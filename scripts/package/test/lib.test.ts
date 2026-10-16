@@ -1,15 +1,25 @@
-import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { runtimePackageManifest } from "../../../packages/daemon/src/runtime-build.ts";
 import { describe, expect, it } from "vitest";
 import {
 	assertHostTarget,
+	checkWindowsCodemodeCompatibility,
+	daemonSourceRevision,
 	buildManifest,
 	checksumFor,
 	engramArchiveName,
 	engramReleaseVersion,
 	hostTarget,
 	nodeArchiveName,
+	nodeExtractionPlan,
+	installerEnv,
+	windowsBuildGo,
+	gentleAiIntegritySummary,
+	pnpmInvocation,
+	npmWrapper,
 	nodeVersion,
 	parseArgs,
 	symlinksIn,
@@ -27,7 +37,7 @@ describe("parseArgs", () => {
 
 	it("refuses a missing or unknown target, unknown flags, and a flag without a value", () => {
 		expect(() => parseArgs(["--out", "/tmp/r"])).toThrow(/Missing --target/);
-		expect(() => parseArgs(["--target", "windows-x64"])).toThrow(/Unknown target windows-x64/);
+		expect(() => parseArgs(["--target", "windows-arm64"])).toThrow(/Unknown target windows-arm64/);
 		expect(() => parseArgs(["--target", "linux-x64", "--force", "1"])).toThrow(/Unexpected argument --force/);
 		expect(() => parseArgs(["--target", "--out", "/tmp/r"])).toThrow(/Unexpected argument --target/);
 		expect(() => parseArgs(["--target", "linux-x64", "--engram-version", "latest"])).toThrow(/x\.y\.z/);
@@ -39,6 +49,9 @@ describe("host target", () => {
 		expect(hostTarget("darwin", "arm64")).toBe("darwin-arm64");
 		expect(hostTarget("linux", "x64")).toBe("linux-x64");
 		expect(hostTarget("darwin", "x64")).toBeUndefined();
+		expect(hostTarget("win32", "x64")).toBe("windows-x64");
+		expect(parseArgs(["--target", "windows-x64"]).target).toBe("windows-x64");
+		expect(() => assertHostTarget("windows-x64", "linux-x64")).toThrow(/Cannot stage/);
 	});
 
 	it("refuses to stage another platform's runtime, naming the way out", () => {
@@ -75,6 +88,130 @@ describe("versions and asset names", () => {
 	});
 });
 
+describe("Windows staging plans", () => {
+	it("admits only explicitly provisioned Go and adds only its directory to installer PATH", () => {
+		const source = { SystemRoot: "C:\\Windows", GENTLE_DOT_BUILD_GO: "C:\\Program Files\\Go\\bin\\go.exe", PATH: "C:\\private-tools", SECRET: "omit" };
+		expect(windowsBuildGo(source, () => true)).toBe(source.GENTLE_DOT_BUILD_GO);
+		expect(() => windowsBuildGo({}, () => true)).toThrow(/GENTLE_DOT_BUILD_GO/);
+		expect(() => windowsBuildGo(source, () => false)).toThrow(/existing/);
+		for (const value of ["go.exe", "C:\\tools;other\\go.exe", "C:\\tools\\other.exe"]) {
+			expect(() => windowsBuildGo({ GENTLE_DOT_BUILD_GO: value }, () => true)).toThrow(/GENTLE_DOT_BUILD_GO/);
+		}
+		const env = installerEnv("C:\\stage", "C:\\cache", "windows-x64", source, source.GENTLE_DOT_BUILD_GO);
+		expect(env.PATH).toBe("C:\\stage\\node\\bin;C:\\Windows\\System32;C:\\Windows;C:\\Program Files\\Go\\bin");
+		expect(env.SECRET).toBeUndefined();
+		expect(env.GENTLE_DOT_BUILD_GO).toBeUndefined();
+		expect(source.PATH).toBe("C:\\private-tools");
+	});
+
+	it("reports source-build module integrity separately from downloaded archive integrity", () => {
+		expect(gentleAiIntegritySummary({ version: "4.0.0", method: "go-sumdb-source-build", package: "example/cmd/tool", tag: "v4.0.0", moduleChecksum: "h1:synthetic", binarySha256: "abc", goVersion: "go1.25.10" })).toBe(
+			"gentle-ai 4.0.0 via go-sumdb-source-build example/cmd/tool@v4.0.0 (module checksum h1:synthetic; binary sha256 abc; Go go1.25.10)",
+		);
+		expect(gentleAiIntegritySummary({ version: "4.0.0", asset: "unix.tar.gz", assetSha256: "def" })).toBe("gentle-ai 4.0.0 from unix.tar.gz (sha256 def)");
+	});
+
+	it("extracts the official Node ZIP and normalizes its layout without changing Unix", () => {
+		expect(nodeArchiveName("24.14.1", "windows-x64")).toBe("node-v24.14.1-win-x64.zip");
+		expect(nodeExtractionPlan("24.14.1", "windows-x64")).toEqual({
+			flag: "-xf", members: ["node-v24.14.1-win-x64/node.exe", "node-v24.14.1-win-x64/node_modules/npm", "node-v24.14.1-win-x64/LICENSE"],
+			moves: [["node.exe", "bin/node.exe"], ["node_modules", "lib/node_modules"]],
+		});
+		expect(nodeExtractionPlan("24.14.1", "linux-x64")).toEqual({
+			flag: "-xzf", members: ["node-v24.14.1-linux-x64/bin/node", "node-v24.14.1-linux-x64/lib/node_modules/npm", "node-v24.14.1-linux-x64/LICENSE"], moves: [],
+		});
+	});
+
+	it("requires checksum-list evidence for the Windows Engram archive format", () => {
+		expect(() => engramArchiveName("3.2.1", "windows-x64")).toThrow(/checksum/);
+		for (const extension of ["zip", "tar.gz"]) {
+			const name = `engram_3.2.1_windows_amd64.${extension}`;
+			expect(engramArchiveName("3.2.1", "windows-x64", `${"a".repeat(64)}  ${name}\n`)).toBe(name);
+		}
+		expect(() => engramArchiveName("3.2.1", "windows-x64", "")).toThrow(/checksum/);
+		const ambiguous = ["zip", "tar.gz"].map((ext) => `${"b".repeat(64)}  engram_3.2.1_windows_amd64.${ext}`).join("\n");
+		expect(() => engramArchiveName("3.2.1", "windows-x64", ambiguous)).toThrow(/exactly one/);
+	});
+
+	it("isolates Windows installer homes, preserving only system and temporary paths", () => {
+		const source = { Path: "C:\\untrusted", SystemRoot: "C:\\Windows", TEMP: "C:\\Temp", SECRET: "omit" };
+		const before = { ...source };
+		const env = installerEnv("C:\\stage & space", "C:\\cache", "windows-x64", source);
+		expect(env.PATH).toBe("C:\\stage & space\\node\\bin;C:\\Windows\\System32;C:\\Windows");
+		expect(env).toMatchObject({ HOME: "C:\\cache\\npm-home", USERPROFILE: "C:\\cache\\npm-home", LOCALAPPDATA: "C:\\cache\\npm-home\\AppData\\Local", APPDATA: "C:\\cache\\npm-home\\AppData\\Roaming", SystemRoot: "C:\\Windows", TEMP: "C:\\Temp", TMP: "C:\\Temp" });
+		expect(env.SECRET).toBeUndefined();
+		expect(source).toEqual(before);
+		expect(installerEnv("/stage", "/cache", "linux-x64", {})).toEqual({
+			HOME: "/cache/npm-home", PATH: "/stage/node/bin:/usr/bin:/bin:/usr/sbin:/sbin", TMPDIR: "/tmp",
+			npm_config_userconfig: "/cache/npmrc", npm_config_cache: "/cache/npm-cache", npm_config_registry: "https://registry.npmjs.org/", npm_config_update_notifier: "false",
+		});
+		expect(installerEnv("C:\\stage", "C:\\cache", "windows-x64", { SYSTEMROOT: "C:\\Windows" }).TEMP).toBe("C:\\cache\\npm-home\\Temp");
+		expect(() => installerEnv("C:\\stage", "C:\\cache", "windows-x64", {})).toThrow(/SystemRoot/);
+	});
+
+	it("invokes pnpm through Node, not a Windows command shell or .cmd spawn", () => {
+		const args = ["--out", "C:\\space & %PATH%"];
+		expect(pnpmInvocation(args, "win32", { npm_execpath: "C:\\tools & space\\pnpm.cjs" }, "C:\\Node\\node.exe")).toEqual({ command: "C:\\Node\\node.exe", args: ["C:\\tools & space\\pnpm.cjs", ...args] });
+		expect(() => pnpmInvocation(args, "win32", { npm_execpath: "pnpm.cmd" })).toThrow(/pnpm/);
+		expect(pnpmInvocation(args, "linux", {})).toEqual({ command: "pnpm", args });
+		expect(npmWrapper("npm-cli.js", "win32")).toContain('"%~dp0node.exe" "%~dp0..\\lib\\node_modules\\npm\\bin\\npm-cli.js" %*');
+		expect(npmWrapper("npm-cli.js")).toContain('exec "$bin/node"');
+	});
+});
+
+describe("Windows codemode compatibility", () => {
+	const names = ["MCP_TYPESCRIPT_PREAMBLE", "mcpStructuredContentSchema", "renderToolOutputType", "renderToolSample", "toCodemodeIdentifier"];
+	function fixture(exports = names, nested = false) {
+		const daemon = mkdtempSync(join(tmpdir(), "codemode-check-"));
+		const modules = join(daemon, "node_modules");
+		const engine = join(modules, "@earendil-works/pi-coding-agent");
+		for (const [name, version] of Object.entries({ "gentle-pi": "4.0.0", "@earendil-works/pi-coding-agent": "1.0.4", "@earendil-works/pi-mcp": "1.0.4", "@earendil-works/pi-codemode": "1.0.4" })) {
+			const dir = join(modules, name);
+			mkdirSync(dir, { recursive: true });
+			writeFileSync(join(dir, "package.json"), JSON.stringify({ name, version, type: "module", exports: name.endsWith("pi-codemode") ? { "./declarations": "./declarations.js" } : "./index.js" }));
+			writeFileSync(join(dir, "index.js"), "throw new Error('must not launch engine');");
+		}
+		const codemode = nested ? join(engine, "node_modules/@earendil-works/pi-codemode") : join(modules, "@earendil-works/pi-codemode");
+		mkdirSync(codemode, { recursive: true });
+		writeFileSync(join(codemode, "package.json"), JSON.stringify({ name: "@earendil-works/pi-codemode", version: "1.0.4", type: "module", exports: { "./declarations": "./declarations.js" } }));
+		writeFileSync(join(codemode, "declarations.js"), exports.map((name) => `export const ${name} = ${name === "MCP_TYPESCRIPT_PREAMBLE" ? "'type Role = string;'" : "() => {}"};`).join("\n"));
+		const dependencies = { "gentle-pi": "4.0.0", "@earendil-works/pi-coding-agent": "1.0.4", "@earendil-works/pi-mcp": "1.0.4", "@earendil-works/pi-codemode": "1.0.4" };
+		writeFileSync(join(daemon, "package.json"), JSON.stringify({ dependencies, overrides: { "@earendil-works/pi-codemode": "1.0.4" } }));
+		return { daemon, codemode };
+	}
+
+	it("verifies the available installed 1.0.4 declarations in isolated state without starting an agent", () => {
+		const daemon = mkdtempSync(join(tmpdir(), "codemode-installed-check-"));
+		writeFileSync(join(daemon, "package.json"), JSON.stringify(runtimePackageManifest("win32")));
+		symlinkSync(fileURLToPath(new URL("../../../packages/daemon/node_modules", import.meta.url)), join(daemon, "node_modules"), "junction");
+		expect(checkWindowsCodemodeCompatibility(daemon, process.execPath)).toEqual({
+			engine: "1.0.4", mcp: "1.0.4", gentlePi: "4.0.0", codemode: "1.0.4",
+		});
+	});
+
+	it("checks named exports without starting the engine", () => {
+		const { daemon } = fixture();
+		expect(checkWindowsCodemodeCompatibility(daemon, process.execPath)).toMatchObject({ codemode: "1.0.4", engine: "1.0.4" });
+	});
+
+	it("rejects the missing preamble even when package versions match", () => {
+		const { daemon } = fixture(names.slice(1));
+		expect(() => checkWindowsCodemodeCompatibility(daemon, process.execPath)).toThrow(/MCP_TYPESCRIPT_PREAMBLE/);
+	});
+
+	it("checks the engine-resolved nested package instead of trusting the flat one", () => {
+		const { daemon } = fixture(names.slice(1), true);
+		expect(() => checkWindowsCodemodeCompatibility(daemon, process.execPath)).toThrow(/MCP_TYPESCRIPT_PREAMBLE/);
+	});
+
+	it("rejects npm graph drift before importing declarations", () => {
+		const { daemon, codemode } = fixture();
+		const manifest = JSON.parse(readFileSync(join(codemode, "package.json"), "utf8"));
+		writeFileSync(join(codemode, "package.json"), JSON.stringify({ ...manifest, version: "1.2.0" }));
+		expect(() => checkWindowsCodemodeCompatibility(daemon, process.execPath)).toThrow(/1.2.0.*1.0.4/);
+	});
+});
+
 describe("checksums", () => {
 	const hello = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 	const listing = `${"a".repeat(64)}  node-v24.14.1-linux-x64.tar.gz\n${hello}  hello.txt\n${"b".repeat(64)} *bin.zip\n`;
@@ -96,6 +233,22 @@ describe("checksums", () => {
 });
 
 describe("tree and manifest", () => {
+	it("labels Windows snapshots honestly while retaining Git revision and dirty detection", () => {
+		const noGit = () => { throw new Error("must not invoke git for a snapshot"); };
+		expect(daemonSourceRevision("C:\\snapshot", "win32", () => false, noGit)).toBe("snapshot-unversioned");
+		for (const platform of ["linux", "darwin", "win32"]) {
+			const calls: unknown[] = [];
+			const git = (command, args, options) => { calls.push([command, args, options]); return args[0] === "rev-parse" ? "abc123\n" : " M packages/daemon/src/cli.ts\n"; };
+			expect(daemonSourceRevision("/repo", platform, () => true, git)).toBe("abc123-dirty");
+			expect(calls).toEqual([
+				["git", ["rev-parse", "HEAD"], { cwd: "/repo", encoding: "utf8" }],
+				["git", ["status", "--porcelain", "--", "packages"], { cwd: "/repo", encoding: "utf8" }],
+			]);
+			expect(daemonSourceRevision("/repo", platform, () => true, (_cmd, args) => args[0] === "rev-parse" ? "abc123\n" : "")).toBe("abc123");
+		}
+		expect(() => daemonSourceRevision("/repo", "linux", () => false, noGit)).toThrow();
+	});
+
 	it("sizes a tree without following links, and lists the links", () => {
 		const dir = mkdtempSync(join(tmpdir(), "stage-runtime-"));
 		writeFileSync(join(dir, "a"), "12345");

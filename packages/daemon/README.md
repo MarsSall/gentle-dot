@@ -1,5 +1,39 @@
 # Gentle Dot daemon
 
+## Reuse an existing Gentle Shell installation
+
+Set `GENTLE_DOT_AGENT_SCRIPT` to the absolute path of the existing installation's
+`gentle-pi/bin/gentle-shell.mjs`. The daemon runs it with its own Node executable;
+`GENTLE_DOT_AGENT_BIN`, when also set, must select a compatible Node executable,
+not a `.cmd` launcher. The script path is passed as one argument, including spaces.
+The default bundled launcher is unchanged when the script override is absent or empty.
+
+This reuses the installation, not the user's agent profile: the agent home remains
+`<GENTLE_DOT_DATA_DIR>/agent`, or `GENTLE_DOT_AGENT_HOME` when explicitly set.
+`GENTLE_DOT_AGENT_ARGS` retains precedence and its existing custom-agent behavior
+without a Gentle Shell home. No packages are installed by selecting this override,
+but the selected launcher may perform its own first-run provisioning. For a trial
+without automatic provisioning, pass `GENTLE_SHELL_NO_AUTO_SETUP=1` and
+`GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1` to the app. Missing dependencies remain missing;
+these switches do not establish that the external installation is compatible.
+
+## Packaged Windows default engine startup
+
+When the desktop launcher supplies `GENTLE_DOT_RUNTIME`, the Windows daemon's
+supervisor disables automatic provisioning for its default bundled Gentle Shell
+on every spawn, including restarts. After merging the spawn environment it sets
+`GENTLE_SHELL_NO_AUTO_SETUP=1` (first-run companion provisioning) and
+`GENTLE_PI_SKIP_GENTLE_AI_INSTALL=1` (missing package-local binary recovery and
+installer). Missing dependencies are not downloaded or repaired by this policy;
+the packaged runtime must already contain compatible dependencies.
+
+Unix startup and Windows source-checkout startup retain their previous behavior.
+Explicit `GENTLE_DOT_AGENT_SCRIPT`, `GENTLE_DOT_AGENT_BIN` and
+`GENTLE_DOT_AGENT_ARGS` choices are not subject to this default-engine policy,
+even when they select the bundled path. Their own provisioning behavior remains
+the caller's responsibility. This change does not fix credential readback or
+establish what effects an earlier provisioning attempt left behind.
+
 ## Windows Discord preparation
 
 Configuring the curated Discord connector prepares its pinned server package before

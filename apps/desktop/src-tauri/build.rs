@@ -58,6 +58,11 @@ fn main() {
     println!("cargo:rustc-env=GENTLE_DOT_BUILD_DAEMON_SCRIPT={}", script.display());
     println!("cargo:rustc-env=GENTLE_DOT_BUILD_PATH={path}");
     println!("cargo:rerun-if-env-changed=PATH");
+    // Only package-windows opts in. A normal release checkout must still run from source.
+    let packaged_required = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && env::var("GENTLE_DOT_WINDOWS_PACKAGED_REQUIRED").as_deref() == Ok("1");
+    println!("cargo:rustc-env=GENTLE_DOT_WINDOWS_PACKAGED_REQUIRED={}", if packaged_required { "1" } else { "0" });
+    println!("cargo:rerun-if-env-changed=GENTLE_DOT_WINDOWS_PACKAGED_REQUIRED");
     println!(
         "cargo:rerun-if-changed={}",
         Path::new("../../../packages/daemon/src/cli.ts").display()

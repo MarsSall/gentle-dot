@@ -38,6 +38,12 @@ After the existing dependency install, Windows staging uses the staged Node to r
 
 Local tests exercised the actual installed 1.0.4 declarations via an isolated scratch manifest and links to existing pnpm modules, plus synthetic missing-export and nested-resolution failures. This proves the specific import seam, not a fresh flat npm installation, Windows-native behavior or full engine startup. No 1.2.0 package was fetched. Restage explicitly when separately authorized: the Windows packager consumes existing runtimes and does **not** re-run this check, so an older staged runtime is not retroactively validated. Secret readback and the effects of the earlier provisioning attempt remain unresolved.
 
+## Windows packaging frontend path
+
+Windows packaging consumes an already staged runtime; it does not stage or install one. The generated Tauri overlay spells `build.frontendDist` as a `./`-prefixed directory path relative to `apps/desktop/src-tauri` (the Tauri config directory), not the desktop CLI working directory. Paths with spaces remain JSON arguments; the runtime resource mapping is unchanged.
+
+An absolute Windows drive path can deserialize as a URL such as `c:`, not an embedded directory, and fail when Tauri joins the panel page. A `file:` URL is not a substitute: it does not embed the frontend. Keep the runtime on the same volume/share as the checkout; packaging refuses paths that cannot be expressed relative to `src-tauri` before invoking a build. This policy fixes the packaging input only; native build and installed-app startup still require separate verification.
+
 ## Unverified Windows release seam
 
 No existing local evidence confirms Engram's Windows archive format or member layout. Staging therefore requires the release checksum list to identify exactly one `engram_<version>_windows_amd64.zip` or `.tar.gz` asset, verifies its checksum, and requires a regular top-level `engram.exe`. Missing or ambiguous evidence fails explicitly rather than guessing the format. These supported naming/layout candidates are not proof that a release supplies them.

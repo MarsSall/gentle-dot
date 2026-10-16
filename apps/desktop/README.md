@@ -89,6 +89,45 @@ This is diagnostic-only: authentication, channel drain, clean exit, empty-Job ch
 record retirement remain required. It does not change the desktop exit code, retry shutdown,
 or recover a retained record. An existing blocking record requires separately authorized recovery.
 
+## Windows packaging (source wiring; native validation pending)
+
+With prerequisites already provisioned on **native Windows x64**, the new entry point consumes an
+existing `build/runtime/windows-x64` (it never stages, installs dependencies, or launches the app):
+
+```sh
+pnpm package:windows
+pnpm package:windows -- --runtime "C:\\path with spaces\\runtime"
+pnpm package:windows -- --help
+```
+
+The runtime must already contain its `windows-x64` manifest, Node, daemon and dependencies, Windows
+stop addon, Gentle AI directory, Engram, `pi.cmd`, and built UI. The checkout must already have the
+installed Tauri CLI and `src-tauri/icons/icon.ico`. Missing artifacts or unsupported host/architecture
+are rejected before build. This is an existence check, not a fresh signature/digest verification;
+staging remains responsible for release pins and dependency/integrity checks.
+
+The command invokes the installed Tauri JavaScript entry through Node without a `.cmd` spawn. Its
+Windows-only overlay includes the runtime as the `runtime` resource and uses the staged UI, bypassing
+the usual UI build hook. The current explicit build-plan default is **NSIS** (`--bundles nsis`), not a
+verified distribution-format decision. WebView2 install mode is `skip`: it must already exist on the
+target machine. Tauri/Rust/MSVC and any bundler tools must be provisioned separately; this command
+is not evidence that a build can run offline. Installer artifacts, when built, use Tauri's usual
+`src-tauri/target/release/bundle/nsis` output directory.
+
+Only this entry point sets the internal compile-time `GENTLE_DOT_WINDOWS_PACKAGED_REQUIRED=1`
+marker. Its Windows release binary validates runtime prerequisites before launching the daemon and
+reports missing resources instead of silently using build-machine checkout paths. This is **not** a
+runtime toggle. Normal checkout release/dev builds and Unix retain their existing fallback behavior;
+Cargo tracks marker changes so subsequent ordinary builds do not retain package-required mode.
+
+`GENTLE_DOT_RUNTIME_DIR` explicitly selects another complete runtime directory. The existing Node
+and daemon-script overrides remain available: when the packaged runtime is absent, **both** nonempty
+`GENTLE_DOT_NODE` and `GENTLE_DOT_DAEMON_SCRIPT` are required to intentionally use an external
+runtime. A single override still works with a complete runtime, but does not authorize checkout
+fallback if resources are missing. External runtime provisioning is the caller's responsibility.
+No Windows packaging, installer execution, GUI launch, credentials, or native runtime proof is
+claimed by these source changes and deterministic tests.
+
 ## Menu bar
 
 | Item | What it does |

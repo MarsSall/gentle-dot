@@ -225,6 +225,43 @@ pub struct LaunchSpec {
     pub envs: Vec<(String, String)>,
 }
 
+/// Admit a package-required launch before selecting any build-machine fallback. Ordinary
+/// checkout builds retain the old contract. A complete explicit Node/script override is
+/// an intentional external runtime, not an accidental fallback; one override alone is not.
+pub fn validate_packaged_runtime(
+    env: impl Fn(&str) -> Option<String>,
+    required: bool,
+    runtime: Option<&Path>,
+) -> Result<(), String> {
+    if !required {
+        return Ok(());
+    }
+    let overridden = |key: &str| env(key).is_some_and(|value| !value.is_empty());
+    if overridden("GENTLE_DOT_NODE") && overridden("GENTLE_DOT_DAEMON_SCRIPT") {
+        return Ok(());
+    }
+    let fail = |detail: String| format!(
+        "The installed Windows runtime is missing or incomplete ({detail}). Reinstall Gentle Dot, \
+         or explicitly select a complete runtime with GENTLE_DOT_RUNTIME_DIR. \
+         To use an external daemon, set both GENTLE_DOT_NODE and GENTLE_DOT_DAEMON_SCRIPT; \
+         this package will not silently use build-machine checkout paths."
+    );
+    let dir = runtime.ok_or_else(|| fail("runtime resource directory unavailable".into()))?;
+    for relative in [
+        "node/bin/node.exe", "daemon/cli.mjs", "daemon/package.json",
+        "daemon/native/windows-stop.node", "daemon/node_modules/gentle-pi/package.json",
+        "bin/engram.exe", "bin/pi.cmd", "ui/index.html",
+    ] {
+        if !dir.join(relative).is_file() {
+            return Err(fail(dir.join(relative).display().to_string()));
+        }
+    }
+    if !dir.join("daemon/node_modules/gentle-pi/.gentle-ai").is_dir() {
+        return Err(fail(dir.join("daemon/node_modules/gentle-pi/.gentle-ai").display().to_string()));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn node_runtime_path(dir: &Path) -> PathBuf {
     // Node's entry resolver rejects verbatim drive paths. Only use the ordinary
@@ -810,6 +847,12 @@ impl Daemon {
         let spec = match &self.launch {
             Some(spec) => spec.clone(),
             None => {
+                validate_packaged_runtime(
+                    |key| std::env::var(key).ok(),
+                    cfg!(windows) && !cfg!(debug_assertions)
+                        && option_env!("GENTLE_DOT_WINDOWS_PACKAGED_REQUIRED") == Some("1"),
+                    self.runtime_dir.as_deref(),
+                )?;
                 launch_spec(|key| std::env::var(key).ok(), cfg!(debug_assertions), self.runtime_dir.as_deref())
             }
         };
@@ -1317,6 +1360,26 @@ mod packaged_runtime_tests {
         // Synthetic fixture retained; no recursive cleanup of user paths.
     }
 
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| pairs.iter().find(|(name, _)| *name == key).map(|(_, value)| (*value).to_string())
+    }
+
+    #[test]
+    fn packaged_runtime_refuses_checkout_fallback_but_preserves_explicit_launches() {
+        assert!(validate_packaged_runtime(env_of(&[]), false, None).is_ok());
+        let error = validate_packaged_runtime(env_of(&[]), true, None).unwrap_err();
+        assert!(error.contains("will not silently use build-machine checkout paths"));
+        assert!(validate_packaged_runtime(env_of(&[("GENTLE_DOT_NODE", "custom-node")]), true, None).is_err());
+        assert!(validate_packaged_runtime(env_of(&[("GENTLE_DOT_DAEMON_SCRIPT", "custom-cli")]), true, None).is_err());
+        assert!(validate_packaged_runtime(env_of(&[
+            ("GENTLE_DOT_NODE", "custom-node"), ("GENTLE_DOT_DAEMON_SCRIPT", ""),
+        ]), true, None).is_err());
+        assert!(validate_packaged_runtime(env_of(&[
+            ("GENTLE_DOT_NODE", "custom-node"), ("GENTLE_DOT_DAEMON_SCRIPT", "custom-cli"),
+        ]), true, None).is_ok());
+        // A source directory without the installed runtime artifacts cannot qualify.
+        assert!(validate_packaged_runtime(env_of(&[]), true, Some(Path::new(env!("CARGO_MANIFEST_DIR")))).is_err());
+    }
 
 }
 

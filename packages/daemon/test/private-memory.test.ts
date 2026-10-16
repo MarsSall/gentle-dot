@@ -6,8 +6,9 @@ import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { startDaemon } from "../src/daemon.ts";
+import { privateMemory } from "../src/isolation.ts";
 import { FAKE_AGENT, tempDir, waitFor } from "./helpers.ts";
 
 const hasLsof = (() => {
@@ -98,4 +99,115 @@ describe.skipIf(!hasLsof)("private memory server (A4)", () => {
 		expect(running(already)).toBe(true);
 		expect(running(foreign)).toBe(true);
 	});
+});
+
+describe("private memory ownership safeguards", () => {
+	async function fixture(
+		outputs: Array<{ code: number; stdout: string; stderr?: string }>,
+		instance = "owned",
+	) {
+		const dataDir = tempDir();
+		mkdirSync(join(dataDir, "home", ".engram"), { recursive: true });
+		writeFileSync(join(dataDir, "home", ".engram", ".instance-id"), "owned\n");
+		const runListenerCommand = vi.fn(async (_command: string, _args: readonly string[]) => {
+			const next = outputs.shift();
+			if (!next) throw new Error("unexpected lookup");
+			return { stderr: "", ...next };
+		});
+		const kill = vi.fn();
+		const health = vi.fn(async () => ({ instance_id: instance }));
+		const port = String(await freePort());
+		const base = { GENTLE_DOT_ENGRAM: "private", GENTLE_DOT_ENGRAM_PORT: port };
+		const options = { platform: "win32" as const, runListenerCommand, kill, health };
+		return { dataDir, base, options, kill, runListenerCommand, port };
+	}
+	const empty = { code: 0, stdout: "" };
+	const one = { code: 0, stdout: "12345\r\n12345\r\n" };
+
+	it("terminates only a stable positive PID with matching health identity", async () => {
+		const f = await fixture([empty, one, one]);
+		const owned = await privateMemory(f.base, f.dataDir, () => {}, f.options);
+		expect(owned).toBeDefined();
+		await owned?.stop();
+		expect(f.kill).toHaveBeenCalledExactlyOnceWith(12345, "SIGTERM");
+		expect(f.runListenerCommand).toHaveBeenCalledTimes(3);
+		expect(f.runListenerCommand.mock.calls[0]?.[0]).toBe("powershell.exe");
+	});
+
+	it.each([
+		{ code: 2, stdout: "", stderr: "lookup failed" },
+		{ code: 0, stdout: "0" },
+		{ code: 0, stdout: "garbage" },
+		{ code: 0, stdout: "12345\n12346" },
+	])("refuses uncertain startup ownership: %j", async (output) => {
+		const f = await fixture([output]);
+		await expect(privateMemory(f.base, f.dataDir, () => {}, f.options)).rejects.toThrow("private memory");
+		expect(f.kill).not.toHaveBeenCalled();
+	});
+
+	it("does not claim a pre-existing listener", async () => {
+		const f = await fixture([one]);
+		expect(await privateMemory(f.base, f.dataDir, () => {}, f.options)).toBeUndefined();
+		expect(f.kill).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ code: 2, stdout: "", stderr: "lookup failed" },
+		{ code: 0, stdout: "0" },
+		{ code: 0, stdout: "12345\n12346" },
+	])("leaves a listener alone when close lookup is uncertain: %j", async (output) => {
+		const f = await fixture([empty, output]);
+		await (await privateMemory(f.base, f.dataDir, () => {}, f.options))?.stop();
+		expect(f.kill).not.toHaveBeenCalled();
+	});
+
+	it("does not terminate when the PID changes after the health check", async () => {
+		const f = await fixture([empty, one, { code: 0, stdout: "12346" }]);
+		await (await privateMemory(f.base, f.dataDir, () => {}, f.options))?.stop();
+		expect(f.kill).not.toHaveBeenCalled();
+	});
+
+	it("does not terminate another memory instance", async () => {
+		const f = await fixture([empty, one], "foreign");
+		await (await privateMemory(f.base, f.dataDir, () => {}, f.options))?.stop();
+		expect(f.kill).not.toHaveBeenCalled();
+	});
+
+	it("rejects a failed command instead of assuming an empty port", async () => {
+		const f = await fixture([]);
+		f.runListenerCommand.mockRejectedValueOnce(new Error("spawn failed"));
+		await expect(privateMemory(f.base, f.dataDir, () => {}, f.options)).rejects.toThrow("private memory");
+		expect(f.kill).not.toHaveBeenCalled();
+	});
+
+	it("preserves the Unix no-match exit code and verifies stable ownership before stopping", async () => {
+		const f = await fixture([{ code: 1, stdout: "" }, one, one]);
+		await (await privateMemory(f.base, f.dataDir, () => {}, { ...f.options, platform: "linux" }))?.stop();
+		expect(f.kill).toHaveBeenCalledExactlyOnceWith(12345, "SIGTERM");
+		expect(f.runListenerCommand.mock.calls[0]?.[0]).toBe("lsof");
+	});
+
+	it("does not terminate when health is unavailable or the stored instance id is empty", async () => {
+		const f = await fixture([empty, one]);
+		await (
+			await privateMemory(f.base, f.dataDir, () => {}, { ...f.options, health: async () => undefined })
+		)?.stop();
+		expect(f.kill).not.toHaveBeenCalled();
+		const other = await fixture([empty, one]);
+		writeFileSync(join(other.dataDir, "home", ".engram", ".instance-id"), "\n");
+		await (await privateMemory(other.base, other.dataDir, () => {}, other.options))?.stop();
+		expect(other.kill).not.toHaveBeenCalled();
+	});
+
+	it.each(["0", "65536", "123;exit"])(
+		"rejects invalid port %s before querying or terminating anything",
+		async (port) => {
+			const f = await fixture([]);
+			await expect(
+				privateMemory({ ...f.base, GENTLE_DOT_ENGRAM_PORT: port }, f.dataDir, () => {}, f.options),
+			).rejects.toThrow("private memory");
+			expect(f.runListenerCommand).not.toHaveBeenCalled();
+			expect(f.kill).not.toHaveBeenCalled();
+		},
+	);
 });

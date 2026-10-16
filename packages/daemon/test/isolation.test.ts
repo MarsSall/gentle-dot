@@ -23,6 +23,42 @@ afterEach(async () => {
 	await Promise.all(daemons.splice(0).map((d) => d.close()));
 });
 
+describe("Windows isolation", () => {
+	it("isolates the OS home and Windows temp while preserving the real memory folder", () => {
+		const realHome = tempDir();
+		const data = tempDir();
+		const env = isolatedAgentEnv({ USERPROFILE: realHome, TEMP: "/user/temp", TMP: "/user/tmp" }, data, {
+			platform: "win32",
+		});
+		expect(env.HOME).toBe(join(data, "home"));
+		expect(env.USERPROFILE).toBe(env.HOME);
+		expect(env.TEMP).toBe(join(data, "home", ".cache", "tmp"));
+		expect(env.TMP).toBe(env.TEMP);
+		expect(env.ENGRAM_DATA_DIR).toBe(join(realHome, ".engram"));
+	});
+
+	it("recognizes a source pi.cmd without a POSIX shim", () => {
+		const bin = tempDir();
+		writeFileSync(join(bin, "pi.cmd"), "@echo off\r\n");
+		const env = isolatedAgentEnv({ HOME: tempDir(), PATH: "/tools" }, tempDir(), {
+			platform: "win32",
+			sourceBinDirs: [bin],
+		});
+		expect(env.PATH).toBe(`${bin};/tools`);
+	});
+
+	it("keeps Unix USERPROFILE and TEMP overrides unchanged", () => {
+		const env = isolatedAgentEnv(
+			{ HOME: tempDir(), USERPROFILE: "/user", TEMP: "/tmp/user", TMP: "/tmp/other" },
+			tempDir(),
+			{ platform: "linux" },
+		);
+		expect(env.USERPROFILE).toBe("/user");
+		expect(env.TEMP).toBe("/tmp/user");
+		expect(env.TMP).toBe("/tmp/other");
+	});
+});
+
 describe("isolatedAgentEnv PATH", () => {
 	it("puts the bundled `pi` first so the engine's first-run setup works on a clean machine", () => {
 		const env = isolatedAgentEnv({ PATH: "/usr/bin:/bin", HOME: tempDir() }, tempDir());

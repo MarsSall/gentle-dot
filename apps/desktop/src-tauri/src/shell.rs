@@ -740,7 +740,7 @@ pub fn run() {
     if let Some(backend) = platform::forced_gdk_backend(|key| std::env::var(key).ok()) {
         std::env::set_var("GDK_BACKEND", backend);
     }
-    let places_windows = !platform::compositor_places_windows(|key| std::env::var(key).ok());
+    let places_windows = !Os::CURRENT.compositor_places_windows(|key| std::env::var(key).ok());
     let config = config::load_config();
     tauri::Builder::default()
         // First, so a second launch forwards its arguments and exits before anything else starts.

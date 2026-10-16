@@ -1,4 +1,4 @@
-# Gentle Dot desktop (macOS and Linux)
+# Gentle Dot desktop (macOS, Linux, and Windows development)
 
 The Tauri 2 shell around the Gentle Dot UI: a floating Dot, an expandable panel, a menu bar item, and a global shortcut. The contract between Rust and the UI is §9 of [`docs/design.md`](../../docs/design.md). Linux is covered [below](#linux).
 
@@ -46,6 +46,38 @@ Runtime overrides:
 | `GENTLE_DOT_PORT` | Daemon port (default `4317`, otherwise `port` in `config.json`) |
 
 `shortcut` in `~/.gentle-dot/config.json` changes the global shortcut (default `Alt+Space`). The Dot position is saved in `~/.gentle-dot/desktop.json` as `dot_points`, in macOS points (the screen space every monitor shares, whatever its scale factor). The `dot` key written by older builds was in physical pixels and is ignored, so the Dot starts once more at the right edge of the main display.
+
+## Windows development (native validation pending)
+
+The Windows port keeps the existing React UI, Rust/Tauri native host, and Node/TypeScript daemon.
+It is source-development work toward the first native opening, **not a verified Windows release**.
+Windows package source wiring is available below; no installer or installed-runtime execution has
+been validated.
+
+Startup prerequisites must already be available: Node 24, pnpm and the repository dependencies,
+Rust for the Windows MSVC target, Microsoft C++ Build Tools with a Windows SDK, and WebView2.
+If any prerequisite is missing, stop rather than assuming an installation is authorized.
+From a native Windows development shell with these tools available, the existing source launcher is
+`pnpm --filter @gentle-dot/desktop dev`; this command has not yet been validated on Windows.
+
+`build.rs` selects `node.exe` for the Windows target and records the source daemon path and build
+PATH. `GENTLE_DOT_NODE` and `GENTLE_DOT_DAEMON_SCRIPT` remain runtime overrides; keep this
+checkout available when launching. The data directory still honors `GENTLE_DOT_DATA_DIR` first;
+its default is `<HOME>/.gentle-dot`, falling back to `<USERPROFILE>/.gentle-dot` only on Windows
+when HOME is absent or empty. Launching writes app/daemon state there; use only an explicitly
+authorized development data directory for validation.
+
+Windows-specific adaptations currently select app-managed window placement (not Linux compositor
+rules) and existing colored non-template tray glyphs. Native panel transparency retains the original
+setting; visual equivalence has not been verified. Voice model commands and connector-secret access
+retain their original implementations, rather than being disabled to make the port compile. The
+existing unsupported-platform recording behavior and ephemeral secret-store fallback are not complete
+Windows equivalents; native voice and secure credential storage still need platform integration.
+Computer control remains macOS-only in the existing implementation.
+Native IPC, daemon startup/owned shutdown, dependency compatibility, graphical behavior, and
+independent security checks still require Windows implementation or verification. sherpa-onnx remains
+a dependency: its build script can download native libraries, so even an offline Cargo invocation must
+not be treated as permission for a download. The paused synthetic probe is not a passed proof.
 
 ## Menu bar
 

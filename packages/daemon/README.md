@@ -1,5 +1,27 @@
 # Gentle Dot daemon
 
+## Windows Discord preparation
+
+Configuring the curated Discord connector prepares its pinned server package before
+asking for a bot token or reporting success. The panel shows `Preparing Discord…`;
+cancelling setup or closing its window cancels preparation. Daemon shutdown also
+aborts preparation and waits for process exit and staging cleanup before completing.
+Acquisition has a
+separate five-minute limit and does not receive connector credentials. It uses
+Node/npm directly, disables lifecycle scripts, and does not start the bot.
+
+A validated installation is published under `<data>/connector-packages/discord-2.2.0`.
+MCP launches that entry point directly, without an `npx` download inside its
+connection deadline. Later configuration reuses the prepared version. Failed
+acquisition removes only its own staging directory; leftover staging from an
+observably exited process can be removed on the next preparation. An existing
+invalid published installation is refused rather than overwritten. Other caches
+and stored credentials are not deleted. This is not a crash-durability guarantee.
+
+An existing Windows Discord configuration without this prepared package must be
+configured again in Connectors; startup does not download it silently. Unix,
+remote connectors, and user-defined commands keep their existing launch behavior.
+
 ## Windows connector secret storage
 
 The desktop app serves Windows connector secrets through the existing private app

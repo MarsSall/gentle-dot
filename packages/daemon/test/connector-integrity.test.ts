@@ -131,6 +131,52 @@ async function signedInstall() {
 	return { dataDir, source };
 }
 
+describe("fresh empty connector initialization", () => {
+	it("persists a signed empty record and reuses its key without a removal notice", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		const first = await started(dataDir, source);
+		expect(first.notices).toEqual([]);
+		expect(validlySigned(dataDir, source.values)).toBe(true);
+		const key = source.values.get(INTEGRITY_KEY_ID);
+		const bytes = readFileSync(join(dataDir, "connectors.json"), "utf8");
+		first.store.close();
+		const second = await started(dataDir, source);
+		expect(second.notices).toEqual([]);
+		expect(source.values.get(INTEGRITY_KEY_ID)).toBe(key);
+		expect(readFileSync(join(dataDir, "connectors.json"), "utf8")).toBe(bytes);
+	});
+
+	it("preserves an existing unreadable path and reports initialization failure", async () => {
+		const dataDir = tempDir();
+		const file = join(dataDir, "connectors.json");
+		mkdirSync(file);
+		writeFileSync(join(file, "keep"), "untouched");
+		const source = new MemorySecretSource();
+		const { store } = storeWith(dataDir, source);
+		await expect(store.checkIntegrity()).rejects.toThrow();
+		expect(statSync(file).isDirectory()).toBe(true);
+		expect(readFileSync(join(file, "keep"), "utf8")).toBe("untouched");
+		expect(source.values.get(INTEGRITY_KEY_ID)).toMatch(/^[0-9a-f]{64}$/);
+	});
+
+	it("keeps an existing-key missing-file warning and does not recreate the file", async () => {
+		const dataDir = tempDir();
+		const source = new MemorySecretSource();
+		source.values.set(INTEGRITY_KEY_ID, "ab".repeat(32));
+		const { notices } = await started(dataDir, source);
+		expect(notices).toEqual([MISSING_NOTICE]);
+		expect(existsSync(join(dataDir, "connectors.json"))).toBe(false);
+		expect(source.values.get(INTEGRITY_KEY_ID)).toBe("ab".repeat(32));
+	});
+
+	it("does not create an empty file without the desktop secret source", async () => {
+		const dataDir = tempDir();
+		await started(dataDir);
+		expect(existsSync(join(dataDir, "connectors.json"))).toBe(false);
+	});
+});
+
 describe("connectors.json is signed on every write (S25.6)", () => {
 	it("carries a valid MAC whose key is only in the app's store, never in a file or a log", async () => {
 		const logs: string[] = [];

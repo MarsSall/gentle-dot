@@ -796,6 +796,11 @@ export class ConnectorStore {
 			if (stored !== undefined) {
 				this.log("connectors.json was signed before and is missing; starting with no connectors");
 				this.onSetAside(MISSING_NOTICE);
+			} else {
+				// Persist the first empty state so its next start is not mistaken for deletion.
+				// load() also catches read failures: never replace an existing unreadable path.
+				mkdirSync(this.options.dataDir, { recursive: true, mode: 0o700 });
+				writeFileSync(this.file, this.recordText(), { flag: "wx", mode: 0o600 });
 			}
 			return;
 		}

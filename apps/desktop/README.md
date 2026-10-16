@@ -79,6 +79,16 @@ independent security checks still require Windows implementation or verification
 a dependency: its build script can download native libraries, so even an offline Cargo invocation must
 not be treated as permission for a download. The paused synthetic probe is not a passed proof.
 
+### Windows exit diagnostics
+
+On exit, a failed checked Windows daemon stop writes
+`gentle-dot: Windows shutdown was not confirmed: <reason>` to the desktop process's stderr.
+The reason comes from that stop attempt, not an unrelated earlier startup refusal; a successful
+stop emits no shutdown diagnostic. Stop errors do not include the record's nonce or capability.
+This is diagnostic-only: authentication, channel drain, clean exit, empty-Job checks and exact
+record retirement remain required. It does not change the desktop exit code, retry shutdown,
+or recover a retained record. An existing blocking record requires separately authorized recovery.
+
 ## Menu bar
 
 | Item | What it does |

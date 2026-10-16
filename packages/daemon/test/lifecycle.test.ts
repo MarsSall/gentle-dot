@@ -3,7 +3,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppChannel } from "../src/app-channel.ts";
 import { type DotDaemon, startDaemon } from "../src/daemon.ts";
 import { fakeApp } from "./fake-app.ts";
@@ -89,6 +89,37 @@ describe("the daemon's lifetime (S35.2)", () => {
 		expect(stopped).toBe(false);
 		expect(d.supervisor.state).toBe("ready");
 		expect(await health(d.port)).toBe(true);
+	});
+
+	it("daemon close and closed settlement wait for channel drain without a close-event cycle", async () => {
+		const app = fakeApp(); const { d } = await start({ appChannel: app });
+		const original = AppChannel.prototype.close;
+		let drain!: () => void;
+		const pending = new Promise<void>(resolve => { drain = resolve; });
+		const spy = vi.spyOn(AppChannel.prototype, "close").mockImplementation(function (this: AppChannel) {
+			void original.call(this); // real logical refusal and onClose reentry
+			return pending;
+		});
+		let settled = false; void d.closed.then(() => { settled = true; });
+		try {
+			const closing = d.close(); expect(d.close()).toBe(closing);
+			await waitFor(() => d.supervisor.state === "stopped");
+			expect(settled).toBe(false); expect(spy).toHaveBeenCalled();
+			drain(); await closing; await d.closed; expect(settled).toBe(true);
+		} finally { drain(); spy.mockRestore(); }
+	});
+
+	it("channel drain failure propagates after other daemon cleanup completes", async () => {
+		const app = fakeApp(); const { d } = await start({ appChannel: app });
+		const original = AppChannel.prototype.close; const failure = new Error("channel drain failed");
+		const spy = vi.spyOn(AppChannel.prototype, "close").mockImplementation(function (this: AppChannel) {
+			void original.call(this);
+			const rejected = Promise.reject(failure); void rejected.catch(() => {}); return rejected;
+		});
+		try {
+			await expect(d.close()).rejects.toBe(failure);
+			await d.closed; expect(d.supervisor.state).toBe("stopped"); expect(await health(d.port)).toBe(false);
+		} finally { spy.mockRestore(); daemons.splice(daemons.indexOf(d), 1); }
 	});
 
 	it("closing twice, or closing while the app quits, stops once", async () => {

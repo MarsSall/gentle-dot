@@ -33,6 +33,17 @@ export function lockedDependencies(
 	return versions;
 }
 
+/** Windows staging is explicit and refuses an absent build; Unix never needs the addon. */
+export function runtimeWindowsStopArtifact(
+	platform: NodeJS.Platform,
+	artifact = join(PACKAGE, "native", "windows-stop.node"),
+	present: (path: string) => boolean = existsSync,
+): string | undefined {
+	if (platform !== "win32") return undefined;
+	if (!present(artifact)) throw new Error("Windows stop addon is missing. Run build:windows-stop with existing Node headers and node.lib first.");
+	return artifact;
+}
+
 /** A `pi` command that runs the runtime's own Node on the engine, from wherever the runtime folder is. */
 export function piWrapper(engineEntry: string): string {
 	return `#!/bin/sh
@@ -71,6 +82,7 @@ function engineEntry(): string {
  * dependencies, and `bin/pi`. Nothing is installed.
  */
 export async function buildRuntime(outDir: string): Promise<void> {
+	const nativeArtifact = runtimeWindowsStopArtifact(process.platform);
 	const daemon = join(outDir, "daemon");
 	mkdirSync(join(daemon, "extensions"), { recursive: true });
 	mkdirSync(join(outDir, "bin"), { recursive: true });
@@ -86,6 +98,10 @@ export async function buildRuntime(outDir: string): Promise<void> {
 		logLevel: "error",
 	});
 	chmodSync(join(daemon, "cli.mjs"), 0o755);
+	if (nativeArtifact) {
+		mkdirSync(join(daemon, "native"), { recursive: true });
+		copyFileSync(nativeArtifact, join(daemon, "native", "windows-stop.node"));
+	}
 	// The bundle finds these through `import.meta.url`, as the sources do in `src/`.
 	copyFileSync(join(PACKAGE, "src", "identity.md"), join(daemon, "identity.md"));
 	// The engine loads the guard with -e, and the guard imports its siblings.

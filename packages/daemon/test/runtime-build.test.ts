@@ -60,6 +60,10 @@ describe("build:runtime", () => {
 		expect(bundle).not.toContain("@gentle-dot/protocol");
 		expect(bundle).toMatch(/from "ws"/);
 		expect(bundle).toContain('import("@earendil-works/pi-coding-agent")');
+		// The production addon stays external and resolves beside the staged entry,
+		// not relative to the source checkout; Unix's file layout remains unchanged.
+		expect(bundle).toContain("./native/windows-stop.node");
+		expect(bundle).not.toContain("NAPI_MODULE");
 	});
 
 	it("lists the external dependencies with the lockfile's exact versions", () => {

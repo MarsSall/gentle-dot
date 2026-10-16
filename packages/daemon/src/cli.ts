@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import type { Duplex } from "node:stream";
 import { inheritedAppSocket } from "./app-channel.ts";
 import { loadConfig } from "./config.ts";
 import { APPROVAL_GUARD, bundledMcpCli } from "./connectors.ts";
 import { startDaemon, startupMessage } from "./daemon.ts";
 import { resolveEngramBin, runtimeDir } from "./runtime.ts";
 import { IDENTITY_SOURCE } from "./white-label.ts";
+import { finishWindowsShutdown, startWithWindowsAppChannel } from "./windows-stop.ts";
+import type { WindowsAppChannel } from "./windows-app-channel.ts";
 
 const log = (line: string) => process.stderr.write(`${new Date().toISOString()} ${line}\n`);
 
@@ -36,8 +40,8 @@ async function main(): Promise<void> {
 	const config = loadConfig();
 	// The desktop app that launched the daemon hands over its private channel on fd 3 (S25.1); it is
 	// opened before anything is spawned, and refused if children would inherit it.
-	const appChannel = inheritedAppSocket({ log });
-	const daemon = await startDaemon({
+	const appChannel = process.platform === "win32" ? undefined : inheritedAppSocket({ log });
+	const start = (channel: Duplex | undefined = appChannel) => startDaemon({
 		port: config.port,
 		host: config.host,
 		dataDir: config.dataDir,
@@ -48,10 +52,28 @@ async function main(): Promise<void> {
 		agentArgs: config.agentArgs,
 		...(config.agentHome ? { agentHome: config.agentHome } : {}),
 		allowedOrigins: config.allowedOrigins,
-		...(appChannel ? { appChannel } : {}),
+		...(channel ? { appChannel: channel } : {}),
 		log,
 	});
+	// Windows requires the L98 private exact-launch record. No implicit unmanaged bypass.
+	// Construction precedes startDaemon and therefore all descendant startup.
+	const windows = process.platform === "win32"
+		? await startWithWindowsAppChannel<Awaited<ReturnType<typeof start>>, WindowsAppChannel>(join(config.dataDir, "daemon.pid"), start)
+		: undefined;
+	const daemon = windows?.daemon ?? await start();
 	process.stdout.write(`${startupMessage(daemon.url, config.dataDir, process.stdout.isTTY === true)}\n`);
+
+	if (windows) {
+		const shutdown = () => { void windows.close(); };
+		process.on("SIGINT", shutdown);
+		process.on("SIGTERM", shutdown);
+		// Only successful daemon.close AND native drain may report success. Never use
+		// daemon.closed directly here: it also settles when daemon.close rejects.
+		// On failure, retain the owner and set exitCode without abandoning native
+		// ownership through process.exit. No descendant completion is claimed.
+		void finishWindowsShutdown(windows, process, log);
+		return;
+	}
 
 	let closing = false;
 	const shutdown = (signal: string) => {
@@ -73,5 +95,6 @@ if (process.argv.includes("--self-check")) selfCheck();
 
 main().catch((error: Error) => {
 	log(`failed to start: ${error.message}`);
-	process.exit(1);
+	if (process.platform === "win32") process.exitCode = 1;
+	else process.exit(1);
 });

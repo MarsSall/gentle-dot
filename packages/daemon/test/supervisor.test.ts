@@ -1,8 +1,8 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSupervisor } from "../src/supervisor.ts";
-import { fakeSupervisor, tempDir, waitFor } from "./helpers.ts";
+import { FAKE_AGENT, fakeSupervisor, tempDir, waitFor } from "./helpers.ts";
 
 const running: AgentSupervisor[] = [];
 afterEach(async () => {
@@ -13,6 +13,31 @@ function track<T extends { supervisor: AgentSupervisor }>(value: T): T {
 	running.push(value.supervisor);
 	return value;
 }
+
+const STUBBORN_AGENT = `
+process.on("SIGTERM", () => {});
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+	buffer += chunk;
+	for (;;) {
+		const newline = buffer.indexOf("\\n");
+		if (newline < 0) break;
+		const line = buffer.slice(0, newline);
+		buffer = buffer.slice(newline + 1);
+		if (!line) continue;
+		const record = JSON.parse(line);
+		if (record.type === "get_state") {
+			process.stdout.write(JSON.stringify({
+				type: "response", id: record.id, command: "get_state", success: true,
+				data: { sessionId: "stubborn" }
+			}) + "\\n");
+		}
+	}
+});
+process.stdin.on("end", () => process.stdin.resume());
+setInterval(() => {}, 1000);
+`;
 
 describe("AgentSupervisor", () => {
 	it("spawns the agent in RPC mode with the session dir and extra args", async () => {
@@ -132,6 +157,54 @@ describe("AgentSupervisor", () => {
 		expect(events.some((e) => e.type === "interrupted")).toBe(false);
 	});
 
+	it.each(["stop during restart", "concurrent restarts"])("serializes lifecycle: %s", async (scenario) => {
+		const scratch = tempDir();
+		const pidsFile = join(scratch, "children.txt");
+		const recorder = join(scratch, "record.mjs");
+		writeFileSync(
+			recorder,
+			`import {appendFileSync} from 'node:fs'; appendFileSync(${JSON.stringify(pidsFile)}, process.pid + '\\n');`,
+		);
+		let spawns = 0;
+		const { supervisor } = track(
+			fakeSupervisor({
+				args: ["--import", recorder, FAKE_AGENT],
+				prepareSpawn: () => {
+					spawns++;
+					return {};
+				},
+			}),
+		);
+		try {
+			await supervisor.start();
+			const session = supervisor.sessionFile;
+			if (scenario === "stop during restart") {
+				await Promise.all([supervisor.restart(), supervisor.stop()]);
+				expect(supervisor.state).toBe("stopped");
+				expect(supervisor.pid).toBeUndefined();
+				expect(spawns).toBe(1);
+				await expect(supervisor.request({ type: "get_state" })).rejects.toThrow(/not ready/i);
+			} else {
+				const results = await Promise.allSettled([supervisor.restart(), supervisor.restart()]);
+				expect(results.map((result) => result.status)).toEqual(["fulfilled", "fulfilled"]);
+				expect(spawns).toBe(2);
+				expect(supervisor.state).toBe("ready");
+				expect(supervisor.sessionFile).toBe(session);
+			}
+		} finally {
+			await supervisor.stop();
+			// Clean up only child PIDs recorded by this fixture, including a duplicate on RED.
+			if (existsSync(pidsFile))
+				for (const text of readFileSync(pidsFile, "utf8").trim().split("\n")) {
+					const pid = Number(text);
+					if (!Number.isSafeInteger(pid) || pid <= 0) continue;
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {}
+				}
+		}
+	});
+
 	it("a stop during a restart starts nothing again (S35.2: the app quitting does both)", async () => {
 		const { supervisor } = track(fakeSupervisor());
 		await supervisor.start();
@@ -149,5 +222,153 @@ describe("AgentSupervisor", () => {
 		await supervisor.stop();
 		expect(supervisor.state).toBe("stopped");
 		await expect(supervisor.request({ type: "get_state" })).rejects.toThrow(/not ready/i);
+	});
+
+	it("closes a cooperative agent within the production grace without escalation", async () => {
+		const escalations: boolean[] = [];
+		const { supervisor } = track(
+			fakeSupervisor({
+				// Keep the production grace: OS scheduling under suite load is not a 10ms contract.
+				terminateProcessTree: async (_child, force) => {
+					escalations.push(force);
+					return false;
+				},
+			}),
+		);
+		await supervisor.start();
+		await supervisor.stop();
+		expect(escalations).toEqual([]);
+		expect(supervisor.state).toBe("stopped");
+		expect(supervisor.pid).toBeUndefined();
+	});
+
+	it.each([
+		["win32", 12000],
+		["linux", 2000],
+		["darwin", 2000],
+	] as const)(
+		"coordinates default %s escalation windows without changing Unix timing",
+		async (platform, windowMs) => {
+			const escalations: boolean[] = [];
+			const { supervisor } = track(
+				fakeSupervisor({
+					platform,
+					command: process.execPath,
+					args: ["-e", STUBBORN_AGENT, "--"],
+					stopTimeoutMs: 1,
+					terminateProcessTree: async (child, force) => {
+						escalations.push(force);
+						if (force) child.kill("SIGKILL");
+						return true;
+					},
+				}),
+			);
+			await supervisor.start();
+			vi.useFakeTimers();
+			const stopped = supervisor.stop();
+			void stopped.catch(() => {});
+			try {
+				await vi.advanceTimersByTimeAsync(1);
+				expect(escalations).toEqual([false]);
+				await vi.advanceTimersByTimeAsync(windowMs - 1);
+				expect(escalations).toEqual([false]);
+				await vi.advanceTimersByTimeAsync(1);
+				expect(escalations).toEqual([false, true]);
+				await stopped;
+				expect(supervisor.state).toBe("stopped");
+				expect(supervisor.pid).toBeUndefined();
+			} finally {
+				vi.useRealTimers();
+				const pid = supervisor.pid;
+				if (pid !== undefined) {
+					if (pid <= 0) throw new Error("Missing positive owned fixture PID");
+					process.kill(pid, "SIGKILL");
+					await waitFor(() => supervisor.state === "stopped");
+				}
+			}
+		},
+	);
+
+	it("keeps both Windows default stages bounded without rejecting before taskkill can finish", async () => {
+		const escalations: boolean[] = [];
+		const { supervisor } = track(
+			fakeSupervisor({
+				platform: "win32",
+				command: process.execPath,
+				args: ["-e", STUBBORN_AGENT, "--"],
+				stopTimeoutMs: 1,
+				terminateProcessTree: async (_child, force) => {
+					escalations.push(force);
+					return false;
+				},
+			}),
+		);
+		await supervisor.start();
+		const pid = supervisor.pid;
+		const sessionId = supervisor.sessionId;
+		vi.useFakeTimers();
+		let failure: Error | undefined;
+		const stopped = supervisor.stop().catch((error) => {
+			failure = error;
+		});
+		try {
+			await vi.advanceTimersByTimeAsync(24000);
+			expect(failure).toBeUndefined();
+			expect(escalations).toEqual([false, true]);
+			await vi.advanceTimersByTimeAsync(1);
+			await stopped;
+			expect(failure?.message).toBe(`Failed to stop agent process ${pid} after bounded termination`);
+			expect(supervisor.pid).toBe(pid);
+			expect(supervisor.sessionId).toBe(sessionId);
+		} finally {
+			vi.useRealTimers();
+			if (!pid || pid <= 0 || supervisor.pid !== pid)
+				throw new Error("Missing current positive owned fixture PID");
+			process.kill(pid, "SIGKILL");
+			await waitFor(() => supervisor.state === "stopped");
+		}
+	});
+
+	it("rejects stop actionably when bounded soft and hard termination do not close the child", async () => {
+		const escalations: boolean[] = [];
+		const { supervisor } = fakeSupervisor({
+			command: process.execPath,
+			args: ["-e", STUBBORN_AGENT, "--"],
+			stopTimeoutMs: 10,
+			hardStopTimeoutMs: 10,
+			terminationFailureTimeoutMs: 10,
+			terminateProcessTree: async (_child, force) => {
+				escalations.push(force);
+				return false;
+			},
+		});
+		await supervisor.start();
+		const pid = supervisor.pid;
+		await expect(supervisor.stop()).rejects.toThrow(/failed to stop agent process/i);
+		expect(escalations).toEqual([false, true]);
+		expect(supervisor.pid).toBe(pid);
+		if (!pid || pid <= 0) throw new Error("Missing owned test child PID");
+		process.kill(pid, "SIGKILL");
+		await waitFor(() => supervisor.state === "stopped");
+	});
+
+	it("rejects restart actionably instead of spawning over a child that did not terminate", async () => {
+		const { supervisor } = fakeSupervisor({
+			command: process.execPath,
+			args: ["-e", STUBBORN_AGENT, "--"],
+			stopTimeoutMs: 10,
+			hardStopTimeoutMs: 10,
+			terminationFailureTimeoutMs: 10,
+			terminateProcessTree: async () => false,
+		});
+		await supervisor.start();
+		const pid = supervisor.pid;
+		await expect(supervisor.restart()).rejects.toThrow(/failed to stop agent process/i);
+		expect(supervisor.pid).toBe(pid);
+		if (!pid || pid <= 0) throw new Error("Missing owned test child PID");
+		const stopped = supervisor.stop();
+		process.kill(pid, "SIGKILL");
+		await stopped;
+		expect(supervisor.state).toBe("stopped");
 	});
 });

@@ -2,6 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { encodeRecord, JsonlDecoder } from "./jsonl.ts";
+import { terminateProcessTree, WINDOWS_TASKKILL_TIMEOUT_MS } from "./process-tree.ts";
 
 /** A record the agent wrote to stdout that is not a command response. */
 export type AgentRecord = { type: string; [key: string]: unknown };
@@ -43,8 +44,16 @@ export interface SupervisorOptions {
 	requestTimeoutMs?: number;
 	/** Deadline for the agent to answer its first `get_state`. Default 60s. */
 	startTimeoutMs?: number;
-	/** Grace period after closing stdin before SIGTERM. Default 5s. */
+	/** Grace period after closing stdin before the first process-tree escalation. Default 5s. */
 	stopTimeoutMs?: number;
+	/** Lifecycle platform override; tests pair this with a termination override. */
+	platform?: NodeJS.Platform;
+	/** Time between soft and forced escalation. Default 12s on Windows, 2s on Unix. */
+	hardStopTimeoutMs?: number;
+	/** Time after forced escalation before shutdown rejects. Default 12s on Windows, 2s on Unix. */
+	terminationFailureTimeoutMs?: number;
+	/** Process-tree termination override, primarily for deterministic lifecycle tests. */
+	terminateProcessTree?: typeof terminateProcessTree;
 	log?: (line: string) => void;
 }
 
@@ -80,6 +89,8 @@ export class AgentSupervisor {
 	private spawnedAt = 0;
 	private stopping = false;
 	private restarting = false;
+	/** Concurrent restart requests share one lifecycle operation. */
+	private restartInFlight: Promise<void> | undefined;
 	private interrupted = false;
 	private restartTimer: NodeJS.Timeout | undefined;
 	private closeWaiters: (() => void)[] = [];
@@ -155,19 +166,28 @@ export class AgentSupervisor {
 	 * reopening the same conversation. Not reported as an interruption.
 	 */
 	async restart(): Promise<void> {
+		if (this.restartInFlight) return this.restartInFlight;
 		const child = this.child;
 		if (!child || this.stopping) return;
-		this.restarting = true;
-		const closed = new Promise<void>((resolve) => this.closeWaiters.push(resolve));
-		child.stdin?.end();
-		const term = setTimeout(() => child.kill("SIGTERM"), this.options.stopTimeoutMs ?? 5000);
-		await closed;
-		clearTimeout(term);
-		// Stopped while the old process was closing: nothing is started again.
-		if (this.stopping) {
-			this.setState("stopped");
-			return;
+		const work = this.restartChild(child);
+		this.restartInFlight = work;
+		try {
+			await work;
+		} finally {
+			if (this.restartInFlight === work) this.restartInFlight = undefined;
 		}
+	}
+
+	private async restartChild(child: ChildProcess): Promise<void> {
+		this.restarting = true;
+		try {
+			await this.closeChild(child);
+		} catch (error) {
+			this.restarting = false;
+			throw error;
+		}
+		// A stop requested during the close owns the lifecycle: never resurrect it.
+		if (this.stopping) return;
 		this.setState("restarting");
 		await this.spawnAndInitialize();
 	}
@@ -180,13 +200,59 @@ export class AgentSupervisor {
 			this.setState("stopped");
 			return;
 		}
-		const closed = new Promise<void>((resolve) => this.closeWaiters.push(resolve));
-		child.stdin?.end();
-		const term = setTimeout(() => child.kill("SIGTERM"), this.options.stopTimeoutMs ?? 5000);
-		const kill = setTimeout(() => child.kill("SIGKILL"), (this.options.stopTimeoutMs ?? 5000) + 2000);
-		await closed;
-		clearTimeout(term);
-		clearTimeout(kill);
+		await this.closeChild(child);
+	}
+
+	private closeChild(child: ChildProcess): Promise<void> {
+		const gracefulMs = this.options.stopTimeoutMs ?? 5000;
+		const platform = this.options.platform ?? process.platform;
+		// Leave two seconds for the child's close event after taskkill's own deadline.
+		const stageMs = platform === "win32" ? WINDOWS_TASKKILL_TIMEOUT_MS + 2000 : 2000;
+		const hardMs = this.options.hardStopTimeoutMs ?? stageMs;
+		const failureMs = this.options.terminationFailureTimeoutMs ?? stageMs;
+		const terminate = this.options.terminateProcessTree ?? terminateProcessTree;
+		return new Promise<void>((resolve, reject) => {
+			let settled = false;
+			const errors: string[] = [];
+			const timers: NodeJS.Timeout[] = [];
+			const finish = (error?: Error) => {
+				if (settled) return;
+				settled = true;
+				for (const timer of timers) clearTimeout(timer);
+				const index = this.closeWaiters.indexOf(onClose);
+				if (index >= 0) this.closeWaiters.splice(index, 1);
+				if (error) reject(error);
+				else resolve();
+			};
+			const onClose = () => finish();
+			const escalate = (force: boolean) => {
+				if (this.child !== child) return;
+				void terminate(child, force, { platform, isCurrent: () => this.child === child }).catch(
+					(error: Error) => {
+						errors.push(error.message);
+						this.log(error.message);
+					},
+				);
+			};
+			this.closeWaiters.push(onClose);
+			child.stdin?.end();
+			timers.push(setTimeout(() => escalate(false), gracefulMs));
+			timers.push(setTimeout(() => escalate(true), gracefulMs + hardMs));
+			timers.push(
+				setTimeout(
+					() => {
+						if (this.child !== child) return finish();
+						const detail = errors.length > 0 ? `: ${errors.join("; ")}` : "";
+						finish(
+							new Error(
+								`Failed to stop agent process ${child.pid ?? "without a PID"} after bounded termination${detail}`,
+							),
+						);
+					},
+					gracefulMs + hardMs + failureMs,
+				),
+			);
+		});
 	}
 
 	private async spawnAndInitialize(): Promise<void> {
@@ -277,16 +343,14 @@ export class AgentSupervisor {
 		}
 		const wasBusy = this.busy;
 		this.busy = false;
-		if (this.restarting) {
-			this.restarting = false;
-			for (const resolve of this.closeWaiters.splice(0)) resolve();
-			return;
-		}
+		const wasRestarting = this.restarting;
+		this.restarting = false;
 		for (const resolve of this.closeWaiters.splice(0)) resolve();
 		if (this.stopping) {
 			this.setState("stopped");
 			return;
 		}
+		if (wasRestarting) return;
 		this.log(`agent exited unexpectedly (${signal ?? `code ${code}`})`);
 		if (wasBusy) this.interrupted = true;
 		this.scheduleRestart();

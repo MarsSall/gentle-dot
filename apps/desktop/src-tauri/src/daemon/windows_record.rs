@@ -5,6 +5,8 @@ use std::io;
 
 pub(super) const MAX_BYTES: usize = 256;
 const VERSION: &[u8] = b"gentle-dot-stop-v1";
+pub(super) const OWNER_MAX_BYTES: usize = 128;
+const OWNER_VERSION: &[u8] = b"gentle-dot-owner-v1";
 
 // Not Copy or Debug: callers must explicitly retain ownership and avoid secret logging.
 #[derive(PartialEq, Eq)]
@@ -61,11 +63,7 @@ impl Record {
     }
 
     pub(super) fn parse(bytes: &[u8]) -> io::Result<Self> {
-        if bytes.is_empty() || bytes.len() > MAX_BYTES || bytes.last() != Some(&b'\n')
-            || !bytes.iter().all(|byte| *byte == b'\n' || (32..=126).contains(byte)) {
-            return Err(invalid());
-        }
-        let mut fields = bytes[..bytes.len() - 1].split(|byte| *byte == b'\n');
+        let mut fields = fields(bytes, MAX_BYTES)?;
         if fields.next() != Some(VERSION) { return Err(invalid()); }
         let pid = u32::try_from(decimal(fields.next().ok_or_else(invalid)?)?).map_err(|_| invalid())?;
         let created = decimal(fields.next().ok_or_else(invalid)?)?;
@@ -80,6 +78,8 @@ impl Record {
             hex(&self.nonce), hex(&self.capability)).into_bytes()
     }
 
+    pub(super) fn nonce(&self) -> [u8; 16] { self.nonce }
+
     pub(super) fn pipe_name(&self) -> String {
         format!(r"\\.\pipe\gentle-dot-stop-{}", hex(&self.nonce))
     }
@@ -90,6 +90,48 @@ impl Record {
         frame[4..].copy_from_slice(&self.capability);
         frame
     }
+}
+
+fn fields(bytes: &[u8], max: usize) -> io::Result<impl Iterator<Item = &[u8]>> {
+    if bytes.is_empty() || bytes.len() > max || bytes.last() != Some(&b'\n')
+        || !bytes.iter().all(|byte| *byte == b'\n' || (32..=126).contains(byte)) {
+        return Err(invalid());
+    }
+    Ok(bytes[..bytes.len() - 1].split(|byte| *byte == b'\n'))
+}
+
+/// App-only witness naming the process that holds the launch's anonymous Job handle.
+/// It carries no capability and grants no authority alone: it applies only to the stop
+/// record with the same nonce, and only the kernel's KILL_ON_JOB_CLOSE makes its exit
+/// meaningful. The daemon and its addon never read it, so the v1 record is unchanged.
+#[derive(PartialEq, Eq, Debug)]
+pub(crate) struct Owner {
+    nonce: [u8; 16],
+    pub(super) pid: u32,
+    pub(super) created: u64,
+}
+
+impl Owner {
+    pub(super) fn new(nonce: [u8; 16], pid: u32, created: u64) -> io::Result<Self> {
+        if pid <= 1 || created == 0 { return Err(invalid()); }
+        Ok(Self { nonce, pid, created })
+    }
+
+    pub(super) fn parse(bytes: &[u8]) -> io::Result<Self> {
+        let mut fields = fields(bytes, OWNER_MAX_BYTES)?;
+        if fields.next() != Some(OWNER_VERSION) { return Err(invalid()); }
+        let nonce = unhex(fields.next().ok_or_else(invalid)?)?;
+        let pid = u32::try_from(decimal(fields.next().ok_or_else(invalid)?)?).map_err(|_| invalid())?;
+        let created = decimal(fields.next().ok_or_else(invalid)?)?;
+        if fields.next().is_some() { return Err(invalid()); }
+        Self::new(nonce, pid, created)
+    }
+
+    pub(super) fn encode(&self) -> Vec<u8> {
+        format!("gentle-dot-owner-v1\n{}\n{}\n{}\n", hex(&self.nonce), self.pid, self.created).into_bytes()
+    }
+
+    pub(super) fn binds(&self, record: &Record) -> bool { self.nonce == record.nonce }
 }
 
 #[cfg(test)]
@@ -146,6 +188,42 @@ mod tests {
         assert!(Record::parse(&bytes).is_err());
         for len in [256, 257] { assert!(Record::parse(&vec![b'\n'; len]).is_err()); }
         assert!(Record::parse(&[]).is_err());
+    }
+
+    #[test]
+    fn owner_roundtrip_binds_record_nonce() {
+        let owner = Owner::new(record().nonce(), u32::MAX, u64::MAX).unwrap();
+        let encoded = owner.encode();
+        assert!(encoded.len() <= OWNER_MAX_BYTES);
+        assert_eq!(Owner::parse(&encoded).unwrap(), owner);
+        assert_eq!(encoded, format!("gentle-dot-owner-v1\n{}\n4294967295\n18446744073709551615\n", "ab".repeat(16)).into_bytes());
+        assert!(owner.binds(&record()));
+        let other = Record::new(42, 123, [0xac; 16], [0xcd; 32]).unwrap();
+        assert!(!owner.binds(&other));
+    }
+
+    #[test]
+    fn owner_rejects_noncanonical_or_partial_text() {
+        let nonce = "ab".repeat(16);
+        let owner = |nonce: &str, pid: &str, created: &str|
+            format!("gentle-dot-owner-v1\n{nonce}\n{pid}\n{created}\n").into_bytes();
+        assert!(Owner::parse(&owner(&nonce, "42", "123")).is_ok());
+        for pid in ["", "0", "1", "042", "-42", "4294967296"] {
+            assert!(Owner::parse(&owner(&nonce, pid, "123")).is_err());
+        }
+        for created in ["", "0", "0123", "18446744073709551616"] {
+            assert!(Owner::parse(&owner(&nonce, "42", created)).is_err());
+        }
+        for bad in ["a".repeat(31), "AB".repeat(16), "gg".repeat(16)] {
+            assert!(Owner::parse(&owner(&bad, "42", "123")).is_err());
+        }
+        let good = owner(&nonce, "42", "123");
+        assert!(Owner::parse(&good[..good.len() - 1]).is_err());
+        let mut extra = good.clone(); extra.extend_from_slice(b"x\n");
+        assert!(Owner::parse(&extra).is_err());
+        assert!(Owner::parse(&record().encode()).is_err(), "a stop record is not an owner witness");
+        assert!(Record::parse(&good).is_err(), "an owner witness is not a stop record");
+        assert!(Owner::parse(&vec![b'\n'; OWNER_MAX_BYTES + 1]).is_err());
     }
 
     #[test]

@@ -99,9 +99,33 @@ Stop-connect result delivery settles the native open only: its inert pinned work
 still retained, not claimed retired. Unconfirmed stop/close outcomes retain ownership for checked
 retry. Restart propagates that attempt's failure without launching another daemon.
 
-These messages do not change the desktop exit code, prevent desktop exit, retry shutdown, or
-recover retained records after a crash/reboot. Existing blocking records require separately
-authorized recovery. Scoped native Windows shutdown tests and a baseline differential cover
+These messages do not change the desktop exit code, prevent desktop exit, or retry shutdown.
+
+### Windows recovery after a crash, restart or power loss
+
+Each launch also writes `daemon.owner` beside `daemon.pid`, after the record is created and before
+the daemon runs. It names the desktop process that holds the launch's only Job handle and is
+bound to the record by its nonce; the daemon and its native addon never read it, so the v1 record
+format is unchanged. The Job uses `KILL_ON_JOB_CLOSE`, and Windows closes a process's handles
+before marking it exited, so once that exact desktop process has exited the kernel has already
+terminated every process in the Job.
+
+On the next start, if the bound owner is proven gone (a matching process that exited, a reused
+PID, or OpenProcess error 87 confirmed by a full process snapshot), Dot waits up to ten seconds
+for the recorded daemon root, retires only that exact record, writes
+`gentle-dot: previous Windows launch retired after its owning app exited` and starts normally.
+Recovery never terminates a process. A witnessed launch that is not proven ended is refused with
+`Windows previous launch admission refused: ...` and its record is kept: the owning app is still
+running, the witness is invalid, unreadable or bound to another record, the owner's state cannot
+be verified, or the recorded root is still running ten seconds after its owner exited. Dot does not
+fall back to stopping the old daemon in those cases, because a clean root exit alone does not show
+that a live owner's Job has no descendants left. Records written before this witness existed keep
+the previous admission route and still need separately authorized manual recovery once their
+daemon has exited.
+
+Limits: processes started through brokers such as WMI `Win32_Process.Create`, Task Scheduler or COM
+are not in the Job, as for forced shutdown. A terminating process may still complete I/O it had
+already issued, but cannot run further code. Scoped native Windows shutdown tests and a baseline differential cover
 this owned-launch path; they do not certify installer behavior or the full Windows port.
 The nine integration checkpoints and earlier paused probes are not release certification.
 

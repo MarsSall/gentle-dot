@@ -76,7 +76,7 @@ pub(super) fn command_line(program: &str, args: &[String]) -> io::Result<Vec<u16
 }
 
 #[cfg(windows)]
-pub(super) use native::{acquire_recovered_launch, ensure_record_directory, open_private_log, spawn, RecoveredLaunch, SpawnFailure, WindowsChild};
+pub(super) use native::{acquire_recovered_launch, ensure_record_directory, open_private_log, retire_if_owner_exited, spawn, RecoveredLaunch, SpawnFailure, WindowsChild};
 
 #[cfg(windows)]
 mod native {
@@ -97,6 +97,9 @@ mod native {
     use windows_sys::Win32::Security::Authorization::*;
     use windows_sys::Win32::Security::*;
     use windows_sys::Win32::Storage::FileSystem::*;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
     use windows_sys::Win32::System::IO::*;
     use windows_sys::Win32::System::JobObjects::*;
     use windows_sys::Win32::System::Pipes::*;
@@ -544,6 +547,8 @@ mod native {
             // No execution until the exact suspended launch has a protected v1 record.
             // The publication helper installs ownership immediately after CREATE_NEW.
             child.publish_record(data_dir)?;
+            // Name this app as the Job's only handle holder before the daemon can run.
+            publish_owner(data_dir, &child.record.as_ref().unwrap().expected)?;
             let previous = unsafe { ResumeThread(child.thread.as_ref().unwrap().as_raw_handle()) };
             if previous == u32::MAX { return Err(io::Error::last_os_error()); }
             if previous != 1 { return Err(io::Error::other("unexpected daemon suspension state")); }
@@ -762,28 +767,176 @@ mod native {
         record_ancestry(&data_dir.join(crate::daemon::PID_FILE), true).map(drop)
     }
 
-    fn read_record_file(file: &mut File) -> io::Result<(crate::daemon::windows_record::Record, FileIdentity)> {
-        use crate::daemon::windows_record::{Record, MAX_BYTES};
+    fn read_protected(file: &mut File, max: usize) -> io::Result<(Vec<u8>, FileIdentity)> {
         use std::io::{Read, Seek};
         let sid = current_user_sid()?;
         let info = file_info(file.as_raw_handle())?;
         let length = ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64;
-        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 || length == 0 || length > MAX_BYTES as u64 {
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 || length == 0 || length > max as u64 {
             return Err(unsafe_record());
         }
         validate_record_security(file.as_raw_handle(), sid.as_ptr() as PSID)?;
         let identity = FileIdentity::from_handle(file.as_raw_handle(), &info)?;
         file.rewind()?;
-        let mut bytes = Vec::with_capacity(MAX_BYTES + 1);
-        (&mut *file).take((MAX_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+        let mut bytes = Vec::with_capacity(max + 1);
+        (&mut *file).take((max + 1) as u64).read_to_end(&mut bytes)?;
         if bytes.len() as u64 != length { return Err(unsafe_record()); }
-        let record = Record::parse(&bytes)?;
         let after = file_info(file.as_raw_handle())?;
         if FileIdentity::from_handle(file.as_raw_handle(), &after)? != identity
             || after.nFileSizeHigh != info.nFileSizeHigh || after.nFileSizeLow != info.nFileSizeLow {
             return Err(unsafe_record());
         }
-        Ok((record, identity))
+        Ok((bytes, identity))
+    }
+
+    fn read_record_file(file: &mut File) -> io::Result<(crate::daemon::windows_record::Record, FileIdentity)> {
+        use crate::daemon::windows_record::{Record, MAX_BYTES};
+        let (bytes, identity) = read_protected(file, MAX_BYTES)?;
+        Ok((Record::parse(&bytes)?, identity))
+    }
+
+    const OWNER_FILE: &str = "daemon.owner";
+
+    fn read_owner_file(file: &mut File) -> io::Result<crate::daemon::windows_record::Owner> {
+        use crate::daemon::windows_record::{Owner, OWNER_MAX_BYTES};
+        Owner::parse(&read_protected(file, OWNER_MAX_BYTES)?.0)
+    }
+
+    fn process_created(handle: HANDLE) -> io::Result<u64> {
+        let mut created: FILETIME = unsafe { std::mem::zeroed() };
+        let mut exited = created;
+        let mut kernel = created;
+        let mut user = created;
+        unsafe { checked(GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user))?; }
+        Ok(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+    }
+
+    /// Written only while this launch exclusively holds its newly created record and
+    /// before the daemon resumes. A previous launch's witness, left without its record,
+    /// has no authority and is removed by handle without following a reparse point.
+    fn publish_owner(data_dir: &Path, record: &crate::daemon::windows_record::Record) -> io::Result<()> {
+        use crate::daemon::windows_record::Owner;
+        use std::io::Write;
+        let path = data_dir.join(OWNER_FILE);
+        let _ancestry = record_ancestry(&path, false)?;
+        let name = wide(path.as_os_str())?;
+        let stale = unsafe { CreateFileW(name.as_ptr(), DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+            null(), OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, null_mut()) };
+        if stale == INVALID_HANDLE_VALUE {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_FILE_NOT_FOUND as i32) { return Err(error); }
+        } else {
+            let stale = owned(stale)?;
+            let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+            unsafe { checked(SetFileInformationByHandle(stale.as_raw_handle(), FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(), std::mem::size_of_val(&disposition) as u32))?; }
+        }
+        let owner = Owner::new(record.nonce(), unsafe { GetCurrentProcessId() },
+            process_created(unsafe { GetCurrentProcess() })?)?;
+        let sid = current_user_sid()?;
+        let descriptor = Descriptor::for_user(sid.as_ptr() as PSID)?;
+        // CREATE_NEW also fails while another reader defers the stale file's deletion.
+        let mut file = File::from(owned(unsafe { CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
+            FILE_SHARE_READ, &descriptor.attributes(), CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, null_mut()) })?);
+        file.write_all(&owner.encode())?;
+        file.sync_all()?;
+        if read_owner_file(&mut file)? != owner { return Err(unsafe_record()); }
+        Ok(())
+    }
+
+    fn read_validated_owner(data_dir: &Path) -> io::Result<Option<crate::daemon::windows_record::Owner>> {
+        let path = data_dir.join(OWNER_FILE);
+        let _ancestry = record_ancestry(&path, false)?;
+        let name = wide(path.as_os_str())?;
+        let raw = unsafe { CreateFileW(name.as_ptr(), GENERIC_READ | READ_CONTROL, FILE_SHARE_READ,
+            null(), OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, null_mut()) };
+        if raw == INVALID_HANDLE_VALUE {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) { return Ok(None); }
+            return Err(error);
+        }
+        read_owner_file(&mut File::from(owned(raw)?)).map(Some)
+    }
+
+    fn snapshot_contains(pid: u32) -> io::Result<bool> {
+        let snapshot = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })?;
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        unsafe { checked(Process32FirstW(snapshot.as_raw_handle(), &mut entry))?; }
+        loop {
+            if entry.th32ProcessID == pid { return Ok(true); }
+            if unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) } == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) { return Ok(false); }
+                return Err(error);
+            }
+        }
+    }
+
+    enum Observed { Gone, Exited, Running(OwnedHandle) }
+    /// Exact-identity state, never a termination route. OpenProcess error 87 alone is
+    /// not absence: a full process snapshot must also lack the PID. A different creation
+    /// time means the PID was reused, which the recorded process object cannot outlive.
+    fn observe_process(pid: u32, created: u64) -> io::Result<Observed> {
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+        if raw.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) && !snapshot_contains(pid)? {
+                return Ok(Observed::Gone);
+            }
+            return Err(error);
+        }
+        let process = owned(raw)?;
+        if process_created(process.as_raw_handle())? != created { return Ok(Observed::Gone); }
+        match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => Ok(Observed::Exited),
+            WAIT_TIMEOUT => Ok(Observed::Running(process)),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    /// Retires a stop record only when its bound witness names an app process that has
+    /// exited. That process held the only handle to the launch's KILL_ON_JOB_CLOSE Job, and
+    /// Windows closes a process's handles before signaling its exit, so the kernel already
+    /// terminated every process in that Job. Nothing is terminated here; processes created
+    /// outside the Job (WMI, Task Scheduler, COM) were never part of the owned group.
+    ///
+    /// Ok(false) only when there is no readable record or no witness at all (a legacy v1
+    /// launch), which keeps the existing admission route. A witnessed launch whose owner
+    /// lives, or whose witness is invalid, unbound or unverifiable, is refused: the recovered
+    /// stop route proves only root exit, and a live owner keeps its Job's descendants alive.
+    pub(crate) fn retire_if_owner_exited(data_dir: &Path) -> io::Result<bool> {
+        let Ok(Some(mut record)) = read_validated_record(data_dir) else { return Ok(false) };
+        let owner = match read_validated_owner(data_dir) {
+            Ok(None) => return Ok(false),
+            Ok(Some(owner)) => owner,
+            Err(_) => return Err(recovery_error("Windows owner witness is invalid or unreadable; record retained")),
+        };
+        if !owner.binds(&record.record) {
+            return Err(recovery_error("Windows owner witness does not match the recorded launch; record retained"));
+        }
+        match observe_process(owner.pid, owner.created) {
+            Ok(Observed::Gone | Observed::Exited) => {}
+            Ok(Observed::Running(_)) => return Err(recovery_error(
+                "the previous launch's owning app is still running; record retained")),
+            Err(_) => return Err(recovery_error("Windows owner state is unverifiable; record retained")),
+        }
+        // Termination is asynchronous and waits for pending I/O: never overlap a root that
+        // is still finishing. A root that keeps running contradicts the proof; refuse.
+        match observe_process(record.record.pid, record.record.created)? {
+            Observed::Gone | Observed::Exited => {}
+            Observed::Running(root) => match unsafe {
+                WaitForSingleObject(root.as_raw_handle(), RECOVERED_STOP_LIMIT.as_millis() as u32)
+            } {
+                WAIT_OBJECT_0 => {}
+                WAIT_TIMEOUT => return Err(recovery_error(
+                    "recorded Windows root is still running after its owner exited; record retained")),
+                _ => return Err(io::Error::last_os_error()),
+            },
+        }
+        delete_exact_record(&record.path, &record.record, record.identity, &mut record.file, &mut record.deletion_marked)?;
+        Ok(true)
     }
 
     // Fixed acquisition stages only: never include paths, PIDs or record capabilities.

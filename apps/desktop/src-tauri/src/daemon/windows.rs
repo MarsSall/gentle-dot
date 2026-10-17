@@ -279,6 +279,9 @@ mod native {
         // handle, never a fresh PID lookup. Keep pending I/O installed on errors.
         stop: Option<RecoveredLaunch>,
         stopping: bool,
+        force_requested: bool,
+        // Completion survives record/channel-close failures and checked retries.
+        completed: bool,
         #[cfg(test)]
         faults: Faults,
     }
@@ -382,13 +385,46 @@ mod native {
             self.status()?.ok_or_else(|| io::Error::other("owned process completion missing"))
         }
         fn shutdown_owned(&mut self, grace: Duration) -> io::Result<()> {
+            if self.completed { return self.finish_record(); }
             if self.failed && !self.stopping {
-                // Failed startup may never have installed its listener. Preserve the
-                // exact-process/Job cleanup path, not an authenticated-stop prerequisite.
-                return self.complete(grace).and_then(|()| self.finish_record());
+                // Failed startup may never have installed its listener.
+                self.complete(grace)?;
+                self.completed = true;
+                return self.finish_record();
             }
             self.stopping = true;
             let deadline = Instant::now() + grace.min(RECOVERED_STOP_LIMIT);
+            let graceful = if self.force_requested { false }
+                else { self.graceful_owned_until(deadline).is_ok() };
+            if !graceful {
+                self.force_requested = true;
+                // Even an early authentication failure gets the remaining grace. Only
+                // the retained exact created process/Job can be terminated, never a PID
+                // lookup, discovered process tree, or recovered record's alleged group.
+                self.complete(deadline.saturating_duration_since(Instant::now()))?;
+                if let Some(stop) = self.stop.as_mut() { stop.settle_owned_io(CLEANUP_WAIT)?; }
+            }
+            self.completed = true;
+            if let Some(record) = self.stop.as_mut().and_then(|stop| stop.record.as_mut()) {
+                drop(record.file.take());
+            }
+            self.finish_record()?;
+            drop(self.thread.take());
+            eprintln!("gentle-dot: owned Windows shutdown confirmed ({})",
+                if graceful { "orderly" } else { "exact-Job fallback" });
+            Ok(())
+        }
+        fn started_owned(&self) -> io::Result<u64> {
+            let mut created: FILETIME = unsafe { std::mem::zeroed() };
+            let mut exited = created;
+            let mut kernel = created;
+            let mut user = created;
+            unsafe { checked(GetProcessTimes(self.process.as_raw_handle(), &mut created, &mut exited, &mut kernel, &mut user))?; }
+            Ok(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+        }
+    }
+    impl WindowsChild {
+        fn graceful_owned_until(&mut self, deadline: Instant) -> io::Result<()> {
             if self.stop.is_none() {
                 let published = self.record.as_ref()
                     .ok_or_else(|| recovery_error("owned Windows stop record is unavailable"))?;
@@ -418,20 +454,7 @@ mod native {
                 }
                 std::thread::sleep(RECOVERY_POLL);
             }
-            // Release only the additional read guard, after all completion facts.
-            // Exact retirement still revalidates the original publication identity.
-            drop(self.stop.as_mut().unwrap().record.as_mut().unwrap().file.take());
-            self.finish_record()?;
-            drop(self.thread.take());
             Ok(())
-        }
-        fn started_owned(&self) -> io::Result<u64> {
-            let mut created: FILETIME = unsafe { std::mem::zeroed() };
-            let mut exited = created;
-            let mut kernel = created;
-            let mut user = created;
-            unsafe { checked(GetProcessTimes(self.process.as_raw_handle(), &mut created, &mut exited, &mut kernel, &mut user))?; }
-            Ok(((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
         }
     }
     impl Drop for WindowsChild {
@@ -503,6 +526,7 @@ mod native {
             process: unsafe { OwnedHandle::from_raw_handle(process.hProcess) },
             thread: Some(unsafe { OwnedHandle::from_raw_handle(process.hThread) }), job,
             pid: process.dwProcessId, assigned: false, failed: false, record: None, stop: None, stopping: false,
+            force_requested: false, completed: false,
             #[cfg(test)] faults,
         };
         let setup = (|| -> io::Result<()> {
@@ -992,6 +1016,40 @@ mod native {
         /// One total bounded budget for connection, asynchronous write, and exact-root
         /// clean exit. Errors keep this owner installed; retries never reopen its PID or
         /// resend an uncertain/failed frame. No record is mutated by this method.
+        // Owned fallback only: settle native operations, not authenticated delivery or
+        // worker/TLS retirement. ConnectAttempt retains its pinned inert worker lifetime.
+        fn settle_owned_io(&mut self, timeout: Duration) -> io::Result<()> {
+            let deadline = Instant::now() + timeout;
+            if let Some(connect) = &self.connect { connect.cancel(); }
+            if let Some(write) = &self.write { write.cancel()?; }
+            loop {
+                if let Some(connect) = &mut self.connect {
+                    match connect.result.try_recv() {
+                        Ok(result) => {
+                            // A late open is closed, never converted into a stop write.
+                            drop(result);
+                            self.connect.take();
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return Err(recovery_error(
+                            "owned Windows stop connection result is unconfirmed")),
+                    }
+                }
+                if let Some(write) = &mut self.write {
+                    if write.poll()?.is_some() {
+                        // Both delivered and aborted writes have ended kernel ownership.
+                        self.write.take();
+                    }
+                }
+                if self.connect.is_none() && self.write.is_none() { return Ok(()); }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut,
+                        "owned Windows stop I/O completion is unconfirmed"));
+                }
+                std::thread::sleep(RECOVERY_POLL.min(remaining));
+            }
+        }
         pub(crate) fn stop(&mut self, timeout: Duration) -> io::Result<()> {
             let result = self.stop_until(Instant::now() + timeout.min(RECOVERED_STOP_LIMIT));
             if result.is_err() {
@@ -1381,9 +1439,10 @@ mod native {
         }
         fn finish_record(&mut self) -> io::Result<()> {
             if self.record.is_none() { return Ok(()); }
-            match self.status()? {
-                Some(status) if status.success() => {}
-                _ => return Err(recovery_error("owned Windows root did not exit cleanly; record retained")),
+            // Only this retained created-process/Job owner may retire a forced exit.
+            // RecoveredLaunch::delete_record still requires its separate clean exit.
+            if !self.completed || self.status()?.is_none() || self.query()? != 0 {
+                return Err(recovery_error("owned Windows root/Job completion is unconfirmed; record retained"));
             }
             let pid = unsafe { GetProcessId(self.process.as_raw_handle()) };
             if pid == 0 { return Err(io::Error::last_os_error()); }
@@ -1599,6 +1658,8 @@ console.log('NORMAL_EXIT');
             assert!(!release.exists());
             child.shutdown_owned(Duration::from_secs(10))
                 .expect("authenticated owned shutdown before fd3 closure");
+            assert!(!child.force_requested, "orderly shutdown must not enter the force path");
+            child.shutdown_owned(Duration::ZERO).expect("checked orderly retry");
             rx.recv_timeout(Duration::from_secs(10)).expect("bounded fd3 exchange/drain").unwrap();
             reader.join().unwrap();
             assert!(child.status().unwrap().unwrap().success());
@@ -1609,6 +1670,101 @@ console.log('NORMAL_EXIT');
             channel_guard.0.shutdown().unwrap();
             assert!(std::fs::read_to_string(&log_path).unwrap().lines().any(|line| line == "NORMAL_EXIT"));
             // Retain this synthetic log/release directory; no recursive cleanup.
+        }
+
+        fn owned_fixture(script: &str) -> (WindowsChild, crate::app_channel::ChannelStream, PathBuf) {
+            let mut nonce = [0u8; 16];
+            getrandom::fill(&mut nonce).unwrap();
+            let token: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+            let root = std::env::temp_dir().join(format!("gentle-owned-stop-{token}"));
+            ensure_record_directory(&root).unwrap();
+            let launch = LaunchSpec {
+                program: env!("GENTLE_DOT_BUILD_NODE").into(),
+                args: vec!["-e".into(), script.into()],
+                envs: vec![("NODE_OPTIONS".into(), String::new())],
+            };
+            let (parent, endpoint) = crate::daemon::channel_pair().unwrap();
+            let child = spawn(&launch, open_private_log(&root).unwrap(), &endpoint, &root).unwrap();
+            drop(endpoint);
+            (child, parent, root)
+        }
+
+        fn force_group_with_unrelated_sentinel(root_exits: bool) {
+            use std::os::windows::process::CommandExt;
+            // Same executable, independently launched: never included in the owned Job.
+            struct Sentinel(std::process::Child);
+            impl Drop for Sentinel {
+                fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+            }
+            let mut sentinel = Sentinel(std::process::Command::new(env!("GENTLE_DOT_BUILD_NODE"))
+                .args(["-e", "setTimeout(()=>{},30000)"])
+                .env_remove("NODE_OPTIONS").creation_flags(CREATE_NO_WINDOW)
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()).spawn().unwrap());
+            let script = format!(r#"
+const {{spawn}} = require('node:child_process');
+// Outlive the Node root while still inheriting the retained outer owned Job.
+const child = spawn(process.execPath, ['-e', "process.stdout.write('CHILD_READY\\n');setTimeout(()=>{{}},30000)"],
+  {{stdio:['ignore','pipe','ignore'],windowsHide:true,detached:true}});
+child.stdout.once('data', bytes => {{
+  if (bytes.toString() !== 'CHILD_READY\n') process.exit(75);
+  console.log('READY'); {}
+}});
+setTimeout(()=>process.exit(74),30000);
+"#, if root_exits { "process.exit(0);" } else { "" });
+            let (mut child, parent, root) = owned_fixture(&script);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let ready = std::fs::read_to_string(root.join("daemon.log")).unwrap().lines().any(|l| l == "READY");
+                if ready && (!root_exits || child.status().unwrap().is_some()) { break; }
+                assert!(Instant::now() < deadline, "synthetic root/descendant not ready");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(child.query().unwrap() >= if root_exits { 1 } else { 2 });
+            assert!(sentinel.0.try_wait().unwrap().is_none());
+            let stopping = Instant::now();
+            child.shutdown_owned(Duration::from_millis(50)).unwrap();
+            assert!(stopping.elapsed() >= Duration::from_millis(50), "force must wait out grace");
+            assert_eq!(child.status().unwrap().unwrap().code(), Some(if root_exits { 0 } else { 1 }));
+            assert_eq!(child.query().unwrap(), 0);
+            assert!(!root.join("daemon.pid").exists());
+            assert!(child.stop.as_ref().is_none_or(|stop| stop.connect.is_none() && stop.write.is_none()));
+            assert!(sentinel.0.try_wait().unwrap().is_none(), "same executable is not ownership");
+            // A later parent-channel failure must not make retry require clean exit.
+            child.shutdown_owned(Duration::ZERO).unwrap();
+            parent.shutdown().unwrap();
+        }
+
+        #[test]
+        fn owned_force_stops_root_and_descendants_not_same_executable() {
+            force_group_with_unrelated_sentinel(false);
+        }
+
+        #[test]
+        fn exited_root_still_requires_owned_descendant_completion() {
+            force_group_with_unrelated_sentinel(true);
+        }
+
+        #[test]
+        fn owned_force_failures_retain_record_and_allow_checked_retry() {
+            for faults in [
+                Faults { terminate: true, ..Faults::default() },
+                Faults { wait: true, ..Faults::default() },
+                Faults { query: true, ..Faults::default() },
+            ] {
+                let (mut child, parent, root) = owned_fixture("setTimeout(()=>{},30000)");
+                child.faults = faults;
+                assert!(child.shutdown_owned(Duration::from_millis(50)).is_err());
+                assert!(child.launch_failed());
+                assert!(child.try_wait().is_err());
+                assert!(root.join("daemon.pid").exists());
+                child.faults = Faults::default();
+                child.shutdown_owned(Duration::ZERO).unwrap();
+                assert!(child.status().unwrap().is_some());
+                assert_eq!(child.query().unwrap(), 0);
+                assert!(!root.join("daemon.pid").exists());
+                parent.shutdown().unwrap();
+            }
         }
 
         #[test]

@@ -119,6 +119,9 @@ impl ChannelStream {
     /// failure is not EOF, native closure, or permission to forget the unfinished operations.
     /// No writer mutex is needed to interrupt a blocked write.
     pub fn shutdown(&self) -> io::Result<()> {
+        self.shutdown_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+    }
+    fn shutdown_until(&self, deadline: std::time::Instant) -> io::Result<()> {
         let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.closed = true;
         if let Some(handle) = &state.handle {
@@ -128,7 +131,15 @@ impl ChannelStream {
             }
         }
         while state.active != 0 {
-            state = self.0.drained.wait(state).unwrap_or_else(PoisonError::into_inner);
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                state.close_error = Some(ERROR_TIMEOUT as i32);
+                return Err(io::Error::new(io::ErrorKind::TimedOut,
+                    "Windows channel cancellation completion deadline elapsed"));
+            }
+            let (next, _) = self.0.drained.wait_timeout(state, remaining)
+                .unwrap_or_else(PoisonError::into_inner);
+            state = next;
         }
         state.handle.take();
         state.close_error = None;
@@ -281,6 +292,31 @@ mod tests {
         let mut peer = ChannelStream::new(child.0);
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
         assert!(retained_writer.try_clone().is_err());
+    }
+
+    #[test]
+    fn close_deadline_retains_handle_until_checked_retry() {
+        let (parent, child) = channel_pair().unwrap();
+        let mut reader = parent.try_clone().unwrap();
+        let thread = std::thread::spawn(move || reader.read(&mut [0]));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while parent.active_operations() == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(parent.active_operations(), 1);
+        // Holding the initiation lock makes a zero-budget drain deterministic even if
+        // the kernel has already completed cancellation: the reader has not retired yet.
+        let error = parent.shutdown_until(std::time::Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(parent.close_error(), Some(ERROR_TIMEOUT as i32));
+        assert!(parent.0.state.lock().unwrap().handle.is_some());
+        assert!(parent.try_clone().is_err());
+        parent.shutdown().unwrap();
+        assert!(thread.join().unwrap().is_err());
+        assert_eq!(parent.active_operations(), 0);
+        assert!(parent.0.state.lock().unwrap().handle.is_none());
+        assert_eq!(parent.close_error(), None);
+        drop(child);
     }
 
     #[test]

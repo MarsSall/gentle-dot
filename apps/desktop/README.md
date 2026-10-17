@@ -83,11 +83,27 @@ not be treated as permission for a download. The paused synthetic probe is not a
 
 On exit, a failed checked Windows daemon stop writes
 `gentle-dot: Windows shutdown was not confirmed: <reason>` to the desktop process's stderr.
-The reason comes from that stop attempt, not an unrelated earlier startup refusal; a successful
-stop emits no shutdown diagnostic. Stop errors do not include the record's nonce or capability.
-This is diagnostic-only: authentication, channel drain, clean exit, empty-Job checks and exact
-record retirement remain required. It does not change the desktop exit code, retry shutdown,
-or recover a retained record. An existing blocking record requires separately authorized recovery.
+The reason comes from that stop attempt, not an unrelated earlier startup refusal.
+Owned child completion reports `gentle-dot: owned Windows shutdown confirmed (orderly)` or
+`gentle-dot: owned Windows shutdown confirmed (exact-Job fallback)`; this is not confirmation
+that the later parent-channel close succeeded. Diagnostics omit record nonces and capabilities.
+
+Owned shutdown first attempts authenticated orderly close within the existing five-second grace.
+If it cannot complete, the retained exact Job is the only forced-group fallback; a PID, process
+name or recovered record never authorizes termination. Root exit and an empty Job must both be
+observed, outstanding stop I/O must settle, and exact record retirement must succeed. Forced
+exit does not require exit code zero. Automatic replacement also checked-closes the old parent
+channel before discarding its owners. Pending parent-channel cancellation has a two-second wait
+budget; timeout retains the handle/operations and refuses replacement, rather than claiming EOF.
+Stop-connect result delivery settles the native open only: its inert pinned worker lifetime is
+still retained, not claimed retired. Unconfirmed stop/close outcomes retain ownership for checked
+retry. Restart propagates that attempt's failure without launching another daemon.
+
+These messages do not change the desktop exit code, prevent desktop exit, retry shutdown, or
+recover retained records after a crash/reboot. Existing blocking records require separately
+authorized recovery. Scoped native Windows shutdown tests and a baseline differential cover
+this owned-launch path; they do not certify installer behavior or the full Windows port.
+The nine integration checkpoints and earlier paused probes are not release certification.
 
 ## Windows packaging (source wiring; native validation pending)
 

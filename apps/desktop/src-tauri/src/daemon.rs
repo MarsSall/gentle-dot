@@ -831,6 +831,12 @@ impl Daemon {
                     slot.as_mut().unwrap().retain_failure();
                     return Err(self.windows_refuse(reason));
                 }
+                if let Some(channel) = channel_slot.as_ref() {
+                    if let Err(error) = channel.close() {
+                        return Err(self.windows_refuse(format!("cannot replace unfinished Windows channel: {error}")));
+                    }
+                }
+                drop(channel_slot.take());
                 drop(slot.take());
             }
             // Direct spawn has the same fallible admission, under the same guard.
@@ -1018,7 +1024,10 @@ impl Daemon {
         if self.handler.is_none() && !self.owns_running() && self.is_healthy() {
             return RestartOutcome::External;
         }
-        let _ = self.stop();
+        #[cfg(unix)]
+        self.stop();
+        #[cfg(windows)]
+        if let Err(reason) = self.stop() { return RestartOutcome::Failed(reason); }
         #[cfg(windows)]
         {
             let child = self.child.lock().unwrap();
@@ -1233,6 +1242,73 @@ mod windows_ownership_tests {
         assert!(matches!(daemon.restart(Duration::ZERO), RestartOutcome::Failed(_)));
         drop(daemon.child.lock().unwrap().take());
         daemon.stop();
+        drop(peer);
+    }
+
+    struct CompletedChild(Arc<AtomicUsize>);
+    impl ChildProcess for CompletedChild {
+        fn id(&self) -> u32 { 3 }
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            use std::os::windows::process::ExitStatusExt;
+            Ok(Some(ExitStatus::from_raw(1))) // A forced exit is not a clean exit.
+        }
+        fn kill(&mut self) -> io::Result<()> { panic!("synthetic completed child") }
+        fn wait(&mut self) -> io::Result<ExitStatus> { panic!("synthetic completed child") }
+        fn shutdown_owned(&mut self, _: Duration) -> io::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn completed_child_close_failure_blocks_restart_until_checked_retry() {
+        let mut daemon = Daemon::new(1, PathBuf::new(), None).with_channel(Arc::new(RefusingHandler));
+        daemon.health = Some(Arc::new(|| false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        *daemon.child.lock().unwrap() = Some(Box::new(CompletedChild(calls.clone())));
+        let (endpoint, peer) = channel_pair().unwrap();
+        let retained = AppChannel::start(endpoint, Arc::new(RefusingHandler)).unwrap();
+        *daemon.channel.lock().unwrap() = Some(retained.clone());
+        retained.test_inject_cancel_error(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32);
+        let error = daemon.stop().unwrap_err();
+        assert!(error.starts_with("the assistant's channel shutdown is unfinished:"));
+        match daemon.restart(Duration::ZERO) {
+            RestartOutcome::Failed(reason) => assert_eq!(reason, error),
+            _ => panic!("restart must propagate checked stop failure"),
+        }
+        assert!(daemon.child.lock().unwrap().is_some());
+        assert!(Arc::ptr_eq(daemon.channel.lock().unwrap().as_ref().unwrap(), &retained));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        retained.test_inject_cancel_error(0);
+        daemon.stop().unwrap();
+        assert!(daemon.child.lock().unwrap().is_none());
+        assert!(daemon.channel.lock().unwrap().is_none());
+        drop(peer);
+    }
+
+    #[test]
+    fn exited_root_replacement_retains_both_owners_when_old_channel_close_fails() {
+        let mut daemon = Daemon::new(1, PathBuf::new(), None).with_channel(Arc::new(RefusingHandler));
+        daemon.health = Some(Arc::new(|| false));
+        // Regression must stop before this deliberately invalid launcher is reached.
+        daemon.launch = Some(LaunchSpec { program: "must-not-launch".into(), args: vec![], envs: vec![] });
+        let calls = Arc::new(AtomicUsize::new(0));
+        *daemon.child.lock().unwrap() = Some(Box::new(CompletedChild(calls.clone())));
+        let (endpoint, peer) = channel_pair().unwrap();
+        let retained = AppChannel::start(endpoint, Arc::new(RefusingHandler)).unwrap();
+        *daemon.channel.lock().unwrap() = Some(retained.clone());
+        retained.test_inject_cancel_error(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32);
+        assert!(daemon.spawn().unwrap_err().starts_with("cannot replace unfinished Windows channel:"));
+        assert!(daemon.child.lock().unwrap().is_some());
+        assert!(Arc::ptr_eq(daemon.channel.lock().unwrap().as_ref().unwrap(), &retained));
+        assert!(retained.close_error().is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(daemon.spawn().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "admission rejects a logically closed retained channel");
+        retained.test_inject_cancel_error(0);
+        daemon.stop().unwrap();
+        assert!(daemon.child.lock().unwrap().is_none());
+        assert!(daemon.channel.lock().unwrap().is_none());
         drop(peer);
     }
 

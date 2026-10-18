@@ -70,9 +70,11 @@ authorized development data directory for validation.
 Windows-specific adaptations currently select app-managed window placement (not Linux compositor
 rules) and existing colored non-template tray glyphs. Native panel transparency retains the original
 setting; visual equivalence has not been verified. Voice model commands and connector-secret access
-retain their original implementations, rather than being disabled to make the port compile. The
-existing unsupported-platform recording behavior and ephemeral secret-store fallback are not complete
-Windows equivalents; native voice and secure credential storage still need platform integration.
+retain their original implementations, rather than being disabled to make the port compile. Voice
+input records the default microphone through WASAPI (shared mode, converted by Windows to 16 kHz
+mono) and transcribes it with the downloadable local model, as on Linux; there is no microphone
+prompt for desktop apps, so a capture blocked in Windows privacy settings explains where to allow it.
+The ephemeral secret-store fallback is not a complete Windows equivalent of secure credential storage.
 Computer control remains macOS-only in the existing implementation.
 Native IPC, daemon startup/owned shutdown, dependency compatibility, graphical behavior, and
 independent security checks still require Windows implementation or verification. sherpa-onnx remains

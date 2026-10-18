@@ -40,6 +40,7 @@ import {
 	nodeVersion,
 	npmWrapper,
 	parseArgs,
+	renameWhenReleased,
 	symlinksIn,
 	treeSize,
 	verifyChecksum,
@@ -128,7 +129,7 @@ async function stageNode(out, target) {
 	run("tar", [plan.flag, archive, "-C", node, "--strip-components=1", ...plan.members]);
 	for (const [from, to] of plan.moves) {
 		mkdirSync(join(node, "lib"), { recursive: true });
-		renameSync(join(node, from), join(node, to));
+		renameWhenReleased(join(node, from), join(node, to));
 	}
 	const windows = target === "windows-x64";
 	for (const name of ["npm", "npx"])

@@ -1,7 +1,7 @@
 // Pure helpers for staging the installed app's runtime (`stage-runtime.mjs`).
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { createReadStream, existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
+import { createReadStream, existsSync, lstatSync, readdirSync, readFileSync, renameSync } from "node:fs";
 import { dirname, join, posix, win32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -143,6 +143,31 @@ export function nodeExtractionPlan(version, target) {
 		members: (windows ? ["node.exe", "node_modules/npm", "LICENSE"] : ["bin/node", "lib/node_modules/npm", "LICENSE"]).map((path) => `${root}/${path}`),
 		moves: windows ? [["node.exe", "bin/node.exe"], ["node_modules", "lib/node_modules"]] : [],
 	};
+}
+
+/** Errors Windows reports while another process (its real-time scanner) still holds files inside the folder. */
+const HELD = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+function sleepSync(ms) {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Renames a folder that was just extracted. Windows' real-time scanner briefly holds the new files,
+ * and renaming their folder is refused until it lets go (observed: refused at 0 and 5 s, allowed at
+ * 20 s). Only those errors are retried, until `timeoutMs`; any other error, or the same one after
+ * the limit, is thrown as it is.
+ */
+export function renameWhenReleased(from, to, { rename = renameSync, sleep = sleepSync, now = Date.now, timeoutMs = 60_000, intervalMs = 500 } = {}) {
+	const deadline = now() + timeoutMs;
+	for (;;) {
+		try {
+			return rename(from, to);
+		} catch (error) {
+			if (!HELD.has(error?.code) || now() >= deadline) throw error;
+			sleep(intervalMs);
+		}
+	}
 }
 
 /** Explicit build prerequisite only; never search or inherit the user's entire PATH. */

@@ -22,6 +22,7 @@ import {
 	npmWrapper,
 	nodeVersion,
 	parseArgs,
+	renameWhenReleased,
 	symlinksIn,
 	treeSize,
 	verifyChecksum,
@@ -119,6 +120,48 @@ describe("Windows staging plans", () => {
 		});
 		expect(nodeExtractionPlan("24.14.1", "linux-x64")).toEqual({
 			flag: "-xzf", members: ["node-v24.14.1-linux-x64/bin/node", "node-v24.14.1-linux-x64/lib/node_modules/npm", "node-v24.14.1-linux-x64/LICENSE"], moves: [],
+		});
+	});
+
+	describe("renaming a folder Windows briefly holds after extraction", () => {
+		const locked = (code: string) => Object.assign(new Error(`${code}: operation not permitted, rename`), { code });
+		// A clock the fake sleep advances, so the deadline is exercised without waiting.
+		const clock = () => {
+			const state = { now: 0, slept: [] as number[] };
+			return { state, now: () => state.now, sleep: (ms: number) => { state.slept.push(ms); state.now += ms; } };
+		};
+
+		it("retries a lock error until the folder is released", () => {
+			const { state, now, sleep } = clock();
+			const calls: string[][] = [];
+			const rename = (from: string, to: string) => {
+				calls.push([from, to]);
+				if (calls.length <= 2) throw locked(calls.length === 1 ? "EPERM" : "EBUSY");
+			};
+			renameWhenReleased("node/node_modules", "node/lib/node_modules", { rename, sleep, now });
+			expect(calls).toEqual(Array(3).fill(["node/node_modules", "node/lib/node_modules"]));
+			expect(state.slept).toEqual([500, 500]);
+		});
+
+		it("gives up with the original error once the lock outlasts the limit", () => {
+			const { state, now, sleep } = clock();
+			let attempts = 0;
+			const rename = () => {
+				attempts += 1;
+				throw locked("EACCES");
+			};
+			expect(() => renameWhenReleased("a", "b", { rename, sleep, now, timeoutMs: 2_000 })).toThrow("EACCES: operation not permitted, rename");
+			expect(attempts).toBe(5);
+			expect(state.now).toBe(2_000);
+		});
+
+		it("does not retry other errors", () => {
+			const { state, now, sleep } = clock();
+			const rename = () => {
+				throw Object.assign(new Error("ENOENT: no such file or directory, rename"), { code: "ENOENT" });
+			};
+			expect(() => renameWhenReleased("a", "b", { rename, sleep, now })).toThrow("ENOENT");
+			expect(state.slept).toEqual([]);
 		});
 	});
 

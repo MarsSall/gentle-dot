@@ -133,7 +133,7 @@ pub enum VoiceError {
     MicrophoneDenied,
     MicrophoneRestricted,
     NoRecognizer(String),
-    /// The local model is the only engine here (Linux) and it is not downloaded.
+    /// The local model is the only engine here (Linux, Windows) and it is not downloaded.
     NoModel,
     NoMicrophone,
     /// Linux: neither `parec` nor `arecord` is installed.

@@ -72,25 +72,37 @@ impl Microphone for WindowsMicrophone {
     }
 
     fn open(&self, sink: Sink) -> Result<Box<dyn Stream>, VoiceError> {
-        let closed = Arc::new(AtomicBool::new(false));
-        let (ready, started) = mpsc::channel();
-        let flag = closed.clone();
-        let thread = std::thread::Builder::new()
-            .name("voice-wasapi".into())
-            .spawn(move || capture(sink, flag, ready))
-            .map_err(failed_to_start)?;
-        let mut stream = WasapiStream { closed, thread: Some(thread) };
-        match started.recv_timeout(OPEN_WAIT) {
-            Ok(Ok(())) => Ok(Box::new(stream)),
-            Ok(Err(error)) => {
-                stream.close();
-                Err(error)
-            }
-            Err(_) => {
-                // The thread ends at its next check of the flag; never leave it capturing.
-                stream.close();
-                Err(failed_to_start("the audio device did not answer"))
-            }
+        let stream = launch(move |closed, ready| capture(sink, closed, ready), OPEN_WAIT)?;
+        Ok(Box::new(stream))
+    }
+}
+
+type Ready = mpsc::Sender<Result<(), VoiceError>>;
+
+/// Runs `run` on the capture thread and waits up to `wait` for it to say whether the device
+/// started. Windows can block inside device activation or start indefinitely, so a timeout does
+/// not wait for the thread: it closes the stream and stops listening, and the thread, once
+/// Windows returns, finds nobody waiting, stops the device, and ends without capturing.
+fn launch(run: impl FnOnce(Arc<AtomicBool>, Ready) + Send + 'static, wait: Duration) -> Result<WasapiStream, VoiceError> {
+    let closed = Arc::new(AtomicBool::new(false));
+    let (ready, started) = mpsc::channel();
+    let flag = closed.clone();
+    let thread = std::thread::Builder::new()
+        .name("voice-wasapi".into())
+        .spawn(move || run(flag, ready))
+        .map_err(failed_to_start)?;
+    let mut stream = WasapiStream { closed, thread: Some(thread) };
+    match started.recv_timeout(wait) {
+        Ok(Ok(())) => Ok(stream),
+        Ok(Err(error)) => {
+            stream.close();
+            Err(error)
+        }
+        Err(_) => {
+            stream.closed.store(true, Ordering::SeqCst);
+            drop(stream.thread.take());
+            drop(started);
+            Err(failed_to_start("the audio device did not answer"))
         }
     }
 }
@@ -128,7 +140,7 @@ impl Drop for LiveCapture {
 
 /// The capture thread: starts the default capture endpoint, says whether that worked, then
 /// delivers packets until the stream is closed or the device fails.
-fn capture(sink: Sink, closed: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), VoiceError>>) {
+fn capture(sink: Sink, closed: Arc<AtomicBool>, ready: Ready) {
     #[cfg(test)]
     let _live = LiveCapture::new();
     if let Err(error) = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok() {
@@ -145,7 +157,11 @@ fn capture(sink: Sink, closed: Arc<AtomicBool>, ready: mpsc::Sender<Result<(), V
     };
     // `open` gave up waiting: release the device at once.
     let gave_up = ready.send(Ok(())).is_err();
-    let result = if gave_up { Ok(()) } else { drain(&capture, &sink, &closed) };
+    let result = if gave_up {
+        Ok(())
+    } else {
+        pump(|| unsafe { capture.GetNextPacketSize() }, || read_packet(&capture), &closed, |samples| sink.audio(samples), POLL)
+    };
     unsafe {
         let _ = client.Stop();
     }
@@ -175,29 +191,42 @@ fn start() -> windows::core::Result<(IAudioClient, IAudioCaptureClient)> {
     }
 }
 
-/// Copies every waiting packet to the sink, then sleeps a poll, until the stream is closed.
-fn drain(capture: &IAudioCaptureClient, sink: &Sink, closed: &AtomicBool) -> windows::core::Result<()> {
+/// Delivers waiting packets, then sleeps a poll, until the stream is closed. The flag is checked
+/// before every packet, so a device that always has another one ready cannot keep the capture
+/// going after a close.
+fn pump<E>(
+    mut waiting: impl FnMut() -> Result<u32, E>,
+    mut read: impl FnMut() -> Result<Vec<f32>, E>,
+    closed: &AtomicBool,
+    mut deliver: impl FnMut(&[f32]),
+    poll: Duration,
+) -> Result<(), E> {
     while !closed.load(Ordering::SeqCst) {
-        while unsafe { capture.GetNextPacketSize()? } > 0 {
-            let mut data = std::ptr::null_mut();
-            let mut frames = 0u32;
-            let mut flags = 0u32;
-            unsafe { capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)? };
-            let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null();
-            // Copied out before the buffer goes back to WASAPI. Each frame is one f32 (mono).
-            let samples = if silent {
-                vec![0.0; frames as usize]
-            } else {
-                unsafe { std::slice::from_raw_parts(data as *const f32, frames as usize) }.to_vec()
-            };
-            unsafe { capture.ReleaseBuffer(frames)? };
+        while !closed.load(Ordering::SeqCst) && waiting()? > 0 {
+            let samples = read()?;
             if !samples.is_empty() {
-                sink.audio(&samples);
+                deliver(&samples);
             }
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(poll);
     }
     Ok(())
+}
+
+/// One packet, copied out before its buffer goes back to WASAPI. Each frame is one f32 (mono).
+fn read_packet(capture: &IAudioCaptureClient) -> windows::core::Result<Vec<f32>> {
+    let mut data = std::ptr::null_mut();
+    let mut frames = 0u32;
+    let mut flags = 0u32;
+    unsafe { capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)? };
+    let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null();
+    let samples = if silent {
+        vec![0.0; frames as usize]
+    } else {
+        unsafe { std::slice::from_raw_parts(data as *const f32, frames as usize) }.to_vec()
+    };
+    unsafe { capture.ReleaseBuffer(frames)? };
+    Ok(samples)
 }
 
 struct WasapiStream {
@@ -264,6 +293,105 @@ mod tests {
         assert_eq!(WindowsMicrophone.request_authorization(), Authorization::Authorized);
     }
 
+    #[test]
+    fn a_close_ends_capture_even_while_packets_keep_arriving() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (done, finished) = mpsc::channel();
+        let (flag, count) = (closed.clone(), delivered.clone());
+        std::thread::spawn(move || {
+            // Another packet is always ready, as when delivery keeps up with the device only just.
+            let result = pump(
+                || Ok::<u32, ()>(1),
+                || Ok(vec![0.25; 160]),
+                &flag,
+                |_| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                },
+                Duration::from_millis(1),
+            );
+            let _ = done.send(result);
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while delivered.load(Ordering::SeqCst) < 10 {
+            assert!(Instant::now() < deadline, "packets flow");
+            std::thread::yield_now();
+        }
+        closed.store(true, Ordering::SeqCst);
+        assert_eq!(finished.recv_timeout(Duration::from_secs(2)), Ok(Ok(())), "the close ends the capture");
+        let after = delivered.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(delivered.load(Ordering::SeqCst), after, "nothing is delivered once the capture ended");
+    }
+
+    #[test]
+    fn a_device_that_never_answers_times_out_without_waiting_for_windows() {
+        let (outcome, observed) = mpsc::channel();
+        let started = Instant::now();
+        let result = launch(
+            move |closed, ready| {
+                // Windows is still activating the device when the wait runs out.
+                std::thread::sleep(Duration::from_millis(600));
+                let nobody_waiting = ready.send(Ok(())).is_err();
+                let _ = outcome.send((nobody_waiting, closed.load(Ordering::SeqCst)));
+            },
+            Duration::from_millis(50),
+        );
+        assert!(started.elapsed() < Duration::from_millis(400), "the timeout does not wait for Windows");
+        assert_eq!(
+            result.err(),
+            Some(VoiceError::Failed("The microphone could not start: the audio device did not answer".into()))
+        );
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(3)),
+            Ok((true, true)),
+            "the late thread finds nobody waiting and the stream closed, so it stops the device without capturing"
+        );
+    }
+
+    #[test]
+    fn a_start_failure_is_returned_once_the_thread_ended() {
+        let ended = Arc::new(AtomicBool::new(false));
+        let flag = ended.clone();
+        let result = launch(
+            move |_, ready| {
+                let _ = ready.send(Err(VoiceError::NoMicrophone));
+                std::thread::sleep(Duration::from_millis(50));
+                flag.store(true, Ordering::SeqCst);
+            },
+            Duration::from_secs(2),
+        );
+        assert_eq!(result.err(), Some(VoiceError::NoMicrophone));
+        assert!(ended.load(Ordering::SeqCst), "open waits for the failed capture thread to end");
+    }
+
+    #[test]
+    fn closing_or_dropping_waits_for_the_capture_thread_and_closing_twice_is_harmless() {
+        for drop_it in [false, true] {
+            let ended = Arc::new(AtomicBool::new(false));
+            let flag = ended.clone();
+            let mut stream = launch(
+                move |closed, ready| {
+                    let _ = ready.send(Ok(()));
+                    while !closed.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    std::thread::sleep(Duration::from_millis(30));
+                    flag.store(true, Ordering::SeqCst);
+                },
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            if drop_it {
+                drop(stream);
+            } else {
+                stream.close();
+                stream.close();
+            }
+            assert!(ended.load(Ordering::SeqCst), "drop={drop_it}: the thread ended before close returned");
+        }
+    }
+
     /// Records the real default microphone for a moment and keeps nothing.
     #[test]
     #[ignore = "uses the real default microphone; run explicitly on a Windows machine with one"]
@@ -287,7 +415,8 @@ mod tests {
             assert!(stopping.elapsed() < Duration::from_secs(2), "round {round}: stop releases the capture");
             recognizer.log.lock().unwrap().fed.clear();
         }
-        // The second round opened the device again, so the first one released it.
+        // Shared mode allows overlapping clients, so reopening shows the device still works, not
+        // that the first capture let go; the joined thread and `cancel_ends_the_capture_thread` do.
         voice.start(None, Recorder::default().events()).unwrap();
         voice.cancel().unwrap();
     }

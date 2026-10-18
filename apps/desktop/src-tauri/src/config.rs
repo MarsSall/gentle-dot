@@ -4,7 +4,8 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_PORT: u16 = 4317;
-pub const DEFAULT_SHORTCUT: &str = "Alt+Space";
+/// Windows keeps Alt+Space for the window menu, and overlays such as NVIDIA's claim it as well.
+pub const DEFAULT_SHORTCUT: &str = if cfg!(windows) { "Ctrl+Alt+Space" } else { "Alt+Space" };
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DesktopConfig {
@@ -197,6 +198,16 @@ mod tests {
     fn defaults_without_file() {
         let config = parse_config(dir(), None, env_of(&[]));
         assert_eq!(config, DesktopConfig { data_dir: dir(), port: DEFAULT_PORT, shortcut: DEFAULT_SHORTCUT.into() });
+    }
+
+    #[test]
+    fn windows_default_shortcut_avoids_the_system_window_menu() {
+        // Windows owns Alt+Space (window menu) and overlays such as NVIDIA's claim it too.
+        let expected = if cfg!(windows) { "Ctrl+Alt+Space" } else { "Alt+Space" };
+        assert_eq!(DEFAULT_SHORTCUT, expected);
+        assert_eq!(parse_config(dir(), Some(r#"{ "port": 5000 }"#), env_of(&[])).shortcut, expected);
+        // A saved shortcut still wins, including Alt+Space chosen explicitly.
+        assert_eq!(parse_config(dir(), Some(r#"{ "shortcut": "Alt+Space" }"#), env_of(&[])).shortcut, "Alt+Space");
     }
 
     #[test]

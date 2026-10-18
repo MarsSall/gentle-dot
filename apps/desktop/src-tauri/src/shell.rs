@@ -337,6 +337,12 @@ fn label_tray_open(app: &AppHandle, shortcut: &str) {
     }
 }
 
+fn unlabel_tray_open(app: &AppHandle) {
+    if let Some(item) = app.try_state::<OpenMenuItem>() {
+        let _ = item.0.set_accelerator(None::<&str>);
+    }
+}
+
 #[tauri::command]
 fn set_dot_state(app: AppHandle, state: String) -> CommandResult {
     let status = tray_status(&state).ok_or_else(|| format!("unknown state `{state}`"))?;
@@ -830,8 +836,10 @@ pub fn run() {
             build_tray(&handle, &config, rose_hidden)?;
             if places_windows {
                 let bound = register_shortcut(&handle, &config.shortcut);
-                if let Some(bound) = &bound {
-                    label_tray_open(&handle, bound);
+                match &bound {
+                    Some(bound) => label_tray_open(&handle, bound),
+                    // Never advertise a shortcut that is not bound.
+                    None => unlabel_tray_open(&handle),
                 }
                 *app.state::<Shell>().shortcut.lock().unwrap() = bound;
                 let snap = app.state::<Shell>().snap.clone();

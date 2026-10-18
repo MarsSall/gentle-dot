@@ -45,7 +45,7 @@ Runtime overrides:
 | `GENTLE_DOT_DATA_DIR` | Data directory (default `~/.gentle-dot`) |
 | `GENTLE_DOT_PORT` | Daemon port (default `4317`, otherwise `port` in `config.json`) |
 
-`shortcut` in `~/.gentle-dot/config.json` changes the global shortcut (default `Alt+Space`). The Dot position is saved in `~/.gentle-dot/desktop.json` as `dot_points`, in macOS points (the screen space every monitor shares, whatever its scale factor). The `dot` key written by older builds was in physical pixels and is ignored, so the Dot starts once more at the right edge of the main display.
+`shortcut` in `~/.gentle-dot/config.json` changes the global shortcut (default `Alt+Space`; `Ctrl+Alt+Space` on Windows, where `Alt+Space` opens the window menu and overlays such as NVIDIA's claim it). When no shortcut can be bound, the tray's Open item shows none. The Dot position is saved in `~/.gentle-dot/desktop.json` as `dot_points`, in macOS points (the screen space every monitor shares, whatever its scale factor). The `dot` key written by older builds was in physical pixels and is ignored, so the Dot starts once more at the right edge of the main display.
 
 ## Windows development (native validation pending)
 

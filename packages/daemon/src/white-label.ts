@@ -12,6 +12,7 @@ export const HIDDEN_NAMES: RegExp[] = [
 	/organic driven development/i,
 	/\/gentle:/i,
 	/\bRDD\b/,
+	/receipt-driven[ -]development/i,
 	/\bpi[ -]coding[ -]agent\b/i,
 ];
 
@@ -24,7 +25,7 @@ const REWRITES: [RegExp, string][] = [
 	[/\borganic driven development\b/gi, "my workflow"],
 	[/\bODD\b/g, "workflow"],
 	[/\bengram\b/gi, "memory"],
-	[/\breceipt-driven development\b/gi, "review"],
+	[/\breceipt-driven[ -]development\b/gi, "review"],
 	[/\bRDD\b/g, "review"],
 ];
 
@@ -35,9 +36,15 @@ export function presentText(text: string): string {
 	return shown.replace(/ {2,}/g, " ").replace(/ +([.,;:!?])/g, "$1");
 }
 
-/** Informational notifications are harness chatter; warnings and errors still reach the user. */
-export function shouldShowToast(level: "info" | "warning" | "error"): boolean {
-	return level !== "info";
+/** The engine's code-review workflow is internal; its notices say nothing the user can act on. */
+const INTERNAL_REVIEW_NOTICE = /receipt-driven[ -]development|\bRDD\b/i;
+
+/**
+ * Informational notifications are harness chatter; warnings and errors still reach the user,
+ * except those about the internal review workflow.
+ */
+export function shouldShowToast(level: "info" | "warning" | "error", message: string): boolean {
+	return level !== "info" && !INTERNAL_REVIEW_NOTICE.test(message);
 }
 
 /** Internal slash commands are not part of the product. */

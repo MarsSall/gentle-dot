@@ -8,6 +8,10 @@ import {
 	shouldShowToast,
 } from "../src/white-label.ts";
 
+/** gentle-pi's notice when it cannot read the review mode (seen in the Windows app). */
+const REVIEW_NOTICE =
+	'Gentle AI: receipt-driven-development status is unavailable (native review CLI absent, timed out, or failed). The parent prompt renders "unknown" until this recovers; this notice will not repeat this session.';
+
 describe("presentText", () => {
 	it.each([
 		["Gentle Shell ready", "Gentle Dot ready"],
@@ -20,6 +24,7 @@ describe("presentText", () => {
 		["Run /gentle:status to check", "Run to check"],
 		["Started the Pi coding agent", "Started the assistant"],
 		["RDD is enabled", "review is enabled"],
+		["receipt-driven-development status", "review status"],
 	])("rewrites %j", (input, expected) => {
 		expect(presentText(input)).toBe(expected);
 	});
@@ -35,6 +40,7 @@ describe("presentText", () => {
 			"el Gentleman loaded ODD",
 			"gentle-ai: review mode on (decided by global)",
 			"Engram connected · project gentle-pi",
+			REVIEW_NOTICE,
 		];
 		for (const text of recorded) {
 			const shown = presentText(text);
@@ -45,9 +51,15 @@ describe("presentText", () => {
 
 describe("shouldShowToast", () => {
 	it("hides informational chatter and keeps warnings and errors", () => {
-		expect(shouldShowToast("info")).toBe(false);
-		expect(shouldShowToast("warning")).toBe(true);
-		expect(shouldShowToast("error")).toBe(true);
+		expect(shouldShowToast("info", "Skill registry refreshed")).toBe(false);
+		expect(shouldShowToast("warning", "Discord needs preparation.")).toBe(true);
+		expect(shouldShowToast("error", "The model is unavailable.")).toBe(true);
+	});
+
+	it("hides notices about the internal review workflow, whatever their level", () => {
+		expect(shouldShowToast("warning", REVIEW_NOTICE)).toBe(false);
+		expect(shouldShowToast("error", "RDD review failed")).toBe(false);
+		expect(shouldShowToast("warning", "receipt-driven development is off")).toBe(false);
 	});
 });
 

@@ -760,15 +760,15 @@ mod tests {
     // Blocked apps of the platform the tests run on (each has its own list): bundle id or
     // executable, and the name the refusal says.
     #[cfg(not(windows))]
-    const SETTINGS: (&str, &str) = (SETTINGS.0, SETTINGS.1);
+    const SETTINGS: (&str, &str) = ("com.apple.systempreferences", "System Settings");
     #[cfg(windows)]
     const SETTINGS: (&str, &str) = ("SystemSettings.exe", "Settings");
     #[cfg(not(windows))]
-    const PASSWORDS: (&str, &str) = (PASSWORDS.0, PASSWORDS.1);
+    const PASSWORDS: (&str, &str) = ("com.1password.1password", "1Password");
     #[cfg(windows)]
     const PASSWORDS: (&str, &str) = ("1Password.exe", "1Password");
     #[cfg(not(windows))]
-    const KEYCHAIN: (&str, &str) = (KEYCHAIN.0, KEYCHAIN.1);
+    const KEYCHAIN: (&str, &str) = ("com.apple.keychainaccess", "Keychain Access");
     #[cfg(windows)]
     const KEYCHAIN: (&str, &str) = ("CredentialUIBroker.exe", "CredentialUIBroker");
     /// An `open_app` name the platform blocks.

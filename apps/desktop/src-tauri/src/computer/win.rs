@@ -33,7 +33,7 @@ use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, HWND, LPARAM, POINT, RECT};
-use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows_sys::Win32::Graphics::Dwm::{DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
@@ -56,7 +56,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DrawIconEx, EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetCursorInfo,
     GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetIconInfo, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowDisplayAffinity, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
     ShowWindow, WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GW_OWNER,
     ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SW_RESTORE, SW_SHOWNORMAL, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
@@ -279,6 +279,7 @@ fn draw_pointer(canvas: &Canvas, frame: MonitorFrame, width: u32, height: u32) {
 /// A screenshot of the monitor under the pointer, downscaled to `MAX_LONG_EDGE`, Gentle Dot's
 /// windows excluded.
 pub fn capture() -> Result<Capture, String> {
+    exclude_own_windows()?;
     let pointer = pointer_location().ok_or("cannot read the pointer position")?;
     let frame = monitor_at(pointer).ok_or("no display under the pointer")?;
     if frame.width <= 0 || frame.height <= 0 {
@@ -1045,6 +1046,39 @@ fn focused_pid() -> Option<i32> {
 /// Keeps a window out of every screenshot and screen capture, this helper's included.
 pub fn exclude_from_capture(hwnd: *mut c_void) -> Result<(), String> {
     set_capture_excluded(hwnd, true)
+}
+
+/// Makes sure no visible window of this process shows in the capture about to be taken: the
+/// session's own exclusion is applied later on the main thread, so it is not relied on here. A
+/// window newly excluded is out of the picture after the next composition (`DwmFlush`).
+fn exclude_own_windows() -> Result<(), String> {
+    unsafe extern "system" fn collect(hwnd: HWND, state: LPARAM) -> i32 {
+        // SAFETY: `state` is the vector passed below, alive for the whole enumeration.
+        unsafe { (*(state as *mut Vec<HWND>)).push(hwnd) };
+        1
+    }
+    let mut handles: Vec<HWND> = Vec::new();
+    // SAFETY: the callback only appends to `handles`, which outlives the call.
+    unsafe { EnumWindows(Some(collect), &mut handles as *mut Vec<HWND> as LPARAM) };
+    let own = std::process::id() as i32;
+    let mut changed = false;
+    for hwnd in handles {
+        // SAFETY: plain queries on a window handle (a vanished window just reads as hidden).
+        if window_pid(hwnd) != own || unsafe { IsWindowVisible(hwnd) } == 0 {
+            continue;
+        }
+        let mut affinity = 0u32;
+        // SAFETY: `affinity` is a valid out-pointer.
+        if unsafe { GetWindowDisplayAffinity(hwnd, &mut affinity) } == 0 || affinity != WDA_EXCLUDEFROMCAPTURE {
+            set_capture_excluded(hwnd, true).map_err(|e| format!("Gentle Dot's window would show in the screenshot: {e}"))?;
+            changed = true;
+        }
+    }
+    if changed {
+        // SAFETY: a plain call; it waits for the next composition.
+        unsafe { DwmFlush() };
+    }
+    Ok(())
 }
 
 /// Leaves a window of this process out of screenshots, or lets it show in them again.

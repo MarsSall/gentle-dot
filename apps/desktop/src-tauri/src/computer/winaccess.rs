@@ -59,6 +59,18 @@ pub fn element(control_type: i32, name: Option<String>, help: Option<String>, va
     AxElement { role: role(control_type).into(), title: present(name), description: present(help), value: present(value) }
 }
 
+/// What the risk check gets when the element under a point is Gentle Dot's own (its click-through
+/// glow) while another app owns the window there: an element that cannot be read stands in for
+/// it and asks for a confirmation, so a risky click under the glow is never let through unseen.
+pub fn unreadable() -> AxElement {
+    AxElement {
+        role: role(UIA_BUTTON).into(),
+        title: Some("an element Gentle Dot cannot read under its glow; confirm to act on it".into()),
+        description: None,
+        value: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +131,13 @@ mod tests {
         assert!(assess(Act::Click(&chain), None).is_some());
         assert!(assess(Act::Click(&[named(UIA_BUTTON, "Open")]), None).is_none());
         assert!(assess(Act::Click(&[named(UIA_CHECK_BOX, "Send me news")]), None).is_none(), "a check box is not pressed");
+    }
+
+    #[test]
+    fn clicking_what_cannot_be_read_under_the_glow_needs_a_confirmation() {
+        let reason = assess(Act::Click(&[unreadable()]), None).expect("a confirmation");
+        assert!(reason.contains("Gentle Dot cannot read"), "{reason}");
+        assert!(assess(Act::Drag(&[named(UIA_TEXT, "x")], &[unreadable()]), None).is_some());
     }
 
     #[test]

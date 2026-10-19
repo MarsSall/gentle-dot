@@ -49,7 +49,7 @@ pub struct Computer {
 }
 
 /// What the overlay thread hears: the session started or ended, or the agent acted.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 enum Overlay {
     Session(bool),
     Mark(super::glow::Mark),
@@ -63,8 +63,8 @@ impl Computer {
     }
 }
 
-/// Creates the session and, on macOS and Windows, starts the MCP helper and the timeout watcher,
-/// and on macOS the glow overlay. Runs in the app's setup, on the main thread.
+/// Creates the session and, on macOS and Windows, starts the MCP helper, the timeout watcher, and
+/// the glow overlay. Runs in the app's setup, on the main thread.
 pub fn start(app: &AppHandle) -> Computer {
     let (overlay, marks) = std::sync::mpsc::channel::<Overlay>();
     let events = app.clone();
@@ -97,8 +97,6 @@ pub fn start(app: &AppHandle) -> Computer {
     }
     #[cfg(windows)]
     {
-        // The glow comes in a later stage; until then its marks go nowhere.
-        drop(marks);
         let desktop: Arc<dyn super::Desktop> = Arc::new(super::win::WinDesktop);
         let glow = move |mark| {
             let _ = overlay.send(Overlay::Mark(mark));
@@ -107,6 +105,10 @@ pub fn start(app: &AppHandle) -> Computer {
             .map_err(|error| eprintln!("gentle-dot: computer control is unavailable: {error}"))
             .ok();
         watch_timeout(control.clone());
+        match build_glow(app) {
+            Ok(window) => run_glow(app.clone(), window, control.clone(), marks),
+            Err(error) => eprintln!("gentle-dot: the computer-control glow is unavailable: {error}"),
+        }
         Computer { control, endpoint, desktop }
     }
     #[cfg(not(any(target_os = "macos", windows)))]
@@ -225,6 +227,80 @@ fn run_overlay(
                         order_overlay(&app, ns_window, &number, true);
                         shown = true;
                     }
+                    if let Err(error) = app.emit_to(GLOW_WINDOW, GLOW_EVENT, event) {
+                        eprintln!("gentle-dot: cannot draw the glow: {error}");
+                    }
+                }
+            }
+        }
+    });
+    if let Err(error) = spawned {
+        eprintln!("gentle-dot: the computer-control glow is unavailable: {error}");
+    }
+}
+
+/// The glow overlay on Windows (S28): transparent, undecorated, click-through, never activated
+/// nor captured, hidden until a session starts. Windows' hit tests skip it, so the window under
+/// a point stays the app's.
+#[cfg(windows)]
+fn build_glow(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
+    let url = tauri::WebviewUrl::App("index.html?surface=glow".into());
+    let window = tauri::WebviewWindowBuilder::new(app, GLOW_WINDOW, url)
+        .title(GLOW_TITLE)
+        .inner_size(1.0, 1.0)
+        .position(0.0, 0.0)
+        .transparent(true)
+        .decorations(false)
+        .always_on_top(true)
+        .resizable(false)
+        .skip_taskbar(true)
+        .shadow(false)
+        .focused(false)
+        .focusable(false)
+        .visible(false)
+        .build()?;
+    window.set_ignore_cursor_events(true)?;
+    super::win::prepare_overlay(window.hwnd()?.0);
+    Ok(window)
+}
+
+/// The glow's own thread on Windows: follows the session and draws each mark while it lasts.
+/// Marks and displays are in physical pixels; the page gets CSS pixels.
+#[cfg(windows)]
+fn run_glow(app: AppHandle, window: tauri::WebviewWindow, control: Arc<Control>, marks: std::sync::mpsc::Receiver<Overlay>) {
+    let Ok(hwnd) = window.hwnd() else {
+        eprintln!("gentle-dot: the computer-control glow is unavailable: no window handle");
+        return;
+    };
+    // The handle crosses to the glow thread as a number; the window lives as long as the app.
+    let hwnd = hwnd.0 as usize;
+    let spawned = std::thread::Builder::new().name("computer-glow".into()).spawn(move || {
+        let window = hwnd as *mut std::ffi::c_void;
+        let (mut shown, mut covering) = (false, None);
+        for message in marks {
+            match message {
+                Overlay::Session(active) => {
+                    if active != shown {
+                        super::win::show_overlay(window, active);
+                        shown = active;
+                    }
+                }
+                Overlay::Mark(mark) => {
+                    // A mark that arrives after Stop or panic is dropped.
+                    if !control.is_active(SystemClock.now_ms()) {
+                        continue;
+                    }
+                    let placed = super::glow::place(mark, super::win::display_frame_at, super::win::focused_frame);
+                    let Some((display, event)) = placed else { continue };
+                    if covering != Some(display) {
+                        super::win::cover(window, display);
+                        covering = Some(display);
+                    }
+                    if !shown {
+                        super::win::show_overlay(window, true);
+                        shown = true;
+                    }
+                    let event = super::glow::in_css_pixels(event, super::win::display_scale(display));
                     if let Err(error) = app.emit_to(GLOW_WINDOW, GLOW_EVENT, event) {
                         eprintln!("gentle-dot: cannot draw the glow: {error}");
                     }

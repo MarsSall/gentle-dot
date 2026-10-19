@@ -75,7 +75,9 @@ input records the default microphone through WASAPI (shared mode, converted by W
 mono) and transcribes it with the downloadable local model, as on Linux; there is no microphone
 prompt for desktop apps, so a capture blocked in Windows privacy settings explains where to allow it.
 The ephemeral secret-store fallback is not a complete Windows equivalent of secure credential storage.
-Computer control remains macOS-only in the existing implementation.
+Computer control runs on Windows too (`docs/design.md` S24.10): SendInput and GDI capture, UI Automation
+for the risk check, a Windows blocklist, task dialogs that refuse by default, Alt+Shift+Esc to stop, and
+the glow. Its real input, capture, dialogs, and glow are exercised only in the user's own desktop session.
 Native IPC, daemon startup/owned shutdown, dependency compatibility, graphical behavior, and
 independent security checks still require Windows implementation or verification. sherpa-onnx remains
 a dependency: its build script can download native libraries, so even an offline Cargo invocation must

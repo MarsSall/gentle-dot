@@ -534,37 +534,43 @@ pub fn frontmost_app() -> Option<AppIdentity> {
     (!root.is_null()).then(|| target_of(root))
 }
 
-/// The app owning the focused element, which can differ from the foreground window's (a panel
-/// of another process): UI Automation's answer, else the focus window's. A Store app's frame
-/// stands for the app inside it; a focus Windows does not identify is `UNIDENTIFIED`.
+/// The app the keys go to: the focus window's app (through the same window checks as every
+/// target) and UI Automation's focused element's app, the more restrictive of the two. One that
+/// is refused carries no process id, so the helper never drops it as the front app; a focus
+/// Windows does not report is the refused Unidentified app.
 pub fn focused_app() -> Option<AppIdentity> {
-    let resolve = |pid: i32| {
+    let own = std::process::id() as i32;
+    let refused = |id: &AppIdentity| blocked_reason(id, own).is_some();
+    // UI Automation's answer: none when it did not answer; a Store frame's host leaves it to the window.
+    let from_uia = focused_pid().and_then(|pid| {
         let id = identity(pid);
-        // An unknown process id-0 app: never mistaken for the front app by its id.
         (!is_frame_host(&id)).then(|| known(id).unwrap_or_else(|| unidentified(NO_PROCESS)))
-    };
-    if let Some(id) = focused_pid().and_then(resolve) {
-        return Some(id);
-    }
+    });
+    // The focus window's answer: an error when Windows did not say, none when no window has the focus.
     // SAFETY: plain queries; `info` is a valid out-pointer whose size is set.
-    unsafe {
+    let from_window: Result<Option<AppIdentity>, ()> = unsafe {
         let foreground = GetForegroundWindow();
-        if foreground.is_null() {
-            return Some(unidentified(NO_PROCESS));
-        }
-        let thread = GetWindowThreadProcessId(foreground, null_mut());
+        let thread = if foreground.is_null() { 0 } else { GetWindowThreadProcessId(foreground, null_mut()) };
         let mut info: GUITHREADINFO = zeroed();
         info.cbSize = size_of::<GUITHREADINFO>() as u32;
-        // Asked and not answered: where the keys go is unknown, so they are refused. No process
-        // has id 0, so the helper never mistakes this for the front app itself.
-        if GetGUIThreadInfo(thread, &mut info) == 0 {
-            return Some(unidentified(NO_PROCESS));
+        if thread == 0 || GetGUIThreadInfo(thread, &mut info) == 0 {
+            Err(())
+        } else if info.hwndFocus.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(target_of(GetAncestor(info.hwndFocus, GA_ROOT))))
         }
-        // No focus window: keys go to the foreground window, which is checked as the front app.
-        if info.hwndFocus.is_null() {
-            return None;
-        }
-        Some(resolve(window_pid(info.hwndFocus)).unwrap_or_else(|| target_of(GetAncestor(info.hwndFocus, GA_ROOT))))
+    };
+    let answers = [from_window.clone().ok().flatten(), from_uia.clone()];
+    if let Some(blocked) = answers.iter().flatten().find(|id| refused(id)) {
+        return Some(AppIdentity { pid: NO_PROCESS, ..blocked.clone() });
+    }
+    match from_window {
+        Err(()) => Some(unidentified(NO_PROCESS)),
+        // A focused element in another process (a panel) receives the keys; the helper checks it.
+        Ok(Some(window)) => Some(from_uia.filter(|uia| uia.pid != window.pid).unwrap_or(window)),
+        // No focus window: keys go to the foreground window, checked as the front app.
+        Ok(None) => from_uia,
     }
 }
 
@@ -784,14 +790,15 @@ const DEFAULT_BUTTON_SCAN: i32 = 1024;
 const UIA_TIMEOUT_MS: u32 = 500;
 
 mod uia {
-    pub use windows::core::{Interface, BSTR};
+    pub use windows::core::Interface;
     pub use windows::Win32::System::Variant::VARIANT;
     pub use windows::Win32::Foundation::POINT;
     pub use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
     pub use windows::Win32::UI::Accessibility::{
         CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern,
-        IUIAutomationValuePattern, TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_LegacyIAccessiblePatternId,
-        UIA_LegacyIAccessibleStatePropertyId, UIA_ValuePatternId,
+        IUIAutomationValuePattern, TreeScope_Descendants, UIA_ControlTypePropertyId,
+        UIA_IsLegacyIAccessiblePatternAvailablePropertyId, UIA_IsValuePatternAvailablePropertyId,
+        UIA_LegacyIAccessiblePatternId, UIA_LegacyIAccessibleStatePropertyId, UIA_PROPERTY_ID, UIA_ValuePatternId,
     };
 }
 
@@ -852,40 +859,58 @@ impl Automation {
     }
 }
 
-fn text(value: windows::core::Result<uia::BSTR>) -> Option<String> {
-    value.ok().map(|text| text.to_string())
-}
-
 fn control_type(of: &uia::IUIAutomationElement) -> i32 {
     // SAFETY: a call on a live COM object.
     unsafe { of.CurrentControlType() }.map_or(0, |t| t.0)
 }
 
 /// The legacy accessible state, where the default button is marked.
-fn legacy_state(of: &uia::IUIAutomationElement) -> Option<u32> {
+/// A boolean property; an error when UI Automation did not answer.
+fn property_bool(of: &uia::IUIAutomationElement, property: uia::UIA_PROPERTY_ID) -> Result<bool, ()> {
+    // SAFETY: a call on a live COM object.
+    let value = unsafe { of.GetCurrentPropertyValue(property) }.map_err(|_| ())?;
+    bool::try_from(&value).map_err(|_| ())
+}
+
+/// The legacy accessible state, where the default button is marked: none for an element without
+/// one, an error when UI Automation did not answer.
+fn legacy_state(of: &uia::IUIAutomationElement) -> Result<Option<u32>, ()> {
+    if !property_bool(of, uia::UIA_IsLegacyIAccessiblePatternAvailablePropertyId)? {
+        return Ok(None);
+    }
     // SAFETY: calls on live COM objects.
     unsafe {
-        let legacy = of.GetCurrentPatternAs::<uia::IUIAutomationLegacyIAccessiblePattern>(uia::UIA_LegacyIAccessiblePatternId).ok()?;
-        legacy.CurrentState().ok()
+        let legacy = of
+            .GetCurrentPatternAs::<uia::IUIAutomationLegacyIAccessiblePattern>(uia::UIA_LegacyIAccessiblePatternId)
+            .map_err(|_| ())?;
+        legacy.CurrentState().map(Some).map_err(|_| ())
     }
 }
 
-/// An element in the risk check's terms. A password field's value is never read, nor is the
-/// value of a field that does not say whether it is one.
+/// An element in the risk check's terms. Any property UI Automation does not report (type, name,
+/// help text, whether it is a password, whether it has a value, the value) makes it an unreadable
+/// element, which asks for a confirmation. A password field's value is never read.
 fn describe(of: &uia::IUIAutomationElement) -> AxElement {
     // SAFETY: calls on live COM objects.
     unsafe {
-        let password = of.CurrentIsPassword().map_or(true, |p| p.as_bool());
-        let value = if password {
+        let (Ok(kind), Ok(name), Ok(help), Ok(password)) =
+            (of.CurrentControlType(), of.CurrentName(), of.CurrentHelpText(), of.CurrentIsPassword())
+        else {
+            return unreadable();
+        };
+        let Ok(has_value) = property_bool(of, uia::UIA_IsValuePatternAvailablePropertyId) else { return unreadable() };
+        let value = if password.as_bool() || !has_value {
             None
         } else {
-            of.GetCurrentPatternAs::<uia::IUIAutomationValuePattern>(uia::UIA_ValuePatternId)
-                .ok()
-                .and_then(|pattern| text(pattern.CurrentValue()))
+            let read = of
+                .GetCurrentPatternAs::<uia::IUIAutomationValuePattern>(uia::UIA_ValuePatternId)
+                .and_then(|pattern| pattern.CurrentValue());
+            match read {
+                Ok(value) => Some(value.to_string()),
+                Err(_) => return unreadable(),
+            }
         };
-        // An element whose type or name Windows does not report cannot be judged, so it asks.
-        let (Ok(kind), Ok(name)) = (of.CurrentControlType(), of.CurrentName()) else { return unreadable() };
-        element(kind.0, Some(name.to_string()), text(of.CurrentHelpText()), value)
+        element(kind.0, Some(name.to_string()), Some(help.to_string()), value)
     }
 }
 
@@ -927,7 +952,9 @@ pub fn element_at(at: Point) -> Vec<AxElement> {
 fn window_of(automation: &Automation, of: &uia::IUIAutomationElement) -> Result<Option<uia::IUIAutomationElement>, ()> {
     let mut current = of.clone();
     for _ in 0..WINDOW_SEARCH {
-        if control_type(&current) == UIA_WINDOW {
+        // SAFETY: a call on a live COM object.
+        let kind = unsafe { current.CurrentControlType() }.map_err(|_| ())?;
+        if kind.0 == UIA_WINDOW {
             return Ok(Some(current));
         }
         match automation.parent(&current) {
@@ -953,16 +980,22 @@ fn default_button(
         cache.AddProperty(uia::UIA_LegacyIAccessibleStatePropertyId)?;
         let found = window.FindAllBuildCache(uia::TreeScope_Descendants, &buttons, &cache)?;
         let count = found.Length()?.min(DEFAULT_BUTTON_SCAN);
-        Ok((0..count).filter_map(|i| found.GetElement(i).ok()).find(|button| {
-            let state = button.GetCachedPropertyValue(uia::UIA_LegacyIAccessibleStatePropertyId).ok();
-            state.and_then(|value| i32::try_from(&value).ok()).is_some_and(|state| is_default(state as u32))
-        }))
+        // Every button is read: one that cannot be could be the default, so the scan fails.
+        for i in 0..count {
+            let button = found.GetElement(i)?;
+            let state = button.GetCachedPropertyValue(uia::UIA_LegacyIAccessibleStatePropertyId)?;
+            let state = i32::try_from(&state)?;
+            if is_default(state as u32) {
+                return Ok(Some(button));
+            }
+        }
+        Ok(None)
     }
 }
 
 /// The focused element, whether it is its window's default button, and that button.
-/// A focus UI Automation does not report is an unreadable element, and a default button it does
-/// not report an unreadable one: Return or Space then asks for a confirmation.
+/// A focus UI Automation does not report is an unreadable element (Return and Space then ask for
+/// a confirmation), and a default button it does not report an unreadable one (Return asks).
 pub fn focused_element() -> Option<Focus> {
     let unknown = || Some(Focus { element: unreadable(), is_default_button: false, default_button: None });
     let Some(automation) = Automation::new() else { return unknown() };
@@ -973,9 +1006,11 @@ pub fn focused_element() -> Option<Focus> {
         Ok(None) => Ok(None),
         Err(()) => Err(()),
     };
+    // A comparison or state UI Automation does not answer counts as the default button.
     // SAFETY: a call on a live COM object.
-    let same = |button: &uia::IUIAutomationElement| unsafe { automation.client.CompareElements(button, &focused) }.is_ok_and(|b| b.as_bool());
-    let is_default_button = legacy_state(&focused).is_some_and(is_default) || default.as_ref().is_ok_and(|d| d.as_ref().is_some_and(same));
+    let same = |button: &uia::IUIAutomationElement| unsafe { automation.client.CompareElements(button, &focused) }.map_or(true, |b| b.as_bool());
+    let marked = legacy_state(&focused).map_or(true, |state| state.is_some_and(is_default));
+    let is_default_button = marked || default.as_ref().is_ok_and(|d| d.as_ref().is_some_and(same));
     let default_button = match &default {
         Ok(found) => found.as_ref().map(describe),
         Err(()) => Some(unreadable()),

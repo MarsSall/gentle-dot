@@ -10,16 +10,20 @@
 //! the executable's file name stands for the macOS bundle id, and its file description for the
 //! app name. Store apps draw inside a frame window owned by `ApplicationFrameHost.exe`; their
 //! identity is the process of the frame's core window, so Settings is Settings, not its host.
+//! An action aimed at an app Windows will not identify (a process that cannot be queried, a
+//! frame whose app is not found) has no target, and the helper refuses it.
 //!
 //! Elements come from UI Automation (`winaccess` maps them), with a 0.5 s timeout so a hung app
 //! cannot stall the helper, as the Accessibility timeout does on macOS.
 
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
-use super::blocklist::{blocked_reason, AppIdentity};
+use super::blocklist::{blocked_name, blocked_reason, AppIdentity};
 use super::risk::{AxElement, Focus};
 use super::winaccess::{element, is_default, UIA_BUTTON, UIA_WINDOW};
-use super::winapps::{answers_to, app_pids, launch_for, launchable, Launch, TopWindow};
+use super::winapps::{
+    answers_to, app_pids, executable_target, hosted_page, request, shortcut_named, strip_ci, Request, TopWindow,
+};
 use super::winput::{releases, steps, Step, VirtualScreen};
 use super::{AppInfo, Capture, InputEvent, MouseButton};
 use std::ffi::c_void;
@@ -30,6 +34,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 use windows_sys::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -338,11 +343,11 @@ fn window_pid(hwnd: HWND) -> i32 {
 }
 
 /// The app a top-level window belongs to: its own process, or for a Store app's frame the
-/// process of the core window inside it.
-fn app_pid(root: HWND) -> i32 {
+/// process of the core window inside it (none when that window is not found).
+fn app_pid(root: HWND) -> Option<i32> {
     let frame_pid = window_pid(root);
     if class_name(root) != FRAME_CLASS {
-        return frame_pid;
+        return (frame_pid != 0).then_some(frame_pid);
     }
     struct Search {
         frame_pid: i32,
@@ -361,7 +366,7 @@ fn app_pid(root: HWND) -> i32 {
     let mut search = Search { frame_pid, found: 0 };
     // SAFETY: the callback only reads windows and writes `search`, which outlives the call.
     unsafe { EnumChildWindows(root, Some(visit), &mut search as *mut Search as LPARAM) };
-    if search.found != 0 { search.found } else { frame_pid }
+    (search.found != 0).then_some(search.found)
 }
 
 /// Every top-level window, front to back, with the app it belongs to.
@@ -386,7 +391,8 @@ fn top_windows() -> Vec<(HWND, TopWindow)> {
                 DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, &mut cloaked as *mut u32 as *mut c_void, size_of::<u32>() as u32)
             };
             let window = TopWindow {
-                pid: app_pid(hwnd),
+                // Listed under its host while its app is not found; never a target then.
+                pid: app_pid(hwnd).unwrap_or_else(|| window_pid(hwnd)),
                 title: title(hwnd),
                 visible,
                 cloaked: read == 0 && cloaked != 0,
@@ -407,7 +413,8 @@ fn process_path(pid: i32) -> Option<String> {
         if process.is_null() {
             return None;
         }
-        let mut buffer = vec![0u16; 1024];
+        // The longest path Windows supports.
+        let mut buffer = vec![0u16; 32768];
         let mut length = buffer.len() as u32;
         let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut length);
         CloseHandle(process);
@@ -460,18 +467,42 @@ pub fn identity(pid: i32) -> AppIdentity {
     AppIdentity { pid, bundle_id: executable, name }
 }
 
+/// An identity Windows actually gave: the executable is known.
+fn known(id: AppIdentity) -> Option<AppIdentity> {
+    id.bundle_id.is_some().then_some(id)
+}
+
+fn is_frame_host(id: &AppIdentity) -> bool {
+    id.bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("ApplicationFrameHost.exe"))
+}
+
+/// The app an action aimed at a top-level window targets, or none when Windows does not say.
+/// A File Explorer window showing a blocked page (Credential Manager) is that page.
+fn target_of(root: HWND) -> Option<AppIdentity> {
+    let id = known(identity(app_pid(root)?))?;
+    Some(match hosted_page(id.bundle_id.as_deref(), &title(root)) {
+        Some(page) => AppIdentity { pid: id.pid, bundle_id: None, name: page.to_string() },
+        None => id,
+    })
+}
+
 /// The app owning the foreground window.
 pub fn frontmost_app() -> Option<AppIdentity> {
     // SAFETY: plain queries.
     let root = unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) };
-    (!root.is_null()).then(|| identity(app_pid(root)))
+    if root.is_null() {
+        return None;
+    }
+    target_of(root)
 }
 
-/// The app owning the focused element, which can differ from the foreground window's (a Store
-/// app's frame, a panel of another process): UI Automation's answer, else the focus window's.
+/// The app owning the focused element, which can differ from the foreground window's (a panel
+/// of another process): UI Automation's answer, else the focus window's. A Store app's frame
+/// stands for the app inside it.
 pub fn focused_app() -> Option<AppIdentity> {
-    if let Some(pid) = focused_pid() {
-        return Some(identity(pid));
+    let direct = |pid: i32| Some(identity(pid)).filter(|id| !is_frame_host(id)).and_then(known);
+    if let Some(id) = focused_pid().and_then(direct) {
+        return Some(id);
     }
     // SAFETY: plain queries; `info` is a valid out-pointer whose size is set.
     unsafe {
@@ -485,13 +516,12 @@ pub fn focused_app() -> Option<AppIdentity> {
         if GetGUIThreadInfo(thread, &mut info) == 0 || info.hwndFocus.is_null() {
             return None;
         }
-        let pid = window_pid(info.hwndFocus);
-        (pid != 0).then(|| identity(pid))
+        direct(window_pid(info.hwndFocus)).or_else(|| target_of(GetAncestor(info.hwndFocus, GA_ROOT)))
     }
 }
 
 /// The app owning the topmost window under `at`. Click-through windows (the glow) are skipped
-/// by Windows itself; a point with no window has no owner.
+/// by Windows itself; a point with no window, or whose app Windows does not say, has no owner.
 pub fn window_owner_at(at: Point) -> Option<AppIdentity> {
     let point = POINT { x: at.x.round() as i32, y: at.y.round() as i32 };
     // SAFETY: plain queries.
@@ -499,8 +529,7 @@ pub fn window_owner_at(at: Point) -> Option<AppIdentity> {
     if root.is_null() {
         return None;
     }
-    let pid = app_pid(root);
-    (pid != 0).then(|| identity(pid))
+    target_of(root)
 }
 
 /// The running apps, front to back.
@@ -576,9 +605,9 @@ fn start_menu_shortcuts() -> Vec<String> {
     found
 }
 
-/// Asks the shell to open a program or a shortcut.
-fn shell_open(target: &str) -> Result<(), String> {
-    let (verb, file) = (wide("open"), wide(target));
+/// Asks the shell to start a program.
+fn shell_open(program: &str) -> Result<(), String> {
+    let (verb, file) = (wide("open"), wide(program));
     // SAFETY: valid wide strings; COM is initialized for the call (the shell may need it) and
     // uninitialized only when this call initialized it.
     unsafe {
@@ -590,44 +619,120 @@ fn shell_open(target: &str) -> Result<(), String> {
         if result as isize > 32 {
             Ok(())
         } else {
-            Err(format!("cannot open `{target}`: Windows could not find or start it"))
+            Err(format!("cannot open `{program}`: Windows could not start it"))
         }
     }
 }
 
-/// Opens an app, or brings it forward when it already runs. A running app is found by its name
-/// or executable; otherwise a Start menu shortcut with that name, otherwise the program name.
+/// `name` with `.exe`, as Windows names programs.
+fn with_exe(name: &str) -> String {
+    if strip_ci(name, ".exe").is_some() { name.to_string() } else { format!("{name}.exe") }
+}
+
+/// The program a shortcut starts, when it is a local program started with no arguments.
+fn shortcut_target(path: &str) -> Result<String, String> {
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    let unreadable = || format!("cannot tell what `{path}` opens, so it was not opened.");
+    let utf16 = |units: &[u16]| String::from_utf16_lossy(&units[..units.iter().position(|&u| u == 0).unwrap_or(units.len())]);
+    // Declared first so the shell link is released before COM is left.
+    let _apartment = Apartment::join();
+    let file = wide(path);
+    // SAFETY: calls on live COM objects with buffers of the lengths passed.
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(|_| unreadable())?;
+        link.cast::<IPersistFile>().map_err(|_| unreadable())?.Load(PCWSTR(file.as_ptr()), STGM_READ).map_err(|_| unreadable())?;
+        let mut target = vec![0u16; 32768];
+        link.GetPath(&mut target, null_mut(), 0).map_err(|_| unreadable())?;
+        let mut arguments = vec![0u16; 32768];
+        link.GetArguments(&mut arguments).map_err(|_| unreadable())?;
+        let target = utf16(&target);
+        if target.trim().is_empty() {
+            return Err(unreadable());
+        }
+        executable_target(&target, &utf16(&arguments))
+    }
+}
+
+/// The program registered for `name` under App Paths (the user's entry first).
+fn app_path(name: &str) -> Option<String> {
+    let key = wide(&format!(r"Software\Microsoft\Windows\CurrentVersion\App Paths\{}", with_exe(name)));
+    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        let mut buffer = vec![0u16; 32768];
+        let mut bytes = (buffer.len() * 2) as u32;
+        // SAFETY: the buffer's size in bytes is passed and updated; REG_EXPAND_SZ is expanded.
+        let status = unsafe {
+            RegGetValueW(root, key.as_ptr(), std::ptr::null(), RRF_RT_REG_SZ, null_mut(), buffer.as_mut_ptr() as *mut c_void, &mut bytes)
+        };
+        if status == 0 {
+            let units = &buffer[..(bytes as usize / 2).min(buffer.len())];
+            return Some(String::from_utf16_lossy(units).trim_end_matches('\0').to_string());
+        }
+    }
+    None
+}
+
+/// The program `name` in an absolute folder of PATH (never the current folder).
+fn search_exe(name: &str) -> Option<String> {
+    let file = with_exe(name);
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&file))
+        .find(|candidate| candidate.is_file())
+        .map(|found| found.to_string_lossy().into_owned())
+}
+
+fn off_limits(label: &str) -> String {
+    format!("{label} is off limits, so it was not opened.")
+}
+
+/// Opens an app, or brings it forward when it already runs, the way `open -a` does on macOS: by a
+/// running app's name or executable, else a Start menu shortcut with that name, else the program
+/// App Paths or PATH names. Whatever the route, only a program on a local drive is started, with
+/// no arguments, and never one the blocklist names.
 pub fn open_app(name: &str) -> Result<(), String> {
-    let wanted = launchable(name)?;
+    let request = request(name)?;
     let own = std::process::id() as i32;
-    for (hwnd, window) in top_windows() {
-        if !window.is_app() {
-            continue;
-        }
-        let id = identity(window.pid);
-        if answers_to(wanted, &id.name, id.bundle_id.as_deref()) {
-            if let Some(label) = blocked_reason(&id, own) {
-                return Err(format!("{label} is off limits, so it was not opened."));
+    if let Request::Name(wanted) = &request {
+        for (hwnd, window) in top_windows() {
+            let Some(id) = Some(window.pid).filter(|_| window.is_app()).and_then(|pid| known(identity(pid))) else { continue };
+            if answers_to(wanted, &id.name, id.bundle_id.as_deref()) {
+                if let Some(label) = blocked_reason(&id, own) {
+                    return Err(off_limits(label));
+                }
+                bring_to_front(hwnd);
+                return Ok(());
             }
-            bring_to_front(hwnd);
-            return Ok(());
         }
     }
-    match launch_for(wanted, &start_menu_shortcuts())? {
-        Launch::Shortcut(path) | Launch::Program(path) => shell_open(&path),
+    let program = match &request {
+        Request::Path(path) if strip_ci(path, ".lnk").is_some() => shortcut_target(path)?,
+        Request::Path(path) => executable_target(path, "")?,
+        Request::Name(wanted) => match shortcut_named(wanted, &start_menu_shortcuts()) {
+            Some(shortcut) => shortcut_target(shortcut)?,
+            None => {
+                let found = app_path(wanted).or_else(|| search_exe(wanted));
+                executable_target(&found.ok_or_else(|| format!("cannot find an app named `{wanted}`"))?, "")?
+            }
+        },
+    };
+    if !std::path::Path::new(&program).is_file() {
+        return Err(format!("`{program}` does not exist, so it was not opened."));
     }
+    if let Some(label) = blocked_name(&program) {
+        return Err(off_limits(label));
+    }
+    shell_open(&program)
 }
 
 /// How many ancestors of the element under a point are read (text inside a button), as on macOS.
 const AX_ANCESTORS: usize = 4;
 /// How far up the focused element its window is looked for.
-const WINDOW_SEARCH: usize = 12;
-/// At most this many buttons of a dialog are checked for the default one.
-const DIALOG_BUTTONS: i32 = 64;
+const WINDOW_SEARCH: usize = 32;
 /// UI Automation gives up on an unresponsive app after this long.
 const UIA_TIMEOUT_MS: u32 = 500;
-/// The class of the classic Win32 dialog.
-const DIALOG_CLASS: &str = "#32770";
 
 mod uia {
     pub use windows::core::{Interface, BSTR};
@@ -636,8 +741,8 @@ mod uia {
     pub use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
     pub use windows::Win32::UI::Accessibility::{
         CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern,
-        IUIAutomationValuePattern, IUIAutomationWindowPattern, TreeScope_Descendants, UIA_ControlTypePropertyId,
-        UIA_LegacyIAccessiblePatternId, UIA_ValuePatternId, UIA_WindowPatternId,
+        IUIAutomationValuePattern, TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_LegacyIAccessiblePatternId,
+        UIA_LegacyIAccessibleStatePropertyId, UIA_ValuePatternId,
     };
 }
 
@@ -650,6 +755,14 @@ struct Automation {
 
 struct Apartment(bool);
 
+impl Apartment {
+    /// Joins the thread's COM apartment; a thread already in another apartment keeps it.
+    fn join() -> Apartment {
+        // SAFETY: COM initialization on this thread, balanced by Drop when it succeeded.
+        Apartment(unsafe { uia::CoInitializeEx(None, uia::COINIT_MULTITHREADED) }.is_ok())
+    }
+}
+
 impl Drop for Apartment {
     fn drop(&mut self) {
         if self.0 {
@@ -661,9 +774,7 @@ impl Drop for Apartment {
 
 impl Automation {
     fn new() -> Option<Automation> {
-        // SAFETY: COM initialization on this thread; a thread already in another apartment keeps it.
-        let joined = unsafe { uia::CoInitializeEx(None, uia::COINIT_MULTITHREADED) }.is_ok();
-        let apartment = Apartment(joined);
+        let apartment = Apartment::join();
         // SAFETY: creating the system's UI Automation object.
         let client: uia::IUIAutomation =
             unsafe { uia::CoCreateInstance(&uia::CUIAutomation8, None, uia::CLSCTX_INPROC_SERVER) }.ok()?;
@@ -701,11 +812,12 @@ fn legacy_state(of: &uia::IUIAutomationElement) -> Option<u32> {
     }
 }
 
-/// An element in the risk check's terms. A password field's value is never read.
+/// An element in the risk check's terms. A password field's value is never read, nor is the
+/// value of a field that does not say whether it is one.
 fn describe(of: &uia::IUIAutomationElement) -> AxElement {
     // SAFETY: calls on live COM objects.
     unsafe {
-        let password = of.CurrentIsPassword().is_ok_and(|p| p.as_bool());
+        let password = of.CurrentIsPassword().map_or(true, |p| p.as_bool());
         let value = if password {
             None
         } else {
@@ -732,43 +844,41 @@ pub fn element_at(at: Point) -> Vec<AxElement> {
     chain
 }
 
-/// The window holding `of`, when it is a dialog (modal, or a classic Win32 dialog).
-fn dialog_of(automation: &Automation, of: &uia::IUIAutomationElement) -> Option<uia::IUIAutomationElement> {
+/// The window holding `of`: its nearest Window ancestor, as macOS reads `AXWindow`.
+fn window_of(automation: &Automation, of: &uia::IUIAutomationElement) -> Option<uia::IUIAutomationElement> {
     let mut current = of.clone();
     for _ in 0..WINDOW_SEARCH {
         if control_type(&current) == UIA_WINDOW {
-            // SAFETY: calls on live COM objects.
-            let modal = unsafe {
-                current
-                    .GetCurrentPatternAs::<uia::IUIAutomationWindowPattern>(uia::UIA_WindowPatternId)
-                    .and_then(|window| window.CurrentIsModal())
-                    .is_ok_and(|modal| modal.as_bool())
-            };
-            let classic = text(unsafe { current.CurrentClassName() }).is_some_and(|class| class == DIALOG_CLASS);
-            return (modal || classic).then_some(current);
+            return Some(current);
         }
         current = automation.parent(&current)?;
     }
     None
 }
 
-/// The dialog's default button, among its first buttons.
-fn default_button(automation: &Automation, dialog: &uia::IUIAutomationElement) -> Option<uia::IUIAutomationElement> {
+/// The window's default button (`AXDefaultButton` on macOS). One cross-process call fetches every
+/// button of the window with its legacy state, within the UI Automation timeout.
+fn default_button(automation: &Automation, window: &uia::IUIAutomationElement) -> Option<uia::IUIAutomationElement> {
     // SAFETY: calls on live COM objects.
     unsafe {
         let buttons = automation.client.CreatePropertyCondition(uia::UIA_ControlTypePropertyId, &uia::VARIANT::from(UIA_BUTTON)).ok()?;
-        let found = dialog.FindAll(uia::TreeScope_Descendants, &buttons).ok()?;
-        let count = found.Length().ok()?.min(DIALOG_BUTTONS);
-        (0..count).filter_map(|i| found.GetElement(i).ok()).find(|button| legacy_state(button).is_some_and(is_default))
+        let cache = automation.client.CreateCacheRequest().ok()?;
+        cache.AddProperty(uia::UIA_LegacyIAccessibleStatePropertyId).ok()?;
+        let found = window.FindAllBuildCache(uia::TreeScope_Descendants, &buttons, &cache).ok()?;
+        let count = found.Length().ok()?;
+        (0..count).filter_map(|i| found.GetElement(i).ok()).find(|button| {
+            let state = button.GetCachedPropertyValue(uia::UIA_LegacyIAccessibleStatePropertyId).ok();
+            state.and_then(|value| i32::try_from(&value).ok()).is_some_and(|state| is_default(state as u32))
+        })
     }
 }
 
-/// The focused element, whether it is its dialog's default button, and that button.
+/// The focused element, whether it is its window's default button, and that button.
 pub fn focused_element() -> Option<Focus> {
     let automation = Automation::new()?;
     // SAFETY: a call on a live COM object.
     let focused = unsafe { automation.client.GetFocusedElement() }.ok()?;
-    let default = dialog_of(&automation, &focused).and_then(|dialog| default_button(&automation, &dialog));
+    let default = window_of(&automation, &focused).and_then(|window| default_button(&automation, &window));
     // SAFETY: a call on a live COM object.
     let same = |button: &uia::IUIAutomationElement| unsafe { automation.client.CompareElements(button, &focused) }.is_ok_and(|b| b.as_bool());
     let is_default_button = legacy_state(&focused).is_some_and(is_default) || default.as_ref().is_some_and(same);

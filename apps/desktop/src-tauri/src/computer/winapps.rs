@@ -1,5 +1,5 @@
-//! Which windows are apps, and what `open_app` may launch, on Windows (S24.2). Plain rules
-//! over what `win` reads from the system, tested on every OS.
+//! Which windows are apps, which app a window is, and what `open_app` may launch, on Windows
+//! (S24.2, S24.4). Plain rules over what `win` reads from the system, tested on every OS.
 
 /// A top-level window as `win` reads it, front to back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,59 +36,105 @@ pub fn app_pids(windows: &[TopWindow]) -> Vec<i32> {
     pids
 }
 
-/// What `open_app` launches for a name.
+/// What `open_app` was asked for: an app's name, or a local program or shortcut by path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Launch {
-    /// A Start menu shortcut whose name is the one asked for.
-    Shortcut(String),
-    /// The name itself, which Windows finds as a program (`notepad`, `chrome.exe`, a full path).
-    Program(String),
+pub enum Request {
+    Name(String),
+    Path(String),
 }
 
-/// Whether `name` may be handed to the shell: a program name or an executable's path, never a
-/// URL, a protocol (`ms-settings:`), or a command line.
-pub fn launchable(name: &str) -> Result<&str, String> {
+/// `text` without `suffix`, compared ASCII case-insensitively.
+pub fn strip_ci<'a>(text: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = text.len().checked_sub(suffix.len())?;
+    (text.is_char_boundary(cut) && text[cut..].eq_ignore_ascii_case(suffix)).then(|| &text[..cut])
+}
+
+/// `X:\` at the start: a path on one of this PC's drives.
+fn drive_path(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+}
+
+fn program_or_shortcut(text: &str) -> bool {
+    strip_ci(text, ".exe").is_some() || strip_ci(text, ".lnk").is_some()
+}
+
+/// Reads what `open_app` was asked for. Only an app name, or the path of a program (.exe) or a
+/// shortcut (.lnk) on a local drive; never a URL, a protocol (`ms-settings:`), a command line, a
+/// network share, a script, or a document.
+pub fn request(name: &str) -> Result<Request, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("`open_app` needs an app name.".into());
     }
-    let drive_path = name.len() > 2 && name.as_bytes()[0].is_ascii_alphabetic() && &name[1..3] == ":\\";
-    if name.contains(':') && !(drive_path && name[2..].find(':').is_none()) {
+    if name.chars().any(char::is_control) || name.ends_with('.') {
+        return Err(format!("`{name}` is not an app name."));
+    }
+    let colons = name.matches(':').count();
+    if colons > 1 || (colons == 1 && !drive_path(name)) {
         return Err(format!("`{name}` is not an app name: URLs and protocols cannot be opened."));
     }
-    if name.contains(['"', '<', '>', '|', '&', '^', '%']) || name.contains(" /") || name.contains(" -") {
+    if name.contains(['"', '<', '>', '|', '&', '^', '%', '*', '?']) || name.contains(" /") || name.contains(" -") {
         return Err(format!("`{name}` is not an app name: command lines cannot be run."));
     }
-    // A path is a local drive's (never a network share's) and names a program or a shortcut.
-    if (name.contains('\\') || name.contains('/')) && !drive_path {
-        return Err(format!("`{name}` is not an app: only programs on this PC's drives can be opened."));
+    if name.contains(['\\', '/']) {
+        let local = drive_path(name) && !name.contains('/') && !name.split('\\').any(|part| part == "..");
+        if !local {
+            return Err(format!("`{name}` is not an app: only programs on this PC's drives can be opened."));
+        }
+        if !program_or_shortcut(name) {
+            return Err(format!("`{name}` is not an app: only programs (.exe) and shortcuts (.lnk) can be opened."));
+        }
+        return Ok(Request::Path(name.to_string()));
     }
-    let lower = name.to_ascii_lowercase();
-    if drive_path && !(lower.ends_with(".exe") || lower.ends_with(".lnk")) {
+    // A bare name with an extension must be a program or a shortcut (not `notes.txt` or `run.cmd`).
+    if name.contains('.') && !program_or_shortcut(name) && name.rsplit('.').next().is_some_and(|ext| !ext.contains(' ')) {
         return Err(format!("`{name}` is not an app: only programs (.exe) and shortcuts (.lnk) can be opened."));
     }
-    Ok(name)
+    Ok(Request::Name(name.to_string()))
 }
 
-/// The Start menu shortcut named `name` (its file name without `.lnk`, any case), else the
-/// name as a program.
-pub fn launch_for(name: &str, shortcuts: &[String]) -> Result<Launch, String> {
-    let name = launchable(name)?;
-    let wanted = name.strip_suffix(".lnk").unwrap_or(name);
-    let found = shortcuts.iter().find(|path| {
+/// The Start menu shortcut named `name` (its file name without `.lnk`, any case).
+pub fn shortcut_named<'a>(name: &str, shortcuts: &'a [String]) -> Option<&'a String> {
+    let wanted = strip_ci(name, ".lnk").unwrap_or(name);
+    shortcuts.iter().find(|path| {
         let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
-        let lower = file.to_ascii_lowercase();
-        lower.ends_with(".lnk") && file[..file.len() - 4].eq_ignore_ascii_case(wanted)
-    });
-    Ok(found.map_or_else(|| Launch::Program(name.to_string()), |path| Launch::Shortcut(path.clone())))
+        strip_ci(file, ".lnk").is_some_and(|stem| stem.eq_ignore_ascii_case(wanted))
+    })
+}
+
+/// What a shortcut, an App Paths entry, or the search resolved to, when it is a program on a
+/// local drive started with no arguments. Anything else (a script, a document, a command line,
+/// a network share) is refused, so `open_app` only ever starts a program, as `open -a` does.
+pub fn executable_target(path: &str, arguments: &str) -> Result<String, String> {
+    let path = path.trim().trim_matches('"').trim();
+    if !arguments.trim().is_empty() {
+        return Err(format!("`{path}` is started with a command line, so it was not opened."));
+    }
+    let local = drive_path(path) && path.matches(':').count() == 1 && !path.contains('/') && !path.split('\\').any(|part| part == "..");
+    if !local || strip_ci(path, ".exe").is_none() || path.ends_with(['.', ' ']) {
+        return Err(format!("`{path}` is not a program on this PC's drives, so it was not opened."));
+    }
+    Ok(path.to_string())
 }
 
 /// Whether a running app answers to `name`: its name or its executable (with or without `.exe`).
 pub fn answers_to(name: &str, app_name: &str, executable: Option<&str>) -> bool {
     let name = name.trim();
-    let bare = |exe: &str| exe.strip_suffix(".exe").or_else(|| exe.strip_suffix(".EXE")).unwrap_or(exe).to_string();
+    let bare = |exe: &str| strip_ci(exe, ".exe").unwrap_or(exe).to_string();
     app_name.eq_ignore_ascii_case(name)
         || executable.is_some_and(|exe| exe.eq_ignore_ascii_case(name) || bare(exe).eq_ignore_ascii_case(&bare(name)))
+}
+
+/// The titles of the Control Panel page that holds saved credentials, which File Explorer hosts.
+const CREDENTIAL_MANAGER_TITLES: &[&str] = &["Credential Manager", "Administrador de credenciales"];
+
+/// The blocked page a File Explorer window shows, by its title: such a window is that page,
+/// not File Explorer.
+pub fn hosted_page(executable: Option<&str>, title: &str) -> Option<&'static str> {
+    let explorer = executable.is_some_and(|exe| exe.eq_ignore_ascii_case("explorer.exe"));
+    let title = title.trim();
+    (explorer && CREDENTIAL_MANAGER_TITLES.iter().any(|t| t.eq_ignore_ascii_case(title))).then_some("Credential Manager")
 }
 
 #[cfg(test)]
@@ -127,31 +173,68 @@ mod tests {
     }
 
     #[test]
-    fn program_names_and_executable_paths_can_be_launched() {
-        for name in ["Notepad", "chrome.exe", "Visual Studio Code", r"C:\Program Files\App\app.exe", r"C:\Users\me\Desktop\Tool.lnk"] {
-            assert_eq!(launchable(name), Ok(name), "{name}");
+    fn app_names_and_local_program_or_shortcut_paths_are_accepted() {
+        for name in ["Notepad", "chrome.exe", "Visual Studio Code", "Notepad++", "Tool.LNK", "Microsoft Edge"] {
+            assert_eq!(request(name), Ok(Request::Name(name.into())), "{name}");
         }
-        assert_eq!(launchable("  Notepad "), Ok("Notepad"));
+        for path in [r"C:\Program Files\App\app.exe", r"C:\Users\me\Desktop\Tool.LNK", r"D:\Tools\x.EXE"] {
+            assert_eq!(request(path), Ok(Request::Path(path.into())), "{path}");
+        }
+        assert_eq!(request("  Notepad "), Ok(Request::Name("Notepad".into())));
+        // Any Unicode name is read without panicking.
+        assert_eq!(request("a€"), Ok(Request::Name("a€".into())));
+        assert_eq!(request("€:"), Err("`€:` is not an app name: URLs and protocols cannot be opened.".into()));
     }
 
     #[test]
-    fn urls_protocols_command_lines_and_other_files_are_refused() {
-        for name in ["", "  ", "ms-settings:", "ms-settings:privacy", "https://example.com", "file:///C:/x.exe", "cmd /c del x", "powershell -c x",
-            "a & b", "a | b", r"C:\x\notes.txt", r"\\server\share\app.exe", r"C:\a:b.exe", "%COMSPEC%"]
-        {
-            assert!(launchable(name).is_err(), "{name:?} should be refused");
+    fn urls_protocols_command_lines_scripts_documents_and_shares_are_refused() {
+        for name in [
+            "", "  ", "ms-settings:", "ms-settings:privacy", "https://example.com", "file:///C:/x.exe", "cmd /c del x",
+            "powershell -c x", "a & b", "a | b", "%COMSPEC%", "x*.exe", "notes.txt", "payload.cmd", "run.bat", "x.vbs",
+            "chrome.exe.", "a\u{7}b", r"C:\x\notes.txt", r"\\server\share\app.exe", r"C:\a:b.exe", r"C:\x\..\Windows\cmd.exe",
+            "C:/x/app.exe", r"tools\app.exe",
+        ] {
+            assert!(request(name).is_err(), "{name:?} should be refused");
         }
-        assert!(launchable("ms-settings:").unwrap_err().contains("protocols"));
-        assert!(launchable("cmd /c del x").unwrap_err().contains("command lines"));
+        assert!(request("ms-settings:").unwrap_err().contains("protocols"));
+        assert!(request("cmd /c del x").unwrap_err().contains("command lines"));
+        assert!(request("payload.cmd").unwrap_err().contains("only programs"));
     }
 
     #[test]
-    fn a_start_menu_shortcut_with_the_name_wins_over_the_program_name() {
-        let shortcuts = [r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Google Chrome.lnk".to_string(), r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Notes\Notes.lnk".to_string()];
-        assert_eq!(launch_for("google chrome", &shortcuts), Ok(Launch::Shortcut(shortcuts[0].clone())));
-        assert_eq!(launch_for("Notes.lnk", &shortcuts), Ok(Launch::Shortcut(shortcuts[1].clone())));
-        assert_eq!(launch_for("Chrome", &shortcuts), Ok(Launch::Program("Chrome".into())));
-        assert!(launch_for("ms-settings:", &shortcuts).is_err());
+    fn a_start_menu_shortcut_is_found_by_its_name_in_any_case() {
+        let shortcuts = [r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Google Chrome.lnk".to_string(), r"C:\Users\me\Start Menu\Programs\Notes\NOTES.LNK".to_string()];
+        assert_eq!(shortcut_named("google chrome", &shortcuts), Some(&shortcuts[0]));
+        assert_eq!(shortcut_named("Notes.lnk", &shortcuts), Some(&shortcuts[1]));
+        assert_eq!(shortcut_named("Chrome", &shortcuts), None);
+    }
+
+    #[test]
+    fn only_a_local_program_started_without_arguments_is_launched() {
+        let chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        assert_eq!(executable_target(chrome, ""), Ok(chrome.into()));
+        assert_eq!(executable_target(&format!("\"{chrome}\""), "  "), Ok(chrome.into()));
+        assert!(executable_target(r"C:\Windows\System32\cmd.exe", "/c del x").unwrap_err().contains("command line"));
+        for target in [r"C:\x\run.cmd", r"C:\x\notes.txt", r"\\server\share\app.exe", r"C:\x\a.exe:stream", r"C:\x\..\y\a.exe", "app.exe", r"C:\x\a.exe.", ""] {
+            assert!(executable_target(target, "").is_err(), "{target:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn suffixes_compare_case_insensitively_and_safely() {
+        assert_eq!(strip_ci("Tool.LnK", ".lnk"), Some("Tool"));
+        assert_eq!(strip_ci("a.Exe", ".exe"), Some("a"));
+        assert_eq!(strip_ci("exe", ".exe"), None);
+        assert_eq!(strip_ci("€exe", ".exe"), None);
+    }
+
+    #[test]
+    fn a_file_explorer_window_showing_credential_manager_is_that_page() {
+        assert_eq!(hosted_page(Some("explorer.exe"), "Credential Manager"), Some("Credential Manager"));
+        assert_eq!(hosted_page(Some("EXPLORER.EXE"), " administrador de credenciales "), Some("Credential Manager"));
+        assert_eq!(hosted_page(Some("explorer.exe"), "Downloads"), None);
+        assert_eq!(hosted_page(Some("notepad.exe"), "Credential Manager"), None);
+        assert_eq!(hosted_page(None, "Credential Manager"), None);
     }
 
     #[test]
@@ -162,5 +245,6 @@ mod tests {
         assert!(answers_to("chrome", "Google Chrome", Some("chrome.exe")));
         assert!(!answers_to("chrom", "Google Chrome", Some("chrome.exe")));
         assert!(!answers_to("Notepad", "Paint", None));
+        assert!(answers_to("notepad", "Notepad", Some("NOTEPAD.Exe")));
     }
 }

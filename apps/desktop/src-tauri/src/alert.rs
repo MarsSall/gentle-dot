@@ -158,7 +158,9 @@ mod windows {
                 SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
                 SetForegroundWindow(hwnd);
                 // Like Gentle Dot's other windows, never in a computer-control screenshot.
-                SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+                if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) == 0 {
+                    eprintln!("gentle-dot: a dialog may show in computer-control screenshots");
+                }
             }
         }
         0

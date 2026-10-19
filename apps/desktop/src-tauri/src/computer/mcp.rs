@@ -1421,19 +1421,26 @@ mod tests {
 
     #[test]
     fn an_approved_action_waits_a_moment_for_the_previous_app_to_come_back() {
-        let rig = rig();
-        rig.ready();
-        *rig.desktop.elements.lock().unwrap() = send_button();
-        *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app();
-        *rig.desktop.activations_needed.lock().unwrap() = 3;
-        let frontmost = rig.desktop.clone();
-        *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
-            *frontmost.frontmost.lock().unwrap() = Some(app(OWN_PID, "dev.gentleman.gentle-dot", "Gentle Dot"));
-        }));
-        let result = rig.call("click", json!({"x": 10, "y": 10}));
-        assert!(!is_error(&result), "{result}");
-        assert_eq!(rig.desktop.activated.lock().unwrap().len(), 3);
-        assert_eq!(rig.desktop.events().len(), 1);
+        // How long a risky click takes when the previous app is back after `needed` activations.
+        let elapsed = |needed: usize| {
+            let rig = rig();
+            rig.ready();
+            *rig.desktop.elements.lock().unwrap() = send_button();
+            *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app();
+            *rig.desktop.activations_needed.lock().unwrap() = needed;
+            let frontmost = rig.desktop.clone();
+            *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
+                *frontmost.frontmost.lock().unwrap() = Some(app(OWN_PID, "dev.gentleman.gentle-dot", "Gentle Dot"));
+            }));
+            let start = rig.clock.now_ms();
+            let result = rig.call("click", json!({"x": 10, "y": 10}));
+            assert!(!is_error(&result), "{result}");
+            assert_eq!(rig.desktop.activated.lock().unwrap().len(), needed);
+            assert_eq!(rig.desktop.events().len(), 1);
+            rig.clock.now_ms() - start
+        };
+        // Back at the third activation: two more tries, each after a step's wait.
+        assert_eq!(elapsed(3) - elapsed(1), 2 * RESTORE_STEP_MS);
     }
 
     #[test]

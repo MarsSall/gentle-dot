@@ -551,7 +551,10 @@ impl Helper {
                 "The user allowed {action} in {target}, but {} could not be brought back to the front, so nothing was done.",
                 before.name
             )),
-            _ => Ok(()),
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "The user allowed {action} in {target}, but Gentle Dot cannot tell which app was in front before it asked, so nothing was done."
+            )),
         }
     }
 
@@ -1386,6 +1389,19 @@ mod tests {
         assert!(is_error(&result), "{result}");
         assert!(first_text(&result).contains("could not be brought back"), "{result}");
         assert_eq!(*rig.desktop.activated.lock().unwrap(), vec![200]);
+        assert!(rig.desktop.events().is_empty());
+    }
+
+    #[test]
+    fn an_approved_action_is_dropped_when_no_app_was_known_to_be_in_front() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.elements.lock().unwrap() = send_button();
+        *rig.desktop.frontmost.lock().unwrap() = None;
+        let result = rig.call("click", json!({"x": 10, "y": 10}));
+        assert!(is_error(&result), "{result}");
+        assert!(first_text(&result).contains("cannot tell which app was in front"), "{result}");
+        assert_eq!(rig.dialogs.confirmations.lock().unwrap().len(), 1, "the user was asked");
         assert!(rig.desktop.events().is_empty());
     }
 

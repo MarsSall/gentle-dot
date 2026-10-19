@@ -5,16 +5,31 @@
 //!
 //! Points are physical pixels of the virtual screen: the app is per-monitor DPI aware, so the
 //! pointer, the monitors, and `SendInput` all use them.
+//!
+//! Apps are processes with a taskbar window (`winapps`). An app's identity is its process:
+//! the executable's file name stands for the macOS bundle id, and its file description for the
+//! app name. Store apps draw inside a frame window owned by `ApplicationFrameHost.exe`; their
+//! identity is the process of the frame's core window, so Settings is Settings, not its host.
 
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
+use super::blocklist::{blocked_reason, AppIdentity};
+use super::winapps::{answers_to, app_pids, launch_for, launchable, Launch, TopWindow};
 use super::winput::{releases, steps, Step, VirtualScreen};
-use super::{Capture, InputEvent, MouseButton};
+use super::{AppInfo, Capture, InputEvent, MouseButton};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{POINT, RECT};
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+use windows_sys::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, MonitorFromPoint,
     ReleaseDC, SelectObject, SetBrushOrgEx, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
@@ -27,8 +42,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEINPUT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DrawIconEx, GetCursorInfo, GetCursorPos, GetIconInfo, GetSystemMetrics, CURSORINFO, CURSOR_SHOWING, DI_NORMAL,
+    BringWindowToTop, DrawIconEx, EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetCursorInfo,
+    GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetIconInfo, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
+    ShowWindow, WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GW_OWNER,
     ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SW_RESTORE, SW_SHOWNORMAL, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// Pause between the events of one action, so apps see distinct presses (as on macOS).
@@ -275,6 +294,322 @@ pub fn capture() -> Result<Capture, String> {
     Ok(Capture { data, mime_type: "image/jpeg", geometry })
 }
 
+/// The Store apps' frame window and the window of the app it hosts.
+const FRAME_CLASS: &str = "ApplicationFrameWindow";
+const CORE_CLASS: &str = "Windows.UI.Core.CoreWindow";
+/// How deep the Start menu folders are searched for shortcuts.
+const SHORTCUT_DEPTH: usize = 4;
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(Some(0)).collect()
+}
+
+fn class_name(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 128];
+    // SAFETY: the buffer's length is passed.
+    let length = unsafe { GetClassNameW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    String::from_utf16_lossy(&buffer[..length.max(0) as usize])
+}
+
+fn title(hwnd: HWND) -> String {
+    // SAFETY: the buffer holds the reported length plus the terminator.
+    unsafe {
+        let length = GetWindowTextLengthW(hwnd);
+        if length <= 0 {
+            return String::new();
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let copied = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
+    }
+}
+
+/// The process that created `hwnd`, or 0.
+fn window_pid(hwnd: HWND) -> i32 {
+    let mut pid = 0u32;
+    // SAFETY: `pid` is a valid out-pointer.
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    pid as i32
+}
+
+/// The app a top-level window belongs to: its own process, or for a Store app's frame the
+/// process of the core window inside it.
+fn app_pid(root: HWND) -> i32 {
+    let frame_pid = window_pid(root);
+    if class_name(root) != FRAME_CLASS {
+        return frame_pid;
+    }
+    struct Search {
+        frame_pid: i32,
+        found: i32,
+    }
+    unsafe extern "system" fn visit(child: HWND, state: LPARAM) -> i32 {
+        // SAFETY: `state` is the `Search` passed below, alive for the whole enumeration.
+        let search = unsafe { &mut *(state as *mut Search) };
+        let pid = window_pid(child);
+        if class_name(child) == CORE_CLASS && pid != search.frame_pid {
+            search.found = pid;
+            return 0;
+        }
+        1
+    }
+    let mut search = Search { frame_pid, found: 0 };
+    // SAFETY: the callback only reads windows and writes `search`, which outlives the call.
+    unsafe { EnumChildWindows(root, Some(visit), &mut search as *mut Search as LPARAM) };
+    if search.found != 0 { search.found } else { frame_pid }
+}
+
+/// Every top-level window, front to back, with the app it belongs to.
+fn top_windows() -> Vec<(HWND, TopWindow)> {
+    unsafe extern "system" fn collect(hwnd: HWND, state: LPARAM) -> i32 {
+        // SAFETY: `state` is the vector passed below, alive for the whole enumeration.
+        unsafe { (*(state as *mut Vec<HWND>)).push(hwnd) };
+        1
+    }
+    let mut handles: Vec<HWND> = Vec::new();
+    // SAFETY: the callback only appends to `handles`, which outlives the call.
+    unsafe { EnumWindows(Some(collect), &mut handles as *mut Vec<HWND> as LPARAM) };
+    handles
+        .into_iter()
+        .map(|hwnd| {
+            // SAFETY: plain queries on a window handle (a vanished window just reads as empty).
+            let (visible, style, owner) =
+                unsafe { (IsWindowVisible(hwnd) != 0, GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32, GetWindow(hwnd, GW_OWNER)) };
+            let mut cloaked = 0u32;
+            // SAFETY: `cloaked` is a valid out-pointer of the size passed.
+            let read = unsafe {
+                DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED as u32, &mut cloaked as *mut u32 as *mut c_void, size_of::<u32>() as u32)
+            };
+            let window = TopWindow {
+                pid: app_pid(hwnd),
+                title: title(hwnd),
+                visible,
+                cloaked: read == 0 && cloaked != 0,
+                tool: style & WS_EX_TOOLWINDOW != 0,
+                app_window: style & WS_EX_APPWINDOW != 0,
+                owned: !owner.is_null(),
+            };
+            (hwnd, window)
+        })
+        .collect()
+}
+
+/// The executable's full path, when the process lets itself be queried.
+fn process_path(pid: i32) -> Option<String> {
+    // SAFETY: the handle is checked and closed; the buffer's length is passed and updated.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if process.is_null() {
+            return None;
+        }
+        let mut buffer = vec![0u16; 1024];
+        let mut length = buffer.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut length);
+        CloseHandle(process);
+        (ok != 0).then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+    }
+}
+
+/// The executable's file description (what Task Manager shows as the app name).
+fn file_description(path: &str) -> Option<String> {
+    let path = wide(path);
+    // SAFETY: every buffer and out-pointer is valid; `VerQueryValueW` points into `data`, which
+    // lives until the strings are copied out.
+    unsafe {
+        let size = GetFileVersionInfoSizeW(path.as_ptr(), null_mut());
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        if GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr() as *mut c_void) == 0 {
+            return None;
+        }
+        let query = |sub: &str| -> Option<(*const c_void, u32)> {
+            let (mut pointer, mut length) = (null_mut::<c_void>(), 0u32);
+            let ok = VerQueryValueW(data.as_ptr() as *const c_void, wide(sub).as_ptr(), &mut pointer, &mut length);
+            (ok != 0 && !pointer.is_null() && length > 0).then_some((pointer as *const c_void, length))
+        };
+        let (translation, length) = query("\\VarFileInfo\\Translation")?;
+        if length < 4 {
+            return None;
+        }
+        let pair = std::slice::from_raw_parts(translation as *const u16, 2);
+        let (text, length) = query(&format!("\\StringFileInfo\\{:04x}{:04x}\\FileDescription", pair[0], pair[1]))?;
+        let units = std::slice::from_raw_parts(text as *const u16, length as usize);
+        let description = String::from_utf16_lossy(units).trim_end_matches('\0').trim().to_string();
+        (!description.is_empty()).then_some(description)
+    }
+}
+
+/// An app's identity: its executable's file name and its display name, or `process <pid>`
+/// when Windows does not let the process be queried (an elevated one, say).
+pub fn identity(pid: i32) -> AppIdentity {
+    let path = process_path(pid);
+    let executable = path.as_deref().and_then(|p| p.rsplit('\\').next()).map(str::to_string);
+    let stem = executable.as_deref().map(|exe| exe.rsplit_once('.').map_or(exe, |(stem, _)| stem).to_string());
+    let name = path
+        .as_deref()
+        .and_then(file_description)
+        .or(stem)
+        .unwrap_or_else(|| format!("process {pid}"));
+    AppIdentity { pid, bundle_id: executable, name }
+}
+
+/// The app owning the foreground window.
+pub fn frontmost_app() -> Option<AppIdentity> {
+    // SAFETY: plain queries.
+    let root = unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) };
+    (!root.is_null()).then(|| identity(app_pid(root)))
+}
+
+/// The app owning the window with the keyboard focus, which can differ from the foreground
+/// window's (a Store app's frame, a panel of another process).
+pub fn focused_app() -> Option<AppIdentity> {
+    // SAFETY: plain queries; `info` is a valid out-pointer whose size is set.
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.is_null() {
+            return None;
+        }
+        let thread = GetWindowThreadProcessId(foreground, null_mut());
+        let mut info: GUITHREADINFO = zeroed();
+        info.cbSize = size_of::<GUITHREADINFO>() as u32;
+        if GetGUIThreadInfo(thread, &mut info) == 0 || info.hwndFocus.is_null() {
+            return None;
+        }
+        let pid = window_pid(info.hwndFocus);
+        (pid != 0).then(|| identity(pid))
+    }
+}
+
+/// The app owning the topmost window under `at`. Click-through windows (the glow) are skipped
+/// by Windows itself; a point with no window has no owner.
+pub fn window_owner_at(at: Point) -> Option<AppIdentity> {
+    let point = POINT { x: at.x.round() as i32, y: at.y.round() as i32 };
+    // SAFETY: plain queries.
+    let root = unsafe { GetAncestor(WindowFromPoint(point), GA_ROOT) };
+    if root.is_null() {
+        return None;
+    }
+    let pid = app_pid(root);
+    (pid != 0).then(|| identity(pid))
+}
+
+/// The running apps, front to back.
+pub fn list_apps() -> Vec<AppInfo> {
+    let active = frontmost_app().map(|app| app.pid);
+    let windows: Vec<TopWindow> = top_windows().into_iter().map(|(_, window)| window).collect();
+    app_pids(&windows)
+        .into_iter()
+        .map(|pid| {
+            let id = identity(pid);
+            AppInfo { name: id.name, bundle_id: id.bundle_id, active: active == Some(pid) }
+        })
+        .collect()
+}
+
+/// Brings a window to the front. Windows lets only the foreground's input thread do that, so the
+/// helper joins it for the call when asking alone is refused.
+fn bring_to_front(hwnd: HWND) {
+    // SAFETY: plain window calls; the input threads are detached again before returning.
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        if SetForegroundWindow(hwnd) != 0 {
+            return;
+        }
+        let foreground = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+        let own = GetCurrentThreadId();
+        let attached = foreground != 0 && foreground != own && AttachThreadInput(own, foreground, 1) != 0;
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+        if attached {
+            AttachThreadInput(own, foreground, 0);
+        }
+    }
+}
+
+/// The frontmost app window of `pid`.
+fn app_window_of(pid: i32) -> Option<HWND> {
+    top_windows().into_iter().find(|(_, window)| window.pid == pid && window.is_app()).map(|(hwnd, _)| hwnd)
+}
+
+/// Brings an app back to the front (after a dialog took the focus).
+pub fn activate(pid: i32) {
+    if let Some(hwnd) = app_window_of(pid) {
+        bring_to_front(hwnd);
+    }
+}
+
+/// The `.lnk` files of the user's and everyone's Start menu.
+fn start_menu_shortcuts() -> Vec<String> {
+    fn walk(dir: &std::path::Path, depth: usize, found: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            // Links are not followed: only folders and files the Start menu itself holds.
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_dir() && depth > 0 {
+                walk(&path, depth - 1, found);
+            } else if kind.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
+                found.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for root in ["APPDATA", "ProgramData"] {
+        if let Some(base) = std::env::var_os(root) {
+            let programs = std::path::Path::new(&base).join(r"Microsoft\Windows\Start Menu\Programs");
+            walk(&programs, SHORTCUT_DEPTH, &mut found);
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Asks the shell to open a program or a shortcut.
+fn shell_open(target: &str) -> Result<(), String> {
+    let (verb, file) = (wide("open"), wide(target));
+    // SAFETY: valid wide strings; COM is initialized for the call (the shell may need it) and
+    // uninitialized only when this call initialized it.
+    unsafe {
+        let initialized = CoInitializeEx(null_mut(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32);
+        let result = ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), null_mut(), null_mut(), SW_SHOWNORMAL);
+        if initialized >= 0 {
+            CoUninitialize();
+        }
+        if result as isize > 32 {
+            Ok(())
+        } else {
+            Err(format!("cannot open `{target}`: Windows could not find or start it"))
+        }
+    }
+}
+
+/// Opens an app, or brings it forward when it already runs. A running app is found by its name
+/// or executable; otherwise a Start menu shortcut with that name, otherwise the program name.
+pub fn open_app(name: &str) -> Result<(), String> {
+    let wanted = launchable(name)?;
+    let own = std::process::id() as i32;
+    for (hwnd, window) in top_windows() {
+        if !window.is_app() {
+            continue;
+        }
+        let id = identity(window.pid);
+        if answers_to(wanted, &id.name, id.bundle_id.as_deref()) {
+            if let Some(label) = blocked_reason(&id, own) {
+                return Err(format!("{label} is off limits, so it was not opened."));
+            }
+            bring_to_front(hwnd);
+            return Ok(());
+        }
+    }
+    match launch_for(wanted, &start_menu_shortcuts())? {
+        Launch::Shortcut(path) | Launch::Program(path) => shell_open(&path),
+    }
+}
+
 /// These need the user's interactive desktop (not an SSH or service session): they take a real
 /// screenshot and move the real pointer, then put it back.
 #[cfg(test)]
@@ -285,6 +620,15 @@ mod tests {
         use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
         // SAFETY: plain call; the app itself is already per-monitor aware.
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    }
+
+    #[test]
+    fn this_process_is_identified_by_its_executable_and_a_name() {
+        let own = identity(std::process::id() as i32);
+        let exe = own.bundle_id.expect("the test process can query itself");
+        assert!(exe.to_ascii_lowercase().ends_with(".exe"), "{exe}");
+        assert!(!own.name.is_empty() && !own.name.starts_with("process "), "{}", own.name);
+        assert_eq!(identity(-5).name, "process -5", "an unknown process keeps its number");
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub mod windows;
 #[allow(dead_code)]
 mod win;
 #[cfg(any(windows, test))]
+pub mod winapps;
+#[cfg(any(windows, test))]
 pub mod winput;
 
 use blocklist::AppIdentity;

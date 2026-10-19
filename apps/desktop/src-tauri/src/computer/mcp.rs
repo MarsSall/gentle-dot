@@ -756,6 +756,26 @@ mod tests {
     use super::super::session::{Reason, StateEvent, SESSION_MS};
     use super::super::{InputEvent, MouseButton};
     use super::*;
+
+    // Blocked apps of the platform the tests run on (each has its own list): bundle id or
+    // executable, and the name the refusal says.
+    #[cfg(not(windows))]
+    const SETTINGS: (&str, &str) = (SETTINGS.0, SETTINGS.1);
+    #[cfg(windows)]
+    const SETTINGS: (&str, &str) = ("SystemSettings.exe", "Settings");
+    #[cfg(not(windows))]
+    const PASSWORDS: (&str, &str) = (PASSWORDS.0, PASSWORDS.1);
+    #[cfg(windows)]
+    const PASSWORDS: (&str, &str) = ("1Password.exe", "1Password");
+    #[cfg(not(windows))]
+    const KEYCHAIN: (&str, &str) = (KEYCHAIN.0, KEYCHAIN.1);
+    #[cfg(windows)]
+    const KEYCHAIN: (&str, &str) = ("CredentialUIBroker.exe", "CredentialUIBroker");
+    /// An `open_app` name the platform blocks.
+    #[cfg(not(windows))]
+    const BLOCKED_OPEN: &str = "Keychain Access";
+    #[cfg(windows)]
+    const BLOCKED_OPEN: &str = "Credential Manager";
     use serde_json::json;
     use std::sync::atomic::Ordering;
     use std::sync::Mutex;
@@ -1133,10 +1153,10 @@ mod tests {
         let rig = rig();
         rig.ready();
         *rig.desktop.owner_at.lock().unwrap() =
-            Box::new(|_| Some(app(300, "com.apple.systempreferences", "System Settings")));
+            Box::new(|_| Some(app(300, SETTINGS.0, SETTINGS.1)));
         let result = rig.call("click", json!({"x": 10, "y": 10}));
         assert!(is_error(&result));
-        assert!(first_text(&result).contains("System Settings"), "{result}");
+        assert!(first_text(&result).contains(SETTINGS.1), "{result}");
         assert!(rig.desktop.events().is_empty());
     }
 
@@ -1146,7 +1166,7 @@ mod tests {
         rig.ready();
         *rig.desktop.owner_at.lock().unwrap() = Box::new(|at: Point| {
             if at.x > 100.0 {
-                Some(app(301, "com.1password.1password", "1Password"))
+                Some(app(301, PASSWORDS.0, PASSWORDS.1))
             } else {
                 Some(safari())
             }
@@ -1169,7 +1189,7 @@ mod tests {
     fn keyboard_actions_check_the_frontmost_app() {
         let rig = rig();
         rig.ready();
-        *rig.desktop.frontmost.lock().unwrap() = Some(app(302, "com.apple.keychainaccess", "Keychain Access"));
+        *rig.desktop.frontmost.lock().unwrap() = Some(app(302, KEYCHAIN.0, KEYCHAIN.1));
         assert!(is_error(&rig.call("type", json!({"text": "hello"}))));
         assert!(is_error(&rig.call("key", json!({"combo": "cmd+a"}))));
         assert!(rig.desktop.events().is_empty());
@@ -1180,7 +1200,7 @@ mod tests {
         let rig = rig();
         rig.ready();
         // A non-activating panel takes the keys while Safari stays frontmost.
-        *rig.desktop.focused_app.lock().unwrap() = Some(app(303, "com.1password.1password", "1Password"));
+        *rig.desktop.focused_app.lock().unwrap() = Some(app(303, PASSWORDS.0, PASSWORDS.1));
         let result = rig.call("type", json!({"text": "hello"}));
         assert!(first_text(&result).contains("1Password"), "{result}");
         assert!(is_error(&rig.call("key", json!({"combo": "return"}))));
@@ -1209,7 +1229,7 @@ mod tests {
     fn opening_a_blocked_app_is_refused() {
         let rig = rig();
         rig.ready();
-        assert!(is_error(&rig.call("open_app", json!({"name": "Keychain Access"}))));
+        assert!(is_error(&rig.call("open_app", json!({"name": BLOCKED_OPEN}))));
         assert!(!is_error(&rig.call("open_app", json!({"name": "com.apple.mail"}))));
         assert_eq!(*rig.desktop.opened.lock().unwrap(), vec!["com.apple.mail".to_string()]);
     }
@@ -1531,7 +1551,7 @@ mod tests {
         rig.ready();
         *rig.desktop.owner_at.lock().unwrap() = Box::new(|at: Point| {
             if at.x > 100.0 {
-                Some(app(300, "com.apple.systempreferences", "System Settings"))
+                Some(app(300, SETTINGS.0, SETTINGS.1))
             } else {
                 Some(safari())
             }
@@ -1545,7 +1565,7 @@ mod tests {
             ])),
         );
         assert!(is_error(&result));
-        assert!(first_text(&result).contains("System Settings"), "{result}");
+        assert!(first_text(&result).contains(SETTINGS.1), "{result}");
         assert_eq!(rig.desktop.events().len(), 1);
     }
 
@@ -1665,8 +1685,8 @@ mod tests {
         *rig.dialogs.allow.lock().unwrap() = true;
         rig.ready();
         *rig.desktop.owner_at.lock().unwrap() =
-            Box::new(|_| Some(app(300, "com.apple.systempreferences", "System Settings")));
-        assert!(first_text(&rig.call("click", json!({"x": 10, "y": 10}))).contains("System Settings"));
+            Box::new(|_| Some(app(300, SETTINGS.0, SETTINGS.1)));
+        assert!(first_text(&rig.call("click", json!({"x": 10, "y": 10}))).contains(SETTINGS.1));
         let queued_at = rig.control.epoch();
         rig.control.end(Reason::Panic);
         let result = rig.helper.call_tool_from(queued_at, "key", &json!({"combo": "tab"})).unwrap();
@@ -1745,12 +1765,12 @@ mod tests {
         let rig_blocked = rig();
         rig_blocked.ready();
         *rig_blocked.desktop.owner_at.lock().unwrap() =
-            Box::new(|_| Some(app(300, "com.apple.systempreferences", "System Settings")));
+            Box::new(|_| Some(app(300, SETTINGS.0, SETTINGS.1)));
         assert!(is_error(&rig_blocked.call("click", json!({"x": 10, "y": 10}))));
         assert!(is_error(&rig_blocked.call("drag", json!({"fromX": 1, "fromY": 1, "toX": 2, "toY": 2}))));
         *rig_blocked.desktop.owner_at.lock().unwrap() = Box::new(|_| None);
         assert!(is_error(&rig_blocked.call("scroll", json!({"x": 1, "y": 1, "dx": 0, "dy": 1}))));
-        *rig_blocked.desktop.frontmost.lock().unwrap() = Some(app(302, "com.apple.keychainaccess", "Keychain Access"));
+        *rig_blocked.desktop.frontmost.lock().unwrap() = Some(app(302, KEYCHAIN.0, KEYCHAIN.1));
         assert!(is_error(&rig_blocked.call("key", json!({"combo": "cmd+a"}))));
         assert!(is_error(&rig_blocked.call("click", json!({"x": 1}))));
         // Stopped: queued before a panic, no session (denied), no screenshot yet.
@@ -1785,7 +1805,7 @@ mod tests {
         rig.ready();
         *rig.desktop.owner_at.lock().unwrap() = Box::new(|at: Point| {
             if at.x > 100.0 {
-                Some(app(300, "com.apple.systempreferences", "System Settings"))
+                Some(app(300, SETTINGS.0, SETTINGS.1))
             } else {
                 Some(safari())
             }

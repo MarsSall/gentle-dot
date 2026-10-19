@@ -1,7 +1,8 @@
 //! The Windows desktop for computer control (S24 on Windows): input through `SendInput`, and
 //! screenshots of the monitor under the pointer through GDI. Gentle Dot's own windows are
-//! left out of every capture by their display affinity (`WDA_EXCLUDEFROMCAPTURE`), set where
-//! the windows are created.
+//! left out of captures by their display affinity (`WDA_EXCLUDEFROMCAPTURE`): the glow and the
+//! dialogs always, the Dot and the panel while a session is active (Windows cannot leave a window
+//! out of one capture only, and the user's own screenshots should still show them).
 //!
 //! Points are physical pixels of the virtual screen: the app is per-monitor DPI aware, so the
 //! pointer, the monitors, and `SendInput` all use them.
@@ -58,7 +59,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
     ShowWindow, WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GW_OWNER,
     ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SW_RESTORE, SW_SHOWNORMAL, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    SW_RESTORE, SW_SHOWNORMAL, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     SetWindowLongPtrW, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
     SetWindowPos,
 };
@@ -1043,11 +1044,17 @@ fn focused_pid() -> Option<i32> {
 
 /// Keeps a window out of every screenshot and screen capture, this helper's included.
 pub fn exclude_from_capture(hwnd: *mut c_void) -> Result<(), String> {
+    set_capture_excluded(hwnd, true)
+}
+
+/// Leaves a window of this process out of screenshots, or lets it show in them again.
+pub fn set_capture_excluded(hwnd: *mut c_void, excluded: bool) -> Result<(), String> {
+    let affinity = if excluded { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
     // SAFETY: a plain call on a window handle of this process.
-    if unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } != 0 {
+    if unsafe { SetWindowDisplayAffinity(hwnd, affinity) } != 0 {
         Ok(())
     } else {
-        Err(format!("cannot keep it out of screenshots: {}", std::io::Error::last_os_error()))
+        Err(format!("cannot change whether it shows in screenshots: {}", std::io::Error::last_os_error()))
     }
 }
 

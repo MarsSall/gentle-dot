@@ -35,7 +35,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
-const DOT: &str = "dot";
+pub(crate) const DOT: &str = "dot";
 pub(crate) const PANEL: &str = "panel";
 const TRAY: &str = "main";
 /// The Dot window, in points: a 66 pt black disc with the rose, plus a 3 pt
@@ -529,8 +529,6 @@ fn build_windows(
     #[cfg(windows)]
     let dot = dot.minimizable(false);
     let dot = dot.build()?;
-    #[cfg(windows)]
-    computer::exclude_from_capture(&dot);
     // Linux has no window effects; the panel URL tells the UI to paint an opaque background.
     let panel = WebviewWindowBuilder::new(app, PANEL, WebviewUrl::App(platform::panel_url(Os::CURRENT).into()))
         .title(PANEL_TITLE)
@@ -549,9 +547,6 @@ fn build_windows(
     let panel = panel
         .effects(EffectsBuilder::new().effect(Effect::HudWindow).state(EffectState::Active).radius(20.0).build());
     let panel = panel.build()?;
-    #[cfg(windows)]
-    computer::exclude_from_capture(&panel);
-    #[cfg(not(windows))]
     drop(panel);
 
     if !places_windows {

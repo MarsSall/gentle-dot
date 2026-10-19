@@ -77,6 +77,8 @@ pub fn start(app: &AppHandle) -> Computer {
             let _ = item.0.set_checked(event.yolo);
         }
         let _ = session.send(Overlay::Session(event.active));
+        #[cfg(windows)]
+        keep_out_of_capture(&events, event.active);
     }));
     #[cfg(target_os = "macos")]
     {
@@ -322,13 +324,26 @@ fn watch_timeout(control: Arc<Control>) {
     });
 }
 
-/// Keeps a Gentle Dot window out of every screenshot (Windows), as macOS leaves the app's own
-/// windows out of the capture.
+/// Keeps the Dot and the panel out of screenshots while a session is active (Windows), as macOS
+/// leaves the app's own windows out of the helper's capture; otherwise the user's own screenshots
+/// show them. Windows cannot exclude a window from one capture only.
 #[cfg(windows)]
-pub fn exclude_from_capture(window: &tauri::WebviewWindow) {
-    let excluded = window.hwnd().map_err(|e| e.to_string()).and_then(|hwnd| super::win::exclude_from_capture(hwnd.0));
-    if let Err(error) = excluded {
-        eprintln!("gentle-dot: a window may show in computer-control screenshots: {error}");
+fn keep_out_of_capture(app: &AppHandle, excluded: bool) {
+    let handle = app.clone();
+    let scheduled = app.run_on_main_thread(move || {
+        for label in [crate::shell::DOT, crate::shell::PANEL] {
+            let Some(window) = handle.get_webview_window(label) else { continue };
+            let changed = window
+                .hwnd()
+                .map_err(|e| e.to_string())
+                .and_then(|hwnd| super::win::set_capture_excluded(hwnd.0, excluded));
+            if let Err(error) = changed {
+                eprintln!("gentle-dot: the {label} window may show in computer-control screenshots: {error}");
+            }
+        }
+    });
+    if let Err(error) = scheduled {
+        eprintln!("gentle-dot: Gentle Dot's windows may show in computer-control screenshots: {error}");
     }
 }
 

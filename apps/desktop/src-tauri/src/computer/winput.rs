@@ -97,13 +97,14 @@ pub fn virtual_key(name: &str) -> Option<(u16, bool)> {
     Some((vk, extended))
 }
 
-/// The held modifiers, in the order a person presses them; `cmd` and `ctrl` are one Ctrl.
+/// The held modifiers in macOS's order (Cmd, Shift, Alt, Ctrl). `cmd` presses Ctrl in Cmd's
+/// place, and with `ctrl` too it is pressed once.
 fn modifiers(combo: &KeyCombo) -> Result<Vec<u16>, String> {
     let m = combo.modifiers;
     if m.fn_key {
         return Err(format!("`fn` has no Windows key, so `{}` cannot be pressed", combo.key));
     }
-    Ok([(m.cmd || m.ctrl, VK_CONTROL), (m.shift, VK_SHIFT), (m.alt, VK_MENU)]
+    Ok([(m.cmd, VK_CONTROL), (m.shift, VK_SHIFT), (m.alt, VK_MENU), (m.ctrl && !m.cmd, VK_CONTROL)]
         .into_iter()
         .filter_map(|(on, vk)| on.then_some(vk))
         .collect())
@@ -120,6 +121,26 @@ fn wheel(horizontal: bool, pixels: i32) -> Option<Step> {
     let delta = if notches < 0.0 { -magnitude } else { magnitude };
     // The tool's dy > 0 scrolls down, which is a negative vertical wheel delta.
     Some(Step::Wheel { horizontal, delta: if horizontal { delta } else { -delta } })
+}
+
+/// What releases every key and button `sent` left pressed, latest first: posted when an input
+/// fails halfway, so a failed action never leaves Ctrl or a mouse button held.
+pub fn releases(sent: &[Step]) -> Vec<Step> {
+    let mut held: Vec<Step> = Vec::new();
+    for step in sent {
+        let up = match *step {
+            Step::Button { button, down } => (Step::Button { button, down: false }, down),
+            Step::Key { vk, down, extended } => (Step::Key { vk, down: false, extended }, down),
+            Step::Unicode { unit, down } => (Step::Unicode { unit, down: false }, down),
+            Step::Move { .. } | Step::Wheel { .. } => continue,
+        };
+        held.retain(|pressed| *pressed != up.0);
+        if up.1 {
+            held.push(up.0);
+        }
+    }
+    held.reverse();
+    held
 }
 
 /// The steps that post `event`, in order.
@@ -262,9 +283,18 @@ mod tests {
 
     #[test]
     fn a_combo_holds_the_modifiers_around_the_key_and_releases_them_in_reverse() {
-        let combo = parse_combo("ctrl+shift+t").unwrap();
+        // macOS presses Cmd, Shift, Alt, Ctrl in that order; Ctrl keeps Ctrl's place, cmd's Ctrl Cmd's.
+        let combo = parse_combo("ctrl+alt+shift+t").unwrap();
         assert_eq!(
             plan(InputEvent::Key(combo)),
+            [
+                key(VK_SHIFT, true), key(VK_MENU, true), key(VK_CONTROL, true), key(0x54, true),
+                key(0x54, false), key(VK_CONTROL, false), key(VK_MENU, false), key(VK_SHIFT, false),
+            ]
+        );
+        let cmd = parse_combo("cmd+shift+t").unwrap();
+        assert_eq!(
+            plan(InputEvent::Key(cmd)),
             [key(VK_CONTROL, true), key(VK_SHIFT, true), key(0x54, true), key(0x54, false), key(VK_SHIFT, false), key(VK_CONTROL, false)]
         );
         let alt = parse_combo("alt+f4").unwrap();
@@ -330,6 +360,45 @@ mod tests {
             plan(InputEvent::Text("😀".into())),
             [unicode(0xD83D, true), unicode(0xD83D, false), unicode(0xDE00, true), unicode(0xDE00, false)]
         );
+    }
+
+    #[test]
+    fn a_failed_input_releases_what_was_left_pressed_latest_first() {
+        let left = |down| Step::Button { button: MouseButton::Left, down };
+        // Failed after Ctrl, Shift, and T went down, and T came back up.
+        let sent = [key(VK_CONTROL, true), key(VK_SHIFT, true), key(0x54, true), key(0x54, false)];
+        assert_eq!(releases(&sent), [key(VK_SHIFT, false), key(VK_CONTROL, false)]);
+        // Failed in the middle of a drag: the button is released.
+        let drag = [SCREEN.move_to(at(0.0, 0.0)), left(true), SCREEN.move_to(at(5.0, 5.0))];
+        assert_eq!(releases(&drag), [left(false)]);
+        // An extended key is released as extended, a typed unit as itself.
+        let nav = [Step::Key { vk: 0x25, down: true, extended: true }, Step::Unicode { unit: 0x68, down: true }];
+        assert_eq!(releases(&nav), [Step::Unicode { unit: 0x68, down: false }, Step::Key { vk: 0x25, down: false, extended: true }]);
+        // Nothing held, nothing to release.
+        assert_eq!(releases(&[left(true), left(false), key(VK_MENU, true), key(VK_MENU, false)]), []);
+        assert_eq!(releases(&[]), []);
+    }
+
+    #[test]
+    fn negative_origins_on_both_axes_and_tiny_screens_are_normalized() {
+        let above = VirtualScreen { x: 0, y: -1080, width: 1920, height: 2160 };
+        assert_eq!(above.move_to(at(0.0, -1080.0)), Step::Move { x: 0, y: 0 });
+        assert_eq!(above.move_to(at(1919.0, 1079.0)), Step::Move { x: 65535, y: 65535 });
+        let tiny = VirtualScreen { x: 0, y: 0, width: 1, height: 1 };
+        assert_eq!(tiny.move_to(at(0.0, 0.0)), Step::Move { x: 0, y: 0 });
+        assert_eq!(tiny.move_to(at(3.0, 3.0)), Step::Move { x: 65535, y: 65535 });
+    }
+
+    #[test]
+    fn scrolling_left_is_a_negative_horizontal_delta() {
+        assert_eq!(plan(InputEvent::Scroll { at: at(0.0, 0.0), dx: -50, dy: 0 })[1], Step::Wheel { horizontal: true, delta: -120 });
+    }
+
+    #[test]
+    fn a_drag_visits_twelve_evenly_spaced_points() {
+        let drag = plan(InputEvent::Drag { from: at(0.0, 0.0), to: at(120.0, 240.0) });
+        let moves: Vec<Step> = (1..=12).map(|i| SCREEN.move_to(at(10.0 * f64::from(i), 20.0 * f64::from(i)))).collect();
+        assert_eq!(drag[2..14], moves[..]);
     }
 
     #[test]

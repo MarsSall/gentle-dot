@@ -8,7 +8,7 @@
 
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
-use super::winput::{steps, Step, VirtualScreen};
+use super::winput::{releases, steps, Step, VirtualScreen};
 use super::{Capture, InputEvent, MouseButton};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -28,7 +28,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DrawIconEx, GetCursorInfo, GetCursorPos, GetIconInfo, GetSystemMetrics, CURSORINFO, CURSOR_SHOWING, DI_NORMAL,
-    ICONINFO, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 /// Pause between the events of one action, so apps see distinct presses (as on macOS).
@@ -120,14 +120,26 @@ fn input(step: Step) -> INPUT {
     }
 }
 
-/// Posts `event`, one input at a time with a short gap, like the macOS helper.
+fn send(step: Step) -> Result<(), String> {
+    let record = input(step);
+    // SAFETY: one valid INPUT record of the size passed.
+    if unsafe { SendInput(1, &record, size_of::<INPUT>() as i32) } == 1 {
+        Ok(())
+    } else {
+        Err(format!("Windows refused the input: {}", std::io::Error::last_os_error()))
+    }
+}
+
+/// Posts `event`, one input at a time with a short gap, like the macOS helper. When an input
+/// fails halfway, whatever it left pressed is released before the error is reported.
 pub fn post(event: &InputEvent) -> Result<(), String> {
-    for step in steps(event, &virtual_screen())? {
-        let record = input(step);
-        // SAFETY: one valid INPUT record of the size passed.
-        let sent = unsafe { SendInput(1, &record, size_of::<INPUT>() as i32) };
-        if sent != 1 {
-            return Err(format!("Windows refused the input: {}", std::io::Error::last_os_error()));
+    let plan = steps(event, &virtual_screen())?;
+    for (done, step) in plan.iter().enumerate() {
+        if let Err(error) = send(*step) {
+            for release in releases(&plan[..done]) {
+                let _ = send(release);
+            }
+            return Err(error);
         }
         std::thread::sleep(EVENT_GAP);
     }
@@ -172,7 +184,12 @@ impl Canvas {
             if canvas.bitmap.is_null() || canvas.bits.is_null() {
                 return Err("cannot prepare the screenshot bitmap".into());
             }
-            canvas.previous = SelectObject(canvas.memory, canvas.bitmap);
+            let previous = SelectObject(canvas.memory, canvas.bitmap);
+            // HGDI_ERROR is -1; without the bitmap selected the pixels read would not be the capture.
+            if previous.is_null() || previous as isize == -1 {
+                return Err("cannot prepare the screenshot bitmap".into());
+            }
+            canvas.previous = previous;
             Ok(canvas)
         }
     }
@@ -196,7 +213,7 @@ impl Drop for Canvas {
     }
 }
 
-/// Draws the pointer where it is, scaled into the screenshot (macOS captures show it too).
+/// Draws the pointer where it is and at the screenshot's scale (macOS captures show it too).
 fn draw_pointer(canvas: &Canvas, frame: MonitorFrame, width: u32, height: u32) {
     // SAFETY: `info` and `icon` are valid out-pointers; the icon's bitmaps are released.
     unsafe {
@@ -217,9 +234,11 @@ fn draw_pointer(canvas: &Canvas, frame: MonitorFrame, width: u32, height: u32) {
             (0, 0)
         };
         let scale = |offset: i32, length: i32, size: u32| (i64::from(offset) * i64::from(size) / i64::from(length.max(1))) as i32;
-        let x = scale(info.ptScreenPos.x - frame.x, frame.width, width) - hot_x;
-        let y = scale(info.ptScreenPos.y - frame.y, frame.height, height) - hot_y;
-        DrawIconEx(canvas.memory, x, y, info.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
+        let (cursor_w, cursor_h) = (GetSystemMetrics(SM_CXCURSOR), GetSystemMetrics(SM_CYCURSOR));
+        let (draw_w, draw_h) = (scale(cursor_w, frame.width, width).max(1), scale(cursor_h, frame.height, height).max(1));
+        let x = scale(info.ptScreenPos.x - frame.x, frame.width, width) - scale(hot_x, frame.width, width);
+        let y = scale(info.ptScreenPos.y - frame.y, frame.height, height) - scale(hot_y, frame.height, height);
+        DrawIconEx(canvas.memory, x, y, info.hCursor, draw_w, draw_h, 0, null_mut(), DI_NORMAL);
     }
 }
 

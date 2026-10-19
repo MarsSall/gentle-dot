@@ -22,6 +22,10 @@ struct Entry {
 
 pub const GENTLE_DOT_BUNDLE: &str = "dev.gentleman.gentle-dot";
 
+/// The name Windows gives an app it does not identify (a process it does not let be queried, a
+/// Store frame whose app is not found). It is blocked: an action aimed there is refused.
+pub const UNIDENTIFIED: &str = "Unidentified app";
+
 /// macOS.
 const MACOS: &[Entry] = &[
     Entry { label: "Gentle Dot", bundles: &[GENTLE_DOT_BUNDLE], names: &["Gentle Dot"] },
@@ -83,6 +87,7 @@ const WINDOWS: &[Entry] = &[
     Entry { label: "LastPass", bundles: &["lastpass"], names: &["LastPass"] },
     Entry { label: "KeePass", bundles: &["keepass"], names: &["KeePass", "KeePass Password Safe"] },
     Entry { label: "KeePassXC", bundles: &["keepassxc"], names: &["KeePassXC"] },
+    Entry { label: "an app Windows does not identify", bundles: &[], names: &[UNIDENTIFIED] },
 ];
 
 /// Each build uses its own platform's list; the tests check both.
@@ -324,6 +329,15 @@ mod tests {
         assert_eq!(windows_name("KeePass Password Safe"), Some("KeePass"));
         assert_eq!(windows_name("Notepad"), None);
         assert_eq!(windows_name(r"C:\Windows\notepad.exe"), None);
+    }
+
+    #[test]
+    fn an_app_windows_does_not_identify_is_blocked_on_windows_only() {
+        let unknown = AppIdentity { pid: 77, bundle_id: None, name: UNIDENTIFIED.into() };
+        assert_eq!(windows_reason(&unknown), Some("an app Windows does not identify"));
+        assert_eq!(mac_reason(&unknown, OWN_PID), None);
+        // An identified app keeps its own verdict even if it happens to carry that name.
+        assert_eq!(windows_reason(&app(Some("tool.exe"), UNIDENTIFIED)), None);
     }
 
     #[test]

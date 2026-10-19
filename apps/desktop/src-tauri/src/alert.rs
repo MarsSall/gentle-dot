@@ -10,6 +10,11 @@
 //! rfd shows a `CFUserNotification` and reports cancels and failures as `Cancel`, which the plugin
 //! turns into the second label of `OkCancelCustom` (T23c B1).
 //!
+//! Windows: a task dialog whose default button is the refusing one, so Return refuses; Escape and
+//! closing answer `IDCANCEL`, and only the allowing button's own id allows. The dialog plugin is
+//! not used there: rfd's task dialog makes its first button (the OK slot, the allowing label) the
+//! default, so Return would allow. It is raised above the app being controlled when it opens.
+//!
 //! Elsewhere (Linux): the dialog plugin with the allowing label in the OK slot and the refusing one
 //! in the cancel slot, so every outcome rfd reports as `Cancel` (the refusing button, Escape,
 //! closing, a dialog that failed) arrives as the refusing label. rfd's GTK dialog sets no default
@@ -22,6 +27,10 @@ use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogResult};
 pub const REFUSE_RESPONSE: isize = 1000;
 /// The `NSAlert` response of the allowing button, added second (`NSAlertSecondButtonReturn`).
 pub const ALLOW_RESPONSE: isize = 1001;
+
+/// The Windows task dialog's button ids: the refusing one is the default.
+pub const TASK_REFUSE_ID: i32 = 2000;
+pub const TASK_ALLOW_ID: i32 = 2001;
 
 /// The two buttons of a yes/no alert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +50,12 @@ impl Choice {
         self.allow != self.refuse && response == Some(ALLOW_RESPONSE)
     }
 
-    /// The plugin's buttons (off macOS): the refusing label takes the cancel slot, where rfd puts
+    /// True only for the allowing button's id (Windows); `None` is a dialog that never ran.
+    pub fn allows_task_button(&self, button: Option<i32>) -> bool {
+        self.allow != self.refuse && button == Some(TASK_ALLOW_ID)
+    }
+
+    /// The plugin's buttons (Linux): the refusing label takes the cancel slot, where rfd puts
     /// Escape, closing, and failures.
     pub fn buttons(&self) -> MessageDialogButtons {
         MessageDialogButtons::OkCancelCustom(self.allow.into(), self.refuse.into())
@@ -58,7 +72,12 @@ impl Choice {
 pub fn ask(app: &AppHandle, title: &str, message: &str, choice: Choice) -> bool {
     #[cfg(target_os = "macos")]
     return macos::ask(app, title, message, choice);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        let _ = app;
+        windows::ask(title, message, choice)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
         let result = app
@@ -112,6 +131,65 @@ mod macos {
     }
 }
 
+#[cfg(windows)]
+mod windows {
+    use super::{Choice, TASK_ALLOW_ID, TASK_REFUSE_ID};
+    use std::mem::{size_of, zeroed};
+    use std::ptr::null_mut;
+    use windows_sys::core::HRESULT;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows_sys::Win32::UI::Controls::{
+        TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
+        TDF_SIZE_TO_CONTENT, TDN_CREATED, TD_WARNING_ICON,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetForegroundWindow, SetWindowDisplayAffinity, SetWindowPos, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, WDA_EXCLUDEFROMCAPTURE,
+    };
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    /// Raises the dialog above the app being controlled, which holds the foreground.
+    unsafe extern "system" fn on_event(hwnd: HWND, notification: u32, _: WPARAM, _: LPARAM, _: isize) -> HRESULT {
+        if notification == TDN_CREATED as u32 {
+            // SAFETY: `hwnd` is the dialog's live window during the notification.
+            unsafe {
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                SetForegroundWindow(hwnd);
+                // Like Gentle Dot's other windows, never in a computer-control screenshot.
+                SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+            }
+        }
+        0
+    }
+
+    pub fn ask(title: &str, message: &str, choice: Choice) -> bool {
+        let (title, message) = (wide(title), wide(message));
+        let (allow, refuse) = (wide(choice.allow), wide(choice.refuse));
+        let buttons = [
+            TASKDIALOG_BUTTON { nButtonID: TASK_ALLOW_ID, pszButtonText: allow.as_ptr() },
+            TASKDIALOG_BUTTON { nButtonID: TASK_REFUSE_ID, pszButtonText: refuse.as_ptr() },
+        ];
+        // SAFETY: every pointer in the config outlives the modal call that reads it.
+        unsafe {
+            let mut config: TASKDIALOGCONFIG = zeroed();
+            config.cbSize = size_of::<TASKDIALOGCONFIG>() as u32;
+            config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_SIZE_TO_CONTENT;
+            config.pszWindowTitle = title.as_ptr();
+            config.pszContent = message.as_ptr();
+            config.Anonymous1.pszMainIcon = TD_WARNING_ICON;
+            config.cButtons = buttons.len() as u32;
+            config.pButtons = buttons.as_ptr();
+            config.nDefaultButton = TASK_REFUSE_ID;
+            config.pfCallback = Some(on_event);
+            let mut pressed = 0i32;
+            let shown = TaskDialogIndirect(&config, &mut pressed, null_mut(), null_mut());
+            choice.allows_task_button((shown >= 0).then_some(pressed))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +207,19 @@ mod tests {
         }
         let same = Choice { allow: "OK", refuse: "OK" };
         assert!(!same.allows_response(Some(ALLOW_RESPONSE)));
+    }
+
+    #[test]
+    fn on_windows_only_the_allowing_task_buttons_id_allows() {
+        assert!(CHOICE.allows_task_button(Some(TASK_ALLOW_ID)));
+        // The refusing (default) button, Escape or closing (IDCANCEL), OK and the other common
+        // buttons nobody can press, an unknown id, and a dialog that failed to show all refuse.
+        for button in [Some(TASK_REFUSE_ID), Some(2), Some(1), Some(6), Some(7), Some(0), Some(-1), Some(2002), None] {
+            assert!(!CHOICE.allows_task_button(button), "{button:?}");
+        }
+        let same = Choice { allow: "OK", refuse: "OK" };
+        assert!(!same.allows_task_button(Some(TASK_ALLOW_ID)));
+        assert_ne!(TASK_ALLOW_ID, TASK_REFUSE_ID);
     }
 
     #[test]

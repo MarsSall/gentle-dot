@@ -10,15 +10,15 @@
 //! the executable's file name stands for the macOS bundle id, and its file description for the
 //! app name. Store apps draw inside a frame window owned by `ApplicationFrameHost.exe`; their
 //! identity is the process of the frame's core window, so Settings is Settings, not its host.
-//! An action aimed at an app Windows will not identify (a process that cannot be queried, a
-//! frame whose app is not found) has no target, and the helper refuses it.
+//! An app Windows will not identify (a process that cannot be queried, a frame whose app is not
+//! found) is the blocked `UNIDENTIFIED` app, so an action aimed at it is refused.
 //!
 //! Elements come from UI Automation (`winaccess` maps them), with a 0.5 s timeout so a hung app
 //! cannot stall the helper, as the Accessibility timeout does on macOS.
 
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
-use super::blocklist::{blocked_name, blocked_reason, AppIdentity};
+use super::blocklist::{blocked_name, blocked_reason, AppIdentity, UNIDENTIFIED};
 use super::risk::{AxElement, Focus};
 use super::winaccess::{element, is_default, UIA_BUTTON, UIA_WINDOW};
 use super::winapps::{
@@ -476,32 +476,39 @@ fn is_frame_host(id: &AppIdentity) -> bool {
     id.bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("ApplicationFrameHost.exe"))
 }
 
-/// The app an action aimed at a top-level window targets, or none when Windows does not say.
-/// A File Explorer window showing a blocked page (Credential Manager) is that page.
-fn target_of(root: HWND) -> Option<AppIdentity> {
-    let id = known(identity(app_pid(root)?))?;
-    Some(match hosted_page(id.bundle_id.as_deref(), &title(root)) {
+/// The app Windows does not identify, which the blocklist refuses.
+fn unidentified(pid: i32) -> AppIdentity {
+    AppIdentity { pid, bundle_id: None, name: UNIDENTIFIED.to_string() }
+}
+
+/// The app an action aimed at a top-level window targets. A File Explorer window showing a
+/// blocked page (Credential Manager) is that page; an app Windows does not identify is
+/// `UNIDENTIFIED`.
+fn target_of(root: HWND) -> AppIdentity {
+    let Some(pid) = app_pid(root) else { return unidentified(window_pid(root)) };
+    let Some(id) = known(identity(pid)) else { return unidentified(pid) };
+    match hosted_page(id.bundle_id.as_deref(), &title(root)) {
         Some(page) => AppIdentity { pid: id.pid, bundle_id: None, name: page.to_string() },
         None => id,
-    })
+    }
 }
 
 /// The app owning the foreground window.
 pub fn frontmost_app() -> Option<AppIdentity> {
     // SAFETY: plain queries.
     let root = unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) };
-    if root.is_null() {
-        return None;
-    }
-    target_of(root)
+    (!root.is_null()).then(|| target_of(root))
 }
 
 /// The app owning the focused element, which can differ from the foreground window's (a panel
 /// of another process): UI Automation's answer, else the focus window's. A Store app's frame
-/// stands for the app inside it.
+/// stands for the app inside it; a focus Windows does not identify is `UNIDENTIFIED`.
 pub fn focused_app() -> Option<AppIdentity> {
-    let direct = |pid: i32| Some(identity(pid)).filter(|id| !is_frame_host(id)).and_then(known);
-    if let Some(id) = focused_pid().and_then(direct) {
+    let resolve = |pid: i32| {
+        let id = identity(pid);
+        (!is_frame_host(&id)).then(|| known(id).unwrap_or_else(|| unidentified(pid)))
+    };
+    if let Some(id) = focused_pid().and_then(resolve) {
         return Some(id);
     }
     // SAFETY: plain queries; `info` is a valid out-pointer whose size is set.
@@ -516,20 +523,17 @@ pub fn focused_app() -> Option<AppIdentity> {
         if GetGUIThreadInfo(thread, &mut info) == 0 || info.hwndFocus.is_null() {
             return None;
         }
-        direct(window_pid(info.hwndFocus)).or_else(|| target_of(GetAncestor(info.hwndFocus, GA_ROOT)))
+        Some(resolve(window_pid(info.hwndFocus)).unwrap_or_else(|| target_of(GetAncestor(info.hwndFocus, GA_ROOT))))
     }
 }
 
 /// The app owning the topmost window under `at`. Click-through windows (the glow) are skipped
-/// by Windows itself; a point with no window, or whose app Windows does not say, has no owner.
+/// by Windows itself; a point with no window has no owner.
 pub fn window_owner_at(at: Point) -> Option<AppIdentity> {
     let point = POINT { x: at.x.round() as i32, y: at.y.round() as i32 };
     // SAFETY: plain queries.
     let root = unsafe { GetAncestor(WindowFromPoint(point), GA_ROOT) };
-    if root.is_null() {
-        return None;
-    }
-    target_of(root)
+    (!root.is_null()).then(|| target_of(root))
 }
 
 /// The running apps, front to back.
@@ -696,8 +700,9 @@ pub fn open_app(name: &str) -> Result<(), String> {
     let request = request(name)?;
     let own = std::process::id() as i32;
     if let Request::Name(wanted) = &request {
-        for (hwnd, window) in top_windows() {
-            let Some(id) = Some(window.pid).filter(|_| window.is_app()).and_then(|pid| known(identity(pid))) else { continue };
+        for (hwnd, _) in top_windows().into_iter().filter(|(_, window)| window.is_app()) {
+            // The same identity an action aimed at the window would get (hosted pages, Store apps).
+            let id = target_of(hwnd);
             if answers_to(wanted, &id.name, id.bundle_id.as_deref()) {
                 if let Some(label) = blocked_reason(&id, own) {
                     return Err(off_limits(label));
@@ -731,6 +736,9 @@ pub fn open_app(name: &str) -> Result<(), String> {
 const AX_ANCESTORS: usize = 4;
 /// How far up the focused element its window is looked for.
 const WINDOW_SEARCH: usize = 32;
+/// At most this many of a window's buttons are checked for the default one. The query itself is
+/// one cross-process call, bounded by the UI Automation timeout.
+const DEFAULT_BUTTON_SCAN: i32 = 1024;
 /// UI Automation gives up on an unresponsive app after this long.
 const UIA_TIMEOUT_MS: u32 = 500;
 
@@ -865,7 +873,7 @@ fn default_button(automation: &Automation, window: &uia::IUIAutomationElement) -
         let cache = automation.client.CreateCacheRequest().ok()?;
         cache.AddProperty(uia::UIA_LegacyIAccessibleStatePropertyId).ok()?;
         let found = window.FindAllBuildCache(uia::TreeScope_Descendants, &buttons, &cache).ok()?;
-        let count = found.Length().ok()?;
+        let count = found.Length().ok()?.min(DEFAULT_BUTTON_SCAN);
         (0..count).filter_map(|i| found.GetElement(i).ok()).find(|button| {
             let state = button.GetCachedPropertyValue(uia::UIA_LegacyIAccessibleStatePropertyId).ok();
             state.and_then(|value| i32::try_from(&value).ok()).is_some_and(|state| is_default(state as u32))

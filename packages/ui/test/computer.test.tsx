@@ -270,6 +270,46 @@ describe("while the assistant controls the Mac (S24.6)", () => {
 	});
 });
 
+describe("on Windows (S24 on Windows)", () => {
+	const WINDOWS_UA =
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0";
+	beforeEach(() => {
+		vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue(WINDOWS_UA);
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("says Windows asks for no permission, with no grant buttons, re-check, or macOS note", async () => {
+		h.state = connectorsOpen([computerEntry()]);
+		await renderApp("?surface=panel");
+		const entry = await screen.findByRole("listitem", { name: "Computer" });
+		expect(
+			within(entry).getByText("Windows asks for no permission for computer control."),
+		).toBeInTheDocument();
+		for (const label of ["Accessibility", "Screen Recording"]) {
+			expect(within(entry).queryByRole("listitem", { name: label })).toBeNull();
+		}
+		expect(within(entry).queryByRole("button", { name: /^Grant/ })).toBeNull();
+		expect(within(entry).queryByRole("button", { name: "Check again" })).toBeNull();
+		expect(within(entry).queryByText(DEBUG_NOTE)).toBeNull();
+		expect(within(entry).getByText(/Stop and Alt\+Shift\+Esc still work\./)).toBeInTheDocument();
+		expect(within(entry).queryByText(/⌥⇧Esc/)).toBeNull();
+		// The yolo switch stays.
+		expect(within(entry).getByRole("switch", { name: "Yolo mode" })).toBeInTheDocument();
+	});
+
+	it("says it is controlling your PC", async () => {
+		vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+		vi.setSystemTime(1_800_000_000_000);
+		h.status = { active: true, endsAt: 1_800_000_000 + 25 * 60 };
+		await renderApp("?surface=panel");
+		const banner = await screen.findByRole("region", { name: "Computer control" });
+		expect(banner).toHaveTextContent("Controlling your PC · 25:00 left");
+		expect(banner).not.toHaveTextContent("Mac");
+	});
+});
+
 describe("yolo mode (S24.9)", () => {
 	const yoloSwitch = async () => {
 		const entry = await screen.findByRole("listitem", { name: "Computer" });

@@ -1,6 +1,6 @@
 //! The app side of computer control (L60): the `computer_*` commands, the `computer://state`
-//! event, the panic shortcut, the timeout watcher, and the native dialogs. Off macOS the
-//! commands answer "unavailable" and nothing starts. Yolo mode (S24.9) is switched only from
+//! event, the panic shortcut, the timeout watcher, and the native dialogs. It runs on macOS and
+//! Windows; elsewhere the commands answer "unavailable" and nothing starts. Yolo mode (S24.9) is switched only from
 //! here (`computer_set_yolo` and the tray item), never from the MCP helper or the daemon.
 //!
 //! The glow (S28): a click-through overlay window (`glow`) is ordered in while a session is
@@ -21,14 +21,21 @@ pub const STATE_EVENT: &str = "computer://state";
 pub const GLOW_EVENT: &str = "computer://glow";
 pub const GLOW_WINDOW: &str = "glow";
 pub const GLOW_TITLE: &str = "Gentle Dot Glow";
-/// ⌥⇧Esc ends the session from anywhere (S24.3).
+/// ⌥⇧Esc (Alt+Shift+Esc on Windows) ends the session from anywhere (S24.3).
 pub const PANIC_SHORTCUT: &str = "Alt+Shift+Escape";
+#[cfg(not(windows))]
 pub const GRANT_TEXT: &str = "Allow Gentle Dot to see and control this Mac for 30 minutes?";
+#[cfg(windows)]
+pub const GRANT_TEXT: &str = "Allow Gentle Dot to see and control this PC for 30 minutes?";
 /// Every computer-control dialog defaults to its refusing button (L75 A2).
 pub const GRANT_CHOICE: Choice = Choice { allow: "Allow", refuse: "Deny" };
 pub const CONFIRM_CHOICE: Choice = Choice { allow: "Allow", refuse: "Cancel" };
+#[cfg(not(windows))]
 pub const YOLO_TEXT: &str = "Turn on yolo mode? Gentle Dot will send, pay, delete, and submit without asking you first, \
 for up to 1 hour. Stop and ⌥⇧Esc still work.";
+#[cfg(windows)]
+pub const YOLO_TEXT: &str = "Turn on yolo mode? Gentle Dot will send, pay, delete, and submit without asking you first, \
+for up to 1 hour. Stop and Alt+Shift+Esc still work.";
 pub const YOLO_CHOICE: Choice = Choice { allow: "Turn On", refuse: "Cancel" };
 
 /// The tray's "Yolo mode" item, kept in step with the state.
@@ -37,7 +44,7 @@ pub struct YoloMenuItem(pub tauri::menu::CheckMenuItem<tauri::Wry>);
 pub struct Computer {
     control: Arc<Control>,
     endpoint: Option<Endpoint>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     desktop: Arc<dyn super::Desktop>,
 }
 
@@ -50,14 +57,14 @@ enum Overlay {
 
 impl Computer {
     /// The helper's address and key for this launch, registered with the daemon over the app's
-    /// channel (S24.7, L61); `None` off macOS or when the helper did not start.
+    /// channel (S24.7, L61); `None` off macOS and Windows, or when the helper did not start.
     pub fn endpoint(&self) -> Option<Endpoint> {
         self.endpoint.clone()
     }
 }
 
-/// Creates the session and, on macOS, starts the MCP helper, the timeout watcher, and the
-/// glow overlay. Runs in the app's setup, on the main thread.
+/// Creates the session and, on macOS and Windows, starts the MCP helper and the timeout watcher,
+/// and on macOS the glow overlay. Runs in the app's setup, on the main thread.
 pub fn start(app: &AppHandle) -> Computer {
     let (overlay, marks) = std::sync::mpsc::channel::<Overlay>();
     let events = app.clone();
@@ -88,14 +95,28 @@ pub fn start(app: &AppHandle) -> Computer {
         }
         Computer { control, endpoint, desktop }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        // The glow comes in a later stage; until then its marks go nowhere.
+        drop(marks);
+        let desktop: Arc<dyn super::Desktop> = Arc::new(super::win::WinDesktop);
+        let glow = move |mark| {
+            let _ = overlay.send(Overlay::Mark(mark));
+        };
+        let endpoint = start_helper(app, control.clone(), desktop.clone(), glow)
+            .map_err(|error| eprintln!("gentle-dot: computer control is unavailable: {error}"))
+            .ok();
+        watch_timeout(control.clone());
+        Computer { control, endpoint, desktop }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         drop((overlay, marks));
         Computer { control, endpoint: None }
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn start_helper(
     app: &AppHandle,
     control: Arc<Control>,
@@ -217,12 +238,22 @@ fn run_overlay(
 }
 
 /// Reports the timeout when it happens, not only at the next tool call.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn watch_timeout(control: Arc<Control>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
         control.expire(SystemClock.now_ms());
     });
+}
+
+/// Keeps a Gentle Dot window out of every screenshot (Windows), as macOS leaves the app's own
+/// windows out of the capture.
+#[cfg(windows)]
+pub fn exclude_from_capture(window: &tauri::WebviewWindow) {
+    let excluded = window.hwnd().map_err(|e| e.to_string()).and_then(|hwnd| super::win::exclude_from_capture(hwnd.0));
+    if let Err(error) = excluded {
+        eprintln!("gentle-dot: a window may show in computer-control screenshots: {error}");
+    }
 }
 
 /// Ends the session (Stop button, tray item, panic shortcut). Queued actions are dropped.
@@ -239,9 +270,9 @@ pub fn computer_endpoint(computer: State<'_, Computer>) -> Option<Endpoint> {
 
 #[tauri::command]
 pub fn computer_permissions(computer: State<'_, Computer>) -> Permissions {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     return computer.desktop.permissions();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = computer;
         Permissions { accessibility: false, screen_recording: false, screenshots_supported: false }
@@ -252,7 +283,13 @@ pub fn computer_permissions(computer: State<'_, Computer>) -> Permissions {
 pub fn computer_request_permission(kind: PermissionKind) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     return super::request_permission(kind);
-    #[cfg(not(target_os = "macos"))]
+    // Windows asks for no permission: there is nothing to grant.
+    #[cfg(windows)]
+    {
+        let _ = kind;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = kind;
         Err("Computer control is only available on macOS.".into())
@@ -268,9 +305,9 @@ pub fn computer_stop(app: AppHandle) {
 /// off the main thread; the tray item calls it from a thread of its own.
 pub fn set_yolo(app: &AppHandle, enabled: bool) -> Result<StateEvent, String> {
     let computer = app.try_state::<Computer>().ok_or("Computer control is not ready.")?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     return Ok(computer.control.set_yolo(enabled, SystemClock.now_ms(), &NativeDialogs { app: app.clone() }));
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (computer, enabled);
         Err("Computer control is only available on macOS.".into())
@@ -298,20 +335,21 @@ pub fn computer_status(computer: State<'_, Computer>) -> StateEvent {
     computer.control.status(SystemClock.now_ms())
 }
 
-/// Dialogs shown by the app itself (an `NSAlert`, see `alert`), never the webview.
-#[cfg(target_os = "macos")]
+/// Dialogs shown by the app itself (an `NSAlert` or a Windows task dialog, see `alert`), never
+/// the webview.
+#[cfg(any(target_os = "macos", windows))]
 struct NativeDialogs {
     app: AppHandle,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 impl NativeDialogs {
     fn ask(&self, message: &str, choice: Choice) -> bool {
         crate::alert::ask(&self.app, "Gentle Dot", message, choice)
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 impl super::Dialogs for NativeDialogs {
     fn ask_grant(&self) -> bool {
         self.ask(GRANT_TEXT, GRANT_CHOICE)
@@ -331,12 +369,14 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(windows))]
     fn the_grant_dialog_asks_exactly_what_the_spec_says() {
         assert_eq!(GRANT_TEXT, "Allow Gentle Dot to see and control this Mac for 30 minutes?");
         assert_eq!(GRANT_CHOICE, Choice { allow: "Allow", refuse: "Deny" });
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn the_yolo_dialog_says_what_it_skips_and_for_how_long() {
         assert_eq!(
             YOLO_TEXT,
@@ -347,11 +387,28 @@ for up to 1 hour. Stop and ⌥⇧Esc still work."
     }
 
     #[test]
+    #[cfg(windows)]
+    fn on_windows_the_dialogs_name_this_pc_and_alt_shift_esc() {
+        assert_eq!(GRANT_TEXT, "Allow Gentle Dot to see and control this PC for 30 minutes?");
+        assert_eq!(GRANT_CHOICE, Choice { allow: "Allow", refuse: "Deny" });
+        assert_eq!(
+            YOLO_TEXT,
+            "Turn on yolo mode? Gentle Dot will send, pay, delete, and submit without asking you first, \
+for up to 1 hour. Stop and Alt+Shift+Esc still work."
+        );
+        assert_eq!(YOLO_CHOICE, Choice { allow: "Turn On", refuse: "Cancel" });
+    }
+
+    #[test]
     fn every_computer_dialog_defaults_to_its_refusing_button() {
         for choice in [GRANT_CHOICE, CONFIRM_CHOICE, YOLO_CHOICE] {
             assert_eq!(choice.alert_buttons(), [choice.refuse, choice.allow]);
             assert!(!choice.allows_response(Some(crate::alert::REFUSE_RESPONSE)));
             assert!(!choice.allows_response(None));
+            // Windows: the refusing button is the default; only the allowing id allows.
+            assert!(!choice.allows_task_button(Some(crate::alert::TASK_REFUSE_ID)));
+            assert!(!choice.allows_task_button(None));
+            assert!(choice.allows_task_button(Some(crate::alert::TASK_ALLOW_ID)));
         }
     }
 

@@ -504,6 +504,8 @@ fn build_windows(
     #[cfg(target_os = "linux")]
     let dot = dot.resizable(true).min_inner_size(DOT_SIZE.0, DOT_SIZE.1).max_inner_size(DOT_SIZE.0, DOT_SIZE.1);
     let dot = dot.build()?;
+    #[cfg(windows)]
+    computer::exclude_from_capture(&dot);
     // Linux has no window effects; the panel URL tells the UI to paint an opaque background.
     let panel = WebviewWindowBuilder::new(app, PANEL, WebviewUrl::App(platform::panel_url(Os::CURRENT).into()))
         .title(PANEL_TITLE)
@@ -519,7 +521,9 @@ fn build_windows(
     #[cfg(target_os = "macos")]
     let panel = panel
         .effects(EffectsBuilder::new().effect(Effect::HudWindow).state(EffectState::Active).radius(20.0).build());
-    panel.build()?;
+    let panel = panel.build()?;
+    #[cfg(windows)]
+    computer::exclude_from_capture(&panel);
 
     if !places_windows {
         // Native Wayland ignores positions; Hyprland window rules place and pin the Dot.
@@ -556,7 +560,8 @@ fn conversations_on(value: Option<&str>) -> bool {
 
 /// The tray menu, top to bottom (`-` is a separator). "New conversation" only exists with the
 /// conversations list on; in the single continuous chat there is nothing new to start.
-/// "Stop computer control" and "Yolo mode" exist where computer control does (macOS, S24.3, S24.9).
+/// "Stop computer control" and "Yolo mode" exist where computer control does (macOS and Windows,
+/// S24.3, S24.9).
 /// "rose" hides or shows the floating Dot (S26.1).
 fn tray_menu_ids(conversations: bool, computer_control: bool) -> Vec<&'static str> {
     let mut ids = vec!["open"];
@@ -579,7 +584,7 @@ fn build_tray(app: &AppHandle, config: &DesktopConfig, rose_hidden: bool) -> tau
     app.manage(OpenMenuItem(open.clone()));
     let menu = Menu::new(app)?;
     let conversations = conversations_on(std::env::var("GENTLE_DOT_CONVERSATIONS").ok().as_deref());
-    for id in tray_menu_ids(conversations, cfg!(target_os = "macos")) {
+    for id in tray_menu_ids(conversations, cfg!(any(target_os = "macos", windows))) {
         match id {
             "open" => menu.append(&open)?,
             "new" => menu.append(&MenuItem::with_id(app, "new", "New conversation", true, None::<&str>)?)?,
@@ -694,8 +699,8 @@ fn restart_daemon(app: AppHandle) {
     });
 }
 
-/// ⌥⇧Esc ends computer control from anywhere, even while another app is in front.
-#[cfg(target_os = "macos")]
+/// ⌥⇧Esc (Alt+Shift+Esc) ends computer control from anywhere, even while another app is in front.
+#[cfg(any(target_os = "macos", windows))]
 fn register_panic_shortcut(app: &AppHandle) {
     let handler = |app: &AppHandle, _: &_, event: tauri_plugin_global_shortcut::ShortcutEvent| {
         if event.state() == ShortcutState::Pressed {
@@ -829,7 +834,7 @@ pub fn run() {
             let (voice_input, voice_model) = voice::start(&handle);
             app.manage(voice_input);
             app.manage(voice_model);
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             register_panic_shortcut(&handle);
 
             build_windows(&handle, &config, places_windows, rose_hidden)?;

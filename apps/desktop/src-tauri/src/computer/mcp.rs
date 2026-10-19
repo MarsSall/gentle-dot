@@ -47,11 +47,34 @@ const NEEDS_SCREENSHOT: &str = "Take a screenshot first: coordinates are pixels 
 const UNKNOWN_TARGET: &str = "Cannot tell which app is under that point, so the action was refused. \
 Take a new screenshot and try again.";
 
+#[cfg(not(windows))]
 const INSTRUCTIONS: &str = "Controls this Mac. Take a screenshot first; x and y are pixels of the latest \
 screenshot. Every action returns a fresh screenshot. Use `batch` for a predictable sequence (click a field, \
 type, press tab, type, press return) so it runs in one call; end the batch whenever you must see the screen \
 before deciding the next step. The user must allow a session, risky actions ask the user to confirm, and \
 some apps (System Settings, password managers) are off limits.";
+#[cfg(windows)]
+const INSTRUCTIONS: &str = "Controls this PC. Take a screenshot first; x and y are pixels of the latest \
+screenshot. Every action returns a fresh screenshot. Use `batch` for a predictable sequence (click a field, \
+type, press tab, type, press return) so it runs in one call; end the batch whenever you must see the screen \
+before deciding the next step. Shortcuts use ctrl (cmd also presses Ctrl). The user must allow a session, \
+risky actions ask the user to confirm, and some apps (Settings, Windows Security, password managers) are off limits.";
+
+/// The `key` and `open_app` tool descriptions, and the system an `open_app` confirmation names.
+#[cfg(not(windows))]
+const KEY_DESCRIPTION: &str = "Press a key combo in the frontmost app, for example `cmd+shift+t`, `return`, or `esc`.";
+#[cfg(windows)]
+const KEY_DESCRIPTION: &str =
+    "Press a key combo in the frontmost app, for example `ctrl+shift+t`, `return`, or `esc` (`cmd` presses Ctrl).";
+#[cfg(not(windows))]
+const OPEN_APP_DESCRIPTION: &str = "Open or bring forward an app by name or bundle id.";
+#[cfg(windows)]
+const OPEN_APP_DESCRIPTION: &str =
+    "Open or bring forward an app by name (as the Start menu shows it) or by the path of its program (.exe).";
+#[cfg(not(windows))]
+const SYSTEM: &str = "macOS";
+#[cfg(windows)]
+const SYSTEM: &str = "Windows";
 
 pub struct HttpRequest<'a> {
     pub method: &'a str,
@@ -155,9 +178,9 @@ fn tools() -> Value {
          "inputSchema": schema(json!({"x": x, "y": y, "dx": {"type": "integer"}, "dy": {"type": "integer"}}), &["x", "y", "dx", "dy"])},
         {"name": "type", "description": "Type text into the frontmost app. A newline presses Return.",
          "inputSchema": schema(json!({"text": {"type": "string"}}), &["text"])},
-        {"name": "key", "description": "Press a key combo in the frontmost app, for example `cmd+shift+t`, `return`, or `esc`.",
+        {"name": "key", "description": KEY_DESCRIPTION,
          "inputSchema": schema(json!({"combo": {"type": "string"}}), &["combo"])},
-        {"name": "open_app", "description": "Open or bring forward an app by name or bundle id.",
+        {"name": "open_app", "description": OPEN_APP_DESCRIPTION,
          "inputSchema": schema(json!({"name": {"type": "string"}}), &["name"])},
         {"name": "list_apps", "description": "List the running apps.",
          "inputSchema": schema(json!({}), &[])},
@@ -726,7 +749,7 @@ impl Helper {
                     return Err(format!("Gentle Dot does not control {label}. The app was not opened."));
                 }
                 let action = format!("Open {name}");
-                self.confirm_if_risky(assess(Act::Other, intent), &action, "macOS")?;
+                self.confirm_if_risky(assess(Act::Other, intent), &action, SYSTEM)?;
                 self.still_running(epoch)?;
                 self.desktop.open_app(&name)?;
                 Ok((format!("{action}: done."), OPEN_APP_SETTLE_MS))

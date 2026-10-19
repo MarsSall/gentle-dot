@@ -3,7 +3,8 @@
 //! action confirmation, panic stop) lives here, outside the agent's reach.
 //!
 //! The rules are pure modules tested on every OS. `Desktop` is the seam to the real Mac
-//! (`macos`), and `fake` records events for the tests. Off macOS the helper does not start.
+//! (`macos`) and the real Windows desktop (`win`), and `fake` records events for the tests.
+//! Elsewhere the helper does not start.
 
 pub mod app;
 pub mod blocklist;
@@ -22,9 +23,8 @@ pub mod risk;
 pub mod server;
 pub mod session;
 pub mod windows;
-// The Windows desktop (S24 on Windows); wired into the helper in a later stage.
+// The Windows desktop (S24 on Windows).
 #[cfg(windows)]
-#[allow(dead_code)]
 mod win;
 #[cfg(any(windows, test))]
 pub mod winaccess;

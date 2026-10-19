@@ -1,9 +1,14 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 
 /**
- * Computer control on macOS (S24): the desktop app's helper, reached through its Tauri commands.
+ * Computer control on macOS and Windows (S24): the desktop app's helper, reached through its Tauri commands.
  * Outside the desktop app (the web page, a VPS) every call is a no-op, so computer control is never offered.
  */
+
+/** The panel runs in the Windows app (WebView2 reports Windows), where wording and permissions differ. */
+export function onWindows(): boolean {
+	return typeof navigator !== "undefined" && /Windows/.test(navigator.userAgent);
+}
 
 /** The helper's MCP address and its key for this launch of the app. */
 export interface ComputerEndpoint {
@@ -42,7 +47,7 @@ interface ComputerStateEvent {
 	yoloEndsAt?: unknown;
 }
 
-/** The helper's endpoint, or null when the app has none (off macOS, or the helper did not start). */
+/** The helper's endpoint, or null when the app has none (off macOS and Windows, or the helper did not start). */
 export async function computerEndpoint(): Promise<ComputerEndpoint | null> {
 	if (!isTauri()) return null;
 	const endpoint = await invoke<Partial<ComputerEndpoint> | null>("computer_endpoint");

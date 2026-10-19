@@ -57,7 +57,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
     ShowWindow, WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GW_OWNER,
     ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    SW_RESTORE, SW_SHOWNORMAL, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    SW_RESTORE, SW_SHOWNORMAL, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// Pause between the events of one action, so apps see distinct presses (as on macOS).
@@ -899,6 +899,67 @@ fn focused_pid() -> Option<i32> {
     // SAFETY: calls on live COM objects.
     let pid = unsafe { automation.client.GetFocusedElement().ok()?.CurrentProcessId().ok()? };
     (pid > 0).then_some(pid)
+}
+
+/// Keeps a window out of every screenshot and screen capture, this helper's included.
+pub fn exclude_from_capture(hwnd: *mut c_void) -> Result<(), String> {
+    // SAFETY: a plain call on a window handle of this process.
+    if unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) } != 0 {
+        Ok(())
+    } else {
+        Err(format!("cannot keep it out of screenshots: {}", std::io::Error::last_os_error()))
+    }
+}
+
+/// The Windows desktop, as the helper sees it. Windows asks for no permission: the helper sees
+/// and drives the desktop of the signed-in user, except windows of higher integrity (elevated
+/// apps), which Windows itself does not let it drive.
+pub struct WinDesktop;
+
+impl super::Desktop for WinDesktop {
+    fn permissions(&self) -> super::Permissions {
+        super::Permissions { accessibility: true, screen_recording: true, screenshots_supported: true }
+    }
+
+    fn capture(&self) -> Result<Capture, String> {
+        capture()
+    }
+
+    fn post(&self, event: &InputEvent) -> Result<(), String> {
+        post(event)
+    }
+
+    fn list_apps(&self) -> Result<Vec<AppInfo>, String> {
+        Ok(list_apps())
+    }
+
+    fn open_app(&self, name: &str) -> Result<(), String> {
+        open_app(name)
+    }
+
+    fn element_at(&self, at: Point) -> Vec<AxElement> {
+        element_at(at)
+    }
+
+    fn focused_element(&self) -> Option<Focus> {
+        focused_element()
+    }
+
+    fn frontmost_app(&self) -> Option<AppIdentity> {
+        frontmost_app()
+    }
+
+    fn focused_app(&self) -> Option<AppIdentity> {
+        focused_app()
+    }
+
+    fn window_owner_at(&self, at: Point) -> Option<AppIdentity> {
+        window_owner_at(at)
+    }
+
+    fn activate(&self, pid: i32) {
+        activate(pid)
+    }
 }
 
 /// These need the user's interactive desktop (not an SSH or service session): they take a real

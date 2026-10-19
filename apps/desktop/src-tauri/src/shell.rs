@@ -190,7 +190,13 @@ async fn connection_info(app: AppHandle) -> CommandResult<ConnectionInfo> {
 
 #[tauri::command]
 fn toggle_panel(app: AppHandle) -> CommandResult {
-    if window(&app, PANEL)?.is_visible().map_err(err)? {
+    let panel = window(&app, PANEL)?;
+    // A minimized panel is visible to Windows but not on screen: it is shown again.
+    #[cfg(windows)]
+    let shown = panel.is_visible().map_err(err)? && !panel.is_minimized().map_err(err)?;
+    #[cfg(not(windows))]
+    let shown = panel.is_visible().map_err(err)?;
+    if shown {
         hide_panel(app)
     } else {
         show_panel(&app)
@@ -435,11 +441,27 @@ fn place_panel_next_to_dot(app: &AppHandle) -> CommandResult {
 }
 
 fn show_panel(app: &AppHandle) -> CommandResult {
+    #[cfg(windows)]
+    restore_panel(&window(app, PANEL)?)?;
     place_panel(app)?;
     let panel = window(app, PANEL)?;
     panel.show().map_err(err)?;
     panel.set_focus().map_err(err)?;
     app.emit("dot://panel-shown", ()).map_err(err)
+}
+
+/// Brings a minimized panel back at its own size: showing a minimized window on Windows keeps it
+/// minimized, and moving it keeps the minimized size (157 × 25 pixels), so it would never show.
+#[cfg(windows)]
+fn restore_panel(panel: &WebviewWindow) -> CommandResult {
+    if panel.is_minimized().map_err(err)? {
+        panel.unminimize().map_err(err)?;
+    }
+    let current = rect_of(panel)?;
+    if (current.width, current.height) != (PANEL_SIZE.0 as i32, PANEL_SIZE.1 as i32) {
+        panel.set_size(LogicalSize::new(PANEL_SIZE.0, PANEL_SIZE.1)).map_err(err)?;
+    }
+    Ok(())
 }
 
 /// Snaps the Dot to the nearest edge and persists the position.
@@ -503,6 +525,9 @@ fn build_windows(
     // the Dot stays resizable and equal minimum and maximum sizes pin it at DOT_SIZE.
     #[cfg(target_os = "linux")]
     let dot = dot.resizable(true).min_inner_size(DOT_SIZE.0, DOT_SIZE.1).max_inner_size(DOT_SIZE.0, DOT_SIZE.1);
+    // Nothing minimizes the Dot or the panel on Windows (Win+M, say): a minimized one is out of sight.
+    #[cfg(windows)]
+    let dot = dot.minimizable(false);
     let dot = dot.build()?;
     #[cfg(windows)]
     computer::exclude_from_capture(&dot);
@@ -518,6 +543,8 @@ fn build_windows(
         // Lets the chat receive HTML5 drops of attachments (S31); Tauri's own handler would take them.
         .disable_drag_drop_handler()
         .visible(false);
+    #[cfg(windows)]
+    let panel = panel.minimizable(false);
     #[cfg(target_os = "macos")]
     let panel = panel
         .effects(EffectsBuilder::new().effect(Effect::HudWindow).state(EffectState::Active).radius(20.0).build());

@@ -22,6 +22,12 @@ pub mod risk;
 pub mod server;
 pub mod session;
 pub mod windows;
+// The Windows desktop (S24 on Windows); wired into the helper in a later stage.
+#[cfg(windows)]
+#[allow(dead_code)]
+mod win;
+#[cfg(any(windows, test))]
+pub mod winput;
 
 use blocklist::AppIdentity;
 use coords::{Point, ScreenshotGeometry};

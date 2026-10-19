@@ -17,7 +17,9 @@ mod windows_record;
 pub use crate::app_channel::APP_FD;
 use crate::app_channel::{AppChannel, Handler};
 use crate::health::check_health;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
@@ -121,6 +123,7 @@ pub fn record_launch(data_dir: &Path, pid: u32) -> io::Result<()> {
 }
 
 /// A pid file holds `<pid> <start time>`, far below this.
+#[cfg(unix)]
 const PID_FILE_MAX: u64 = 64;
 
 /// Whether a pid read from the pid file may name a daemon to signal: never this app, its parent,
@@ -570,13 +573,13 @@ impl Daemon {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_launch(mut self, spec: LaunchSpec) -> Self {
         self.launch = Some(spec);
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn with_health(mut self, health: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
         self.health = Some(health);
         self
@@ -812,6 +815,7 @@ impl Daemon {
         self.wait_ready(timeout)
     }
 
+    #[cfg(any(unix, test))]
     fn spawn(&self) -> Result<(), String> {
         self.spawn_locked(self.child.lock().unwrap())
     }
@@ -931,7 +935,6 @@ impl Daemon {
             drop(channel_slot);
             drop(slot);
             if let Some(handler) = &self.handler { handler.opened(&channel); }
-            return Ok(());
         }
         #[cfg(unix)]
         { *slot = Some(child); }
@@ -1208,7 +1211,7 @@ mod windows_ownership_tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         drop(daemon.child.lock().unwrap().take());
-        daemon.stop();
+        let _ = daemon.stop(); // Cleanup only: the child was already dropped.
         drop(peer);
     }
 
@@ -1243,7 +1246,7 @@ mod windows_ownership_tests {
         let retained = AppChannel::start(endpoint, Arc::new(RefusingHandler)).unwrap();
         *daemon.channel.lock().unwrap() = Some(retained.clone());
         retained.test_inject_cancel_error(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32);
-        daemon.stop();
+        assert!(daemon.stop().is_err());
         assert!(daemon.child.lock().unwrap().is_some());
         assert!(Arc::ptr_eq(daemon.channel.lock().unwrap().as_ref().unwrap(), &retained));
         assert!(!daemon.owns_running());
@@ -1251,12 +1254,12 @@ mod windows_ownership_tests {
         assert!(daemon.spawn().is_err());
         assert_eq!(ready.load(Ordering::SeqCst), 0);
         retained.test_inject_cancel_error(0);
-        daemon.stop(); // Synthetic child's unsupported checked cleanup must also retain both.
+        assert!(daemon.stop().is_err()); // Synthetic child's unsupported checked cleanup must also retain both.
         assert!(daemon.child.lock().unwrap().is_some());
         assert!(Arc::ptr_eq(daemon.channel.lock().unwrap().as_ref().unwrap(), &retained));
         assert!(matches!(daemon.restart(Duration::ZERO), RestartOutcome::Failed(_)));
         drop(daemon.child.lock().unwrap().take());
-        daemon.stop();
+        let _ = daemon.stop(); // Cleanup only: the child was already dropped.
         drop(peer);
     }
 
@@ -1563,13 +1566,14 @@ setTimeout(()=>process.exit(74),60000);
         // Release/join the controlled stop before asserting invariants, including on a
         // regression: an assertion must not strand a thread at the test-only barrier.
         release.wait();
-        stopping.join().unwrap();
+        let stopped = stopping.join().unwrap();
         let result = premature_result.unwrap_or_else(|| result_rx.recv_timeout(Duration::from_secs(2)).unwrap());
         starting.join().unwrap();
         assert!(child_locked, "start admission must remain blocked by checked stop");
         assert!(channel_locked, "retained channel must remain installed and guarded");
         assert!(!completed_early, "start must not complete during checked close");
         assert!(result.is_err());
+        assert!(stopped.is_err(), "the controlled checked close must fail");
         assert!(Arc::ptr_eq(daemon.channel.lock().unwrap().as_ref().unwrap(), &retained));
         assert!(retained.close_error().is_some());
         assert!(daemon.refusal().is_some());
@@ -1577,7 +1581,7 @@ setTimeout(()=>process.exit(74),60000);
 
         // Explicit checked retry, not start, is what permits the slot to be cleared.
         retained.test_inject_cancel_error(0);
-        daemon.stop();
+        assert_eq!(daemon.stop(), Ok(()));
         assert!(daemon.channel.lock().unwrap().is_none());
         assert_eq!(retained.close_error(), None);
         drop(peer);
@@ -1594,7 +1598,7 @@ setTimeout(()=>process.exit(74),60000);
         daemon.ensure_running(Duration::ZERO).unwrap();
         assert_eq!(ready.load(Ordering::SeqCst), 1);
         drop(daemon.child.lock().unwrap().take()); // Drop the synthetic child, never signal a PID.
-        daemon.stop();
+        let _ = daemon.stop(); // Cleanup only: the child was already dropped.
         drop(next_peer);
     }
 

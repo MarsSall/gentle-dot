@@ -598,7 +598,7 @@ mod native {
         // No delete sharing pins every path component through validation and future
         // use. Keep these guards when replacing the record reader with a deletion
         // handle; that handle must be validated anew, not trusted by pathname.
-        pub(crate) ancestry: Vec<OwnedHandle>,
+        _ancestry: Vec<OwnedHandle>,
     }
 
     fn require_complete_record(expected_identity: FileIdentity, expected: &crate::daemon::windows_record::Record,
@@ -997,7 +997,7 @@ mod native {
         let mut file = File::from(owned(raw).map_err(|error| AcquisitionStage::RecordOpen.error(error))?);
         let (record, identity) = read_record_file(&mut file)
             .map_err(|error| AcquisitionStage::RecordValidation.error(error))?;
-        Ok(Some(ValidatedRecord { record, identity, path, file: Some(file), deletion_marked: false, ancestry }))
+        Ok(Some(ValidatedRecord { record, identity, path, file: Some(file), deletion_marked: false, _ancestry: ancestry }))
     }
 
     const RECOVERED_STOP_LIMIT: Duration = Duration::from_secs(10);
@@ -1097,9 +1097,6 @@ mod native {
                 _ => Err(io::Error::last_os_error()),
             }
         }
-        /// Only a clean, identity-checked ROOT exit, never anonymous-Job recovery or
-        /// descendant completion. Unit 3 must independently validate and delete the record.
-        pub(crate) fn clean_exit_observed(&self) -> bool { self.clean_exit }
         pub(crate) fn delete_record(&mut self) -> io::Result<()> {
             if !self.clean_exit || self.connect.is_some() || self.write.is_some() || !self.observe_exit()? {
                 return Err(recovery_error("recorded Windows clean exit/client drain is not established"));

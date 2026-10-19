@@ -23,6 +23,8 @@ pub struct FakeDesktop {
     pub focus: Mutex<Option<Focus>>,
     pub opened: Mutex<Vec<String>>,
     pub activated: Mutex<Vec<i32>>,
+    /// What `activate` brings to the front, when it succeeds (by default it only records the pid).
+    pub activates_to: Mutex<Option<AppIdentity>>,
     pub captures: AtomicUsize,
     /// A 2560 × 1600 pt display at the origin, captured at 1280 × 800 (scale 0.5).
     pub geometry: ScreenshotGeometry,
@@ -42,6 +44,7 @@ impl Default for FakeDesktop {
             focus: Mutex::new(None),
             opened: Mutex::new(Vec::new()),
             activated: Mutex::new(Vec::new()),
+            activates_to: Mutex::new(None),
             captures: AtomicUsize::new(0),
             geometry: ScreenshotGeometry::for_display(Point { x: 0.0, y: 0.0 }, 2560.0, 1280, 800),
         }
@@ -103,6 +106,9 @@ impl Desktop for FakeDesktop {
 
     fn activate(&self, pid: i32) {
         self.activated.lock().unwrap().push(pid);
+        if let Some(app) = self.activates_to.lock().unwrap().clone() {
+            *self.frontmost.lock().unwrap() = Some(app);
+        }
     }
 }
 

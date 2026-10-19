@@ -59,13 +59,13 @@ pub fn element(control_type: i32, name: Option<String>, help: Option<String>, va
     AxElement { role: role(control_type).into(), title: present(name), description: present(help), value: present(value) }
 }
 
-/// What the risk check gets when the element under a point is Gentle Dot's own (its click-through
-/// glow) while another app owns the window there: an element that cannot be read stands in for
-/// it and asks for a confirmation, so a risky click under the glow is never let through unseen.
+/// What the risk check gets for an element UI Automation does not report, or Gentle Dot's own
+/// (its click-through glow) while another app owns the window there: an element that cannot be
+/// read stands in for it and asks for a confirmation, so a risky action is never let through unseen.
 pub fn unreadable() -> AxElement {
     AxElement {
         role: role(UIA_BUTTON).into(),
-        title: Some("an element Gentle Dot cannot read under its glow; confirm to act on it".into()),
+        title: Some("an element Gentle Dot cannot read; confirm to act on it".into()),
         description: None,
         value: None,
     }

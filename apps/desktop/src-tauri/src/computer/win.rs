@@ -534,10 +534,12 @@ pub fn frontmost_app() -> Option<AppIdentity> {
     (!root.is_null()).then(|| target_of(root))
 }
 
-/// The app the keys go to: the focus window's app (through the same window checks as every
-/// target) and UI Automation's focused element's app, the more restrictive of the two. One that
-/// is refused carries no process id, so the helper never drops it as the front app; a focus
-/// Windows does not report is the refused Unidentified app.
+/// The app the keys go to: the focus window's top-level app, through the same window checks as
+/// every target, and the process of the focus window itself (Windows sends keys there), the more
+/// restrictive of the two. UI Automation's focused element, when it answers, is checked too: a
+/// refused one, or one in another process (a panel), is what is returned. A
+/// refused app other than Gentle Dot carries no process id, so the helper never drops it as the
+/// front app; a focus window Windows does not report is the refused Unidentified app.
 pub fn focused_app() -> Option<AppIdentity> {
     let own = std::process::id() as i32;
     let refused = |id: &AppIdentity| blocked_reason(id, own).is_some();
@@ -558,12 +560,24 @@ pub fn focused_app() -> Option<AppIdentity> {
         } else if info.hwndFocus.is_null() {
             Ok(None)
         } else {
-            Ok(Some(target_of(GetAncestor(info.hwndFocus, GA_ROOT))))
+            // The window with the focus may be another process's (a child window it hosts): that
+            // process receives the keys, so it is checked too, the more restrictive one returned.
+            let root = target_of(GetAncestor(info.hwndFocus, GA_ROOT));
+            let pid = window_pid(info.hwndFocus);
+            let own_window = if pid == 0 {
+                unidentified(NO_PROCESS)
+            } else {
+                let id = identity(pid);
+                if is_frame_host(&id) { root.clone() } else { known(id).unwrap_or_else(|| unidentified(NO_PROCESS)) }
+            };
+            Ok(Some(if !refused(&root) && (refused(&own_window) || own_window.pid != root.pid) { own_window } else { root }))
         }
     };
     let answers = [from_window.clone().ok().flatten(), from_uia.clone()];
     if let Some(blocked) = answers.iter().flatten().find(|id| refused(id)) {
-        return Some(AppIdentity { pid: NO_PROCESS, ..blocked.clone() });
+        // Gentle Dot keeps its own id, which is what refuses it when its executable is renamed.
+        let pid = if blocked.pid == own { own } else { NO_PROCESS };
+        return Some(AppIdentity { pid, ..blocked.clone() });
     }
     match from_window {
         Err(()) => Some(unidentified(NO_PROCESS)),
@@ -834,12 +848,13 @@ impl Automation {
         // SAFETY: creating the system's UI Automation object.
         let client: uia::IUIAutomation =
             unsafe { uia::CoCreateInstance(&uia::CUIAutomation8, None, uia::CLSCTX_INPROC_SERVER) }.ok()?;
-        if let Ok(timeouts) = uia::Interface::cast::<uia::IUIAutomation2>(&client) {
-            // SAFETY: plain setters on a live client.
-            unsafe {
-                let _ = timeouts.SetConnectionTimeout(UIA_TIMEOUT_MS);
-                let _ = timeouts.SetTransactionTimeout(UIA_TIMEOUT_MS);
-            }
+        // Without its timeouts a hung app could stall the helper: no client then (what it would
+        // have read is unreadable, which asks for a confirmation).
+        let timeouts = uia::Interface::cast::<uia::IUIAutomation2>(&client).ok()?;
+        // SAFETY: plain setters on a live client.
+        unsafe {
+            timeouts.SetConnectionTimeout(UIA_TIMEOUT_MS).ok()?;
+            timeouts.SetTransactionTimeout(UIA_TIMEOUT_MS).ok()?;
         }
         Some(Automation { client, _apartment: apartment })
     }

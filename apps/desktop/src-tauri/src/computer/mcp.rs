@@ -540,10 +540,18 @@ impl Helper {
             return Ok(());
         }
         let message = format!("{action} in {target}.\n\nThis needs your OK because of {reason}.");
-        if self.with_dialog(|| self.dialogs.confirm(&message)) {
-            Ok(())
-        } else {
-            Err(format!("The user declined: {action} in {target}. Nothing was done."))
+        let before = self.desktop.frontmost_app();
+        if !self.with_dialog(|| self.dialogs.confirm(&message)) {
+            return Err(format!("The user declined: {action} in {target}. Nothing was done."));
+        }
+        // The OK was for the app in front before the dialog; another app never gets the action.
+        let back = self.desktop.frontmost_app().map(|app| app.pid);
+        match before {
+            Some(before) if back != Some(before.pid) => Err(format!(
+                "The user allowed {action} in {target}, but {} could not be brought back to the front, so nothing was done.",
+                before.name
+            )),
+            _ => Ok(()),
         }
     }
 
@@ -1363,6 +1371,37 @@ mod tests {
         rig.ready();
         rig.call("scroll", json!({"x": 1, "y": 1, "dx": 0, "dy": 10, "intent": "buy the ticket"}));
         assert_eq!(rig.dialogs.confirmations.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_approved_action_is_dropped_when_the_previous_app_cannot_be_brought_back() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.elements.lock().unwrap() = send_button();
+        let frontmost = rig.desktop.clone();
+        *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
+            *frontmost.frontmost.lock().unwrap() = Some(app(OWN_PID, "dev.gentleman.gentle-dot", "Gentle Dot"));
+        }));
+        let result = rig.call("click", json!({"x": 10, "y": 10}));
+        assert!(is_error(&result), "{result}");
+        assert!(first_text(&result).contains("could not be brought back"), "{result}");
+        assert_eq!(*rig.desktop.activated.lock().unwrap(), vec![200]);
+        assert!(rig.desktop.events().is_empty());
+    }
+
+    #[test]
+    fn an_approved_action_runs_once_the_previous_app_is_back() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.elements.lock().unwrap() = send_button();
+        *rig.desktop.activates_to.lock().unwrap() = rig.desktop.frontmost_app();
+        let frontmost = rig.desktop.clone();
+        *rig.dialogs.during.lock().unwrap() = Some(Box::new(move || {
+            *frontmost.frontmost.lock().unwrap() = Some(app(OWN_PID, "dev.gentleman.gentle-dot", "Gentle Dot"));
+        }));
+        let result = rig.call("click", json!({"x": 10, "y": 10}));
+        assert!(!is_error(&result), "{result}");
+        assert_eq!(rig.desktop.events().len(), 1);
     }
 
     #[test]

@@ -480,6 +480,9 @@ fn is_frame_host(id: &AppIdentity) -> bool {
     id.bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("ApplicationFrameHost.exe"))
 }
 
+/// The process id of an app whose process is not even known (a failed focus query).
+const NO_PROCESS: i32 = 0;
+
 /// The app Windows does not identify, which the blocklist refuses.
 fn unidentified(pid: i32) -> AppIdentity {
     AppIdentity { pid, bundle_id: None, name: UNIDENTIFIED.to_string() }
@@ -524,9 +527,10 @@ pub fn focused_app() -> Option<AppIdentity> {
         let thread = GetWindowThreadProcessId(foreground, null_mut());
         let mut info: GUITHREADINFO = zeroed();
         info.cbSize = size_of::<GUITHREADINFO>() as u32;
-        // Asked and not answered: where the keys go is unknown, so they are refused.
+        // Asked and not answered: where the keys go is unknown, so they are refused. No process
+        // has id 0, so the helper never mistakes this for the front app itself.
         if GetGUIThreadInfo(thread, &mut info) == 0 {
-            return Some(unidentified(window_pid(foreground)));
+            return Some(unidentified(NO_PROCESS));
         }
         // No focus window: keys go to the foreground window, which is checked as the front app.
         if info.hwndFocus.is_null() {
@@ -856,7 +860,8 @@ pub fn element_at(at: Point) -> Vec<AxElement> {
     // there: what is under the glow cannot be read, so it asks for a confirmation.
     let own = std::process::id() as i32;
     // SAFETY: a call on a live COM object.
-    let hit_own = unsafe { current.CurrentProcessId() }.is_ok_and(|pid| pid == own);
+    // A process Windows does not report counts as Gentle Dot's: the element is not read either.
+    let hit_own = unsafe { current.CurrentProcessId() }.map_or(true, |pid| pid == own);
     if hit_own && window_owner_at(at).is_some_and(|owner| owner.pid != own) {
         return vec![unreadable()];
     }

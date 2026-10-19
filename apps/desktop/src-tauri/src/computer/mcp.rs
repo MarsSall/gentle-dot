@@ -1231,6 +1231,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn keys_are_refused_when_windows_cannot_say_where_the_focus_is() {
+        let rig = rig();
+        rig.ready();
+        // A failed focus query: no process, the blocked Unidentified app, while Safari is in front.
+        let unknown = AppIdentity { pid: 0, bundle_id: None, name: super::super::blocklist::UNIDENTIFIED.into() };
+        *rig.desktop.focused_app.lock().unwrap() = Some(unknown);
+        let result = rig.call("type", json!({"text": "hello"}));
+        assert!(first_text(&result).contains("an app Windows does not identify"), "{result}");
+        assert!(is_error(&rig.call("key", json!({"combo": "return"}))));
+        assert!(rig.desktop.events().is_empty());
+    }
+
+    #[test]
     fn pointer_actions_where_no_app_owns_the_point_are_refused() {
         let rig = rig();
         rig.ready();

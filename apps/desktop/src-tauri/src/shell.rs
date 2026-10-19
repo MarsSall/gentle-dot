@@ -524,6 +524,8 @@ fn build_windows(
     let panel = panel.build()?;
     #[cfg(windows)]
     computer::exclude_from_capture(&panel);
+    #[cfg(not(windows))]
+    drop(panel);
 
     if !places_windows {
         // Native Wayland ignores positions; Hyprland window rules place and pin the Dot.

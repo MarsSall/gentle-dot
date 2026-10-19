@@ -520,7 +520,12 @@ pub fn focused_app() -> Option<AppIdentity> {
         let thread = GetWindowThreadProcessId(foreground, null_mut());
         let mut info: GUITHREADINFO = zeroed();
         info.cbSize = size_of::<GUITHREADINFO>() as u32;
-        if GetGUIThreadInfo(thread, &mut info) == 0 || info.hwndFocus.is_null() {
+        // Asked and not answered: where the keys go is unknown, so they are refused.
+        if GetGUIThreadInfo(thread, &mut info) == 0 {
+            return Some(unidentified(window_pid(foreground)));
+        }
+        // No focus window: keys go to the foreground window, which is checked as the front app.
+        if info.hwndFocus.is_null() {
             return None;
         }
         Some(resolve(window_pid(info.hwndFocus)).unwrap_or_else(|| target_of(GetAncestor(info.hwndFocus, GA_ROOT))))

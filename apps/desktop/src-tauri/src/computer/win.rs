@@ -10,10 +10,15 @@
 //! the executable's file name stands for the macOS bundle id, and its file description for the
 //! app name. Store apps draw inside a frame window owned by `ApplicationFrameHost.exe`; their
 //! identity is the process of the frame's core window, so Settings is Settings, not its host.
+//!
+//! Elements come from UI Automation (`winaccess` maps them), with a 0.5 s timeout so a hung app
+//! cannot stall the helper, as the Accessibility timeout does on macOS.
 
 use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
 use super::blocklist::{blocked_reason, AppIdentity};
+use super::risk::{AxElement, Focus};
+use super::winaccess::{element, is_default, UIA_BUTTON, UIA_WINDOW};
 use super::winapps::{answers_to, app_pids, launch_for, launchable, Launch, TopWindow};
 use super::winput::{releases, steps, Step, VirtualScreen};
 use super::{AppInfo, Capture, InputEvent, MouseButton};
@@ -462,9 +467,12 @@ pub fn frontmost_app() -> Option<AppIdentity> {
     (!root.is_null()).then(|| identity(app_pid(root)))
 }
 
-/// The app owning the window with the keyboard focus, which can differ from the foreground
-/// window's (a Store app's frame, a panel of another process).
+/// The app owning the focused element, which can differ from the foreground window's (a Store
+/// app's frame, a panel of another process): UI Automation's answer, else the focus window's.
 pub fn focused_app() -> Option<AppIdentity> {
+    if let Some(pid) = focused_pid() {
+        return Some(identity(pid));
+    }
     // SAFETY: plain queries; `info` is a valid out-pointer whose size is set.
     unsafe {
         let foreground = GetForegroundWindow();
@@ -608,6 +616,171 @@ pub fn open_app(name: &str) -> Result<(), String> {
     match launch_for(wanted, &start_menu_shortcuts())? {
         Launch::Shortcut(path) | Launch::Program(path) => shell_open(&path),
     }
+}
+
+/// How many ancestors of the element under a point are read (text inside a button), as on macOS.
+const AX_ANCESTORS: usize = 4;
+/// How far up the focused element its window is looked for.
+const WINDOW_SEARCH: usize = 12;
+/// At most this many buttons of a dialog are checked for the default one.
+const DIALOG_BUTTONS: i32 = 64;
+/// UI Automation gives up on an unresponsive app after this long.
+const UIA_TIMEOUT_MS: u32 = 500;
+/// The class of the classic Win32 dialog.
+const DIALOG_CLASS: &str = "#32770";
+
+mod uia {
+    pub use windows::core::{Interface, BSTR};
+    pub use windows::Win32::System::Variant::VARIANT;
+    pub use windows::Win32::Foundation::POINT;
+    pub use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+    pub use windows::Win32::UI::Accessibility::{
+        CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern,
+        IUIAutomationValuePattern, IUIAutomationWindowPattern, TreeScope_Descendants, UIA_ControlTypePropertyId,
+        UIA_LegacyIAccessiblePatternId, UIA_ValuePatternId, UIA_WindowPatternId,
+    };
+}
+
+/// A UI Automation client for one call, on a COM apartment it owns when it had to join one.
+struct Automation {
+    client: uia::IUIAutomation,
+    /// Declared after `client` so the client is released before COM is left.
+    _apartment: Apartment,
+}
+
+struct Apartment(bool);
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: balances the successful CoInitializeEx on this thread.
+            unsafe { uia::CoUninitialize() };
+        }
+    }
+}
+
+impl Automation {
+    fn new() -> Option<Automation> {
+        // SAFETY: COM initialization on this thread; a thread already in another apartment keeps it.
+        let joined = unsafe { uia::CoInitializeEx(None, uia::COINIT_MULTITHREADED) }.is_ok();
+        let apartment = Apartment(joined);
+        // SAFETY: creating the system's UI Automation object.
+        let client: uia::IUIAutomation =
+            unsafe { uia::CoCreateInstance(&uia::CUIAutomation8, None, uia::CLSCTX_INPROC_SERVER) }.ok()?;
+        if let Ok(timeouts) = uia::Interface::cast::<uia::IUIAutomation2>(&client) {
+            // SAFETY: plain setters on a live client.
+            unsafe {
+                let _ = timeouts.SetConnectionTimeout(UIA_TIMEOUT_MS);
+                let _ = timeouts.SetTransactionTimeout(UIA_TIMEOUT_MS);
+            }
+        }
+        Some(Automation { client, _apartment: apartment })
+    }
+
+    fn parent(&self, of: &uia::IUIAutomationElement) -> Option<uia::IUIAutomationElement> {
+        // SAFETY: calls on live COM objects.
+        unsafe { self.client.ControlViewWalker().ok()?.GetParentElement(of).ok() }
+    }
+}
+
+fn text(value: windows::core::Result<uia::BSTR>) -> Option<String> {
+    value.ok().map(|text| text.to_string())
+}
+
+fn control_type(of: &uia::IUIAutomationElement) -> i32 {
+    // SAFETY: a call on a live COM object.
+    unsafe { of.CurrentControlType() }.map_or(0, |t| t.0)
+}
+
+/// The legacy accessible state, where the default button is marked.
+fn legacy_state(of: &uia::IUIAutomationElement) -> Option<u32> {
+    // SAFETY: calls on live COM objects.
+    unsafe {
+        let legacy = of.GetCurrentPatternAs::<uia::IUIAutomationLegacyIAccessiblePattern>(uia::UIA_LegacyIAccessiblePatternId).ok()?;
+        legacy.CurrentState().ok()
+    }
+}
+
+/// An element in the risk check's terms. A password field's value is never read.
+fn describe(of: &uia::IUIAutomationElement) -> AxElement {
+    // SAFETY: calls on live COM objects.
+    unsafe {
+        let password = of.CurrentIsPassword().is_ok_and(|p| p.as_bool());
+        let value = if password {
+            None
+        } else {
+            of.GetCurrentPatternAs::<uia::IUIAutomationValuePattern>(uia::UIA_ValuePatternId)
+                .ok()
+                .and_then(|pattern| text(pattern.CurrentValue()))
+        };
+        element(control_type(of), text(of.CurrentName()), text(of.CurrentHelpText()), value)
+    }
+}
+
+/// The element under `at`, then its ancestors (as many as macOS reads); empty when unknown.
+pub fn element_at(at: Point) -> Vec<AxElement> {
+    let Some(automation) = Automation::new() else { return Vec::new() };
+    let point = uia::POINT { x: at.x.round() as i32, y: at.y.round() as i32 };
+    // SAFETY: a call on a live COM object.
+    let Ok(mut current) = (unsafe { automation.client.ElementFromPoint(point) }) else { return Vec::new() };
+    let mut chain = vec![describe(&current)];
+    while chain.len() <= AX_ANCESTORS {
+        let Some(parent) = automation.parent(&current) else { break };
+        chain.push(describe(&parent));
+        current = parent;
+    }
+    chain
+}
+
+/// The window holding `of`, when it is a dialog (modal, or a classic Win32 dialog).
+fn dialog_of(automation: &Automation, of: &uia::IUIAutomationElement) -> Option<uia::IUIAutomationElement> {
+    let mut current = of.clone();
+    for _ in 0..WINDOW_SEARCH {
+        if control_type(&current) == UIA_WINDOW {
+            // SAFETY: calls on live COM objects.
+            let modal = unsafe {
+                current
+                    .GetCurrentPatternAs::<uia::IUIAutomationWindowPattern>(uia::UIA_WindowPatternId)
+                    .and_then(|window| window.CurrentIsModal())
+                    .is_ok_and(|modal| modal.as_bool())
+            };
+            let classic = text(unsafe { current.CurrentClassName() }).is_some_and(|class| class == DIALOG_CLASS);
+            return (modal || classic).then_some(current);
+        }
+        current = automation.parent(&current)?;
+    }
+    None
+}
+
+/// The dialog's default button, among its first buttons.
+fn default_button(automation: &Automation, dialog: &uia::IUIAutomationElement) -> Option<uia::IUIAutomationElement> {
+    // SAFETY: calls on live COM objects.
+    unsafe {
+        let buttons = automation.client.CreatePropertyCondition(uia::UIA_ControlTypePropertyId, &uia::VARIANT::from(UIA_BUTTON)).ok()?;
+        let found = dialog.FindAll(uia::TreeScope_Descendants, &buttons).ok()?;
+        let count = found.Length().ok()?.min(DIALOG_BUTTONS);
+        (0..count).filter_map(|i| found.GetElement(i).ok()).find(|button| legacy_state(button).is_some_and(is_default))
+    }
+}
+
+/// The focused element, whether it is its dialog's default button, and that button.
+pub fn focused_element() -> Option<Focus> {
+    let automation = Automation::new()?;
+    // SAFETY: a call on a live COM object.
+    let focused = unsafe { automation.client.GetFocusedElement() }.ok()?;
+    let default = dialog_of(&automation, &focused).and_then(|dialog| default_button(&automation, &dialog));
+    // SAFETY: a call on a live COM object.
+    let same = |button: &uia::IUIAutomationElement| unsafe { automation.client.CompareElements(button, &focused) }.is_ok_and(|b| b.as_bool());
+    let is_default_button = legacy_state(&focused).is_some_and(is_default) || default.as_ref().is_some_and(same);
+    Some(Focus { element: describe(&focused), is_default_button, default_button: default.as_ref().map(describe) })
+}
+
+/// The process of the focused UI Automation element.
+fn focused_pid() -> Option<i32> {
+    let automation = Automation::new()?;
+    // SAFETY: calls on live COM objects.
+    let pid = unsafe { automation.client.GetFocusedElement().ok()?.CurrentProcessId().ok()? };
+    (pid > 0).then_some(pid)
 }
 
 /// These need the user's interactive desktop (not an SSH or service session): they take a real

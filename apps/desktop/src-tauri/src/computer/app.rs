@@ -16,7 +16,7 @@ use super::control::Control;
 use super::server::Endpoint;
 use super::session::{Reason, StateEvent};
 use super::working::Windows;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use super::working::{MainThread, Rings, Task, Working, WorkingEvent, READY_TIMEOUT, WORKING_EVENT};
 use super::{Clock, PermissionKind, Permissions, SystemClock};
 use crate::alert::Choice;
@@ -53,14 +53,13 @@ pub struct Computer {
     endpoint: Option<Endpoint>,
     #[cfg(any(target_os = "macos", windows))]
     desktop: Arc<dyn super::Desktop>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     working: Arc<Working>,
 }
 
 /// What the overlay thread hears: the session started or ended, the agent acted, or a call
-/// starts (answered once the rings were told to draw, or why not) or ends its working rings
-/// (macOS; Windows has no working rings yet).
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// starts (answered once the rings were told to draw, or why not) or ends its working rings.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 enum Overlay {
     Session(bool),
     Mark(super::glow::Mark),
@@ -73,10 +72,10 @@ enum Overlay {
 const OVERLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The overlay's working rings, through the overlay thread.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 struct OverlayRings(std::sync::mpsc::Sender<Overlay>);
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 impl Rings for OverlayRings {
     fn show(&self, operation: u64) -> Result<(), String> {
         let (reply, answer) = std::sync::mpsc::channel();
@@ -89,10 +88,10 @@ impl Rings for OverlayRings {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 struct AppMainThread(AppHandle);
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 impl MainThread for AppMainThread {
     fn run(&self, task: Task) -> Result<(), String> {
         self.0.run_on_main_thread(task).map_err(|error| error.to_string())
@@ -109,6 +108,15 @@ pub fn show_without_focus(window: &tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+/// Shows one of the app's windows without activating it, so the app being controlled keeps the
+/// focus: the Dot and the panel once a computer-control call ends (S5).
+#[cfg(windows)]
+pub fn show_without_focus(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    super::win::show_without_activating(hwnd.0);
+    Ok(())
+}
+
 impl Computer {
     /// The helper's address and key for this launch, registered with the daemon over the app's
     /// channel (S24.7, L61); `None` off macOS and Windows, or when the helper did not start.
@@ -122,19 +130,19 @@ impl Computer {
 /// Runs in the app's setup, on the main thread.
 pub fn start(app: &AppHandle, windows: Arc<dyn Windows>) -> Computer {
     let (overlay, marks) = std::sync::mpsc::channel::<Overlay>();
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let working = Arc::new(Working::new(
         windows,
         Arc::new(OverlayRings(overlay.clone())),
         Arc::new(AppMainThread(app.clone())),
         READY_TIMEOUT,
     ));
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let session_ended = {
         let working = working.clone();
         move || working.session_ended()
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     let session_ended = {
         drop(windows);
         || {}
@@ -163,8 +171,7 @@ pub fn start(app: &AppHandle, windows: Arc<dyn Windows>) -> Computer {
         let glow = move |mark| {
             let _ = overlay.send(Overlay::Mark(mark));
         };
-        let preparation: Arc<dyn super::working::Preparation> = working.clone();
-        let endpoint = start_helper(app, control.clone(), desktop.clone(), glow, Some(preparation))
+        let endpoint = start_helper(app, control.clone(), desktop.clone(), glow, working.clone())
             .map_err(|error| eprintln!("gentle-dot: computer control is unavailable: {error}"))
             .ok();
         watch_timeout(control.clone());
@@ -182,16 +189,17 @@ pub fn start(app: &AppHandle, windows: Arc<dyn Windows>) -> Computer {
         let glow = move |mark| {
             let _ = overlay.send(Overlay::Mark(mark));
         };
-        // No working rings on Windows yet: calls are not prepared (the helper's default).
-        let endpoint = start_helper(app, control.clone(), desktop.clone(), glow, None)
+        let endpoint = start_helper(app, control.clone(), desktop.clone(), glow, working.clone())
             .map_err(|error| eprintln!("gentle-dot: computer control is unavailable: {error}"))
             .ok();
         watch_timeout(control.clone());
+        // Without the glow, `marks` is dropped: no rings can show, so every call that captures
+        // or acts fails before doing anything (S5), as on macOS.
         match build_glow(app) {
-            Ok(window) => run_glow(app.clone(), window, control.clone(), marks),
+            Ok(window) => run_glow(app.clone(), window, control.clone(), working.clone(), marks),
             Err(error) => eprintln!("gentle-dot: the computer-control glow is unavailable: {error}"),
         }
-        Computer { control, endpoint, desktop }
+        Computer { control, endpoint, desktop, working }
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -206,7 +214,7 @@ fn start_helper(
     control: Arc<Control>,
     desktop: Arc<dyn super::Desktop>,
     glow: impl Fn(super::glow::Mark) + Send + Sync + 'static,
-    working: Option<Arc<dyn super::working::Preparation>>,
+    working: Arc<dyn super::working::Preparation>,
 ) -> std::io::Result<Endpoint> {
     let token = super::server::new_token();
     let helper = super::mcp::Helper::new(
@@ -217,11 +225,8 @@ fn start_helper(
         token.clone(),
         std::process::id() as i32,
     )
-    .with_glow(glow);
-    let helper = match working {
-        Some(working) => helper.with_working(working),
-        None => helper,
-    };
+    .with_glow(glow)
+    .with_working(working);
     super::server::start(Arc::new(helper), token)
 }
 
@@ -297,7 +302,7 @@ fn cover(window: &tauri::WebviewWindow, covering: &mut Option<super::glow::Frame
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn emit_working(app: &AppHandle, operation: u64, active: bool) -> Result<(), String> {
     let event = WorkingEvent { active, operation_id: operation };
     app.emit_to(GLOW_WINDOW, WORKING_EVENT, event).map_err(|error| error.to_string())
@@ -413,7 +418,13 @@ fn build_glow(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
 /// The glow's own thread on Windows: follows the session and draws each mark while it lasts.
 /// Marks and displays are in physical pixels; the page gets CSS pixels.
 #[cfg(windows)]
-fn run_glow(app: AppHandle, window: tauri::WebviewWindow, control: Arc<Control>, marks: std::sync::mpsc::Receiver<Overlay>) {
+fn run_glow(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    control: Arc<Control>,
+    working: Arc<Working>,
+    marks: std::sync::mpsc::Receiver<Overlay>,
+) {
     let Ok(hwnd) = window.hwnd() else {
         eprintln!("gentle-dot: the computer-control glow is unavailable: no window handle");
         return;
@@ -422,7 +433,7 @@ fn run_glow(app: AppHandle, window: tauri::WebviewWindow, control: Arc<Control>,
     let hwnd = hwnd.0 as usize;
     let spawned = std::thread::Builder::new().name("computer-glow".into()).spawn(move || {
         let window = hwnd as *mut std::ffi::c_void;
-        let (mut shown, mut covering) = (false, None);
+        let (mut shown, mut covering, mut drawing) = (false, None, None);
         for message in marks {
             match message {
                 Overlay::Session(active) => {
@@ -430,12 +441,39 @@ fn run_glow(app: AppHandle, window: tauri::WebviewWindow, control: Arc<Control>,
                         super::win::show_overlay(window, active);
                         shown = active;
                     }
+                    if let Some(operation) = drawing.take().filter(|_| !active) {
+                        let _ = emit_working(&app, operation, false);
+                    }
                 }
-                // No working rings on Windows yet (the helper prepares no call): a start is refused.
-                Overlay::Working { reply, .. } => {
-                    let _ = reply.send(Err("The working rings are only available on macOS.".into()));
+                Overlay::Working { operation, reply } => {
+                    // A start that arrives after its call or the session ended draws nothing.
+                    let outcome = if !control.is_active(SystemClock.now_ms()) || !working.is_current(operation) {
+                        Err("the call already ended".to_string())
+                    } else {
+                        let display = super::win::pointer_location().and_then(super::win::display_frame_at);
+                        match display {
+                            None => Err("no display under the pointer".to_string()),
+                            Some(display) => {
+                                if covering != Some(display) {
+                                    super::win::cover(window, display);
+                                    covering = Some(display);
+                                }
+                                // Shown without activation, so the controlled app keeps the focus.
+                                super::win::show_overlay(window, true);
+                                shown = true;
+                                drawing = Some(operation);
+                                emit_working(&app, operation, true)
+                            }
+                        }
+                    };
+                    let _ = reply.send(outcome);
                 }
-                Overlay::WorkingEnd(_) => {}
+                Overlay::WorkingEnd(operation) => {
+                    if drawing == Some(operation) {
+                        drawing = None;
+                        let _ = emit_working(&app, operation, false);
+                    }
+                }
                 Overlay::Mark(mark) => {
                     // A mark that arrives after Stop or panic is dropped.
                     if !control.is_active(SystemClock.now_ms()) {
@@ -549,12 +587,12 @@ pub fn computer_working_ready(
     computer: State<'_, Computer>,
     operation_id: u64,
 ) -> Result<bool, String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     return computer.working.acknowledge(window.label(), operation_id);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (window, computer, operation_id);
-        Err("The working rings are only available on macOS.".into())
+        Err("Computer control is only available on macOS and Windows.".into())
     }
 }
 

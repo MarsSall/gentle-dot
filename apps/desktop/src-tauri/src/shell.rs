@@ -94,9 +94,9 @@ impl working::Windows for ShellWindows {
 
     fn show(&self, part: Part) {
         let Some(window) = self.get(part) else { return };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let shown = computer::show_without_focus(&window);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let shown = window.show().map_err(err);
         if let Err(error) = shown {
             eprintln!("gentle-dot: cannot show the {part:?} again: {error}");

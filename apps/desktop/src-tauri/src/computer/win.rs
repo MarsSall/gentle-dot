@@ -1184,6 +1184,13 @@ pub fn show_overlay(hwnd: *mut c_void, visible: bool) {
     }
 }
 
+/// Shows one of this process's windows without activating it (the Dot and the panel after a
+/// computer-control call), so the app being controlled keeps the focus.
+pub fn show_without_activating(hwnd: *mut c_void) {
+    // SAFETY: a plain call on a window of this process.
+    unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+}
+
 /// Moves the glow over a display, without activating it.
 pub fn cover(hwnd: *mut c_void, display: Frame) {
     // SAFETY: a plain call on a window of this process.

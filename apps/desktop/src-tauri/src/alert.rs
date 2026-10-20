@@ -13,7 +13,9 @@
 //! Windows: a task dialog whose default button is the refusing one, so Return refuses; Escape and
 //! closing answer `IDCANCEL`, and only the allowing button's own id allows. The dialog plugin is
 //! not used there: rfd's task dialog makes its first button (the OK slot, the allowing label) the
-//! default, so Return would allow. It is raised above the app being controlled when it opens.
+//! default, so Return would allow. It is raised above the app being controlled when it opens. An
+//! `OpenDialog` keeps its window while it is up, so another thread can refuse it (an approval
+//! that timed out, as `abortModal` does on macOS).
 //!
 //! Elsewhere (Linux): the dialog plugin with the allowing label in the OK slot and the refusing one
 //! in the cancel slot, so every outcome rfd reports as `Cancel` (the refusing button, Escape,
@@ -31,6 +33,19 @@ pub const ALLOW_RESPONSE: isize = 1001;
 /// The Windows task dialog's button ids: the refusing one is the default.
 pub const TASK_REFUSE_ID: i32 = 2000;
 pub const TASK_ALLOW_ID: i32 = 2001;
+
+/// The window of a dialog while it is on screen (Windows), so another thread can refuse it.
+#[derive(Default)]
+pub struct OpenDialog(std::sync::Mutex<usize>);
+
+impl OpenDialog {
+    /// Presses the refusing button of the dialog on screen, if one is (Windows; elsewhere
+    /// nothing). The dialog then answers as refused.
+    pub fn refuse(&self) {
+        #[cfg(windows)]
+        windows::refuse(self);
+    }
+}
 
 /// The two buttons of a yes/no alert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,15 +85,24 @@ impl Choice {
 /// Shows the alert and waits for the answer. Blocks, so it never runs on the main thread (there it
 /// refuses at once).
 pub fn ask(app: &AppHandle, title: &str, message: &str, choice: Choice) -> bool {
+    ask_tracked(app, title, message, choice, None)
+}
+
+/// `ask`, keeping the dialog's window in `open` while it is up (Windows), for `OpenDialog::refuse`.
+pub fn ask_tracked(app: &AppHandle, title: &str, message: &str, choice: Choice, open: Option<&OpenDialog>) -> bool {
     #[cfg(target_os = "macos")]
-    return macos::ask(app, title, message, choice);
+    {
+        let _ = open;
+        return macos::ask(app, title, message, choice);
+    }
     #[cfg(windows)]
     {
         let _ = app;
-        windows::ask(title, message, choice)
+        windows::ask(title, message, choice, open)
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
+        let _ = open;
         use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
         let result = app
             .dialog()
@@ -133,26 +157,37 @@ mod macos {
 
 #[cfg(windows)]
 mod windows {
-    use super::{Choice, TASK_ALLOW_ID, TASK_REFUSE_ID};
+    use super::{Choice, OpenDialog, TASK_ALLOW_ID, TASK_REFUSE_ID};
     use std::mem::{size_of, zeroed};
     use std::ptr::null_mut;
     use windows_sys::core::HRESULT;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::UI::Controls::{
         TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
-        TDF_SIZE_TO_CONTENT, TDN_CREATED, TD_WARNING_ICON,
+        TDF_SIZE_TO_CONTENT, TDM_CLICK_BUTTON, TDN_CREATED, TDN_DESTROYED, TD_WARNING_ICON,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        SetForegroundWindow, SetWindowDisplayAffinity, SetWindowPos, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, WDA_EXCLUDEFROMCAPTURE,
+        PostMessageW, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowPos, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, WDA_EXCLUDEFROMCAPTURE,
     };
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
     }
 
-    /// Raises the dialog above the app being controlled, which holds the foreground.
-    unsafe extern "system" fn on_event(hwnd: HWND, notification: u32, _: WPARAM, _: LPARAM, _: isize) -> HRESULT {
+    /// Raises the dialog above the app being controlled, which holds the foreground, and keeps
+    /// its window in the `OpenDialog` (the callback data) while it is up.
+    unsafe extern "system" fn on_event(hwnd: HWND, notification: u32, _: WPARAM, _: LPARAM, data: isize) -> HRESULT {
+        // SAFETY: `data` is 0 or the `OpenDialog` borrowed by `ask`, alive for the whole dialog.
+        let open = unsafe { (data as *const OpenDialog).as_ref() };
+        if notification == TDN_DESTROYED as u32 {
+            if let Some(open) = open {
+                *open.0.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+            }
+        }
         if notification == TDN_CREATED as u32 {
+            if let Some(open) = open {
+                *open.0.lock().unwrap_or_else(|e| e.into_inner()) = hwnd as usize;
+            }
             // SAFETY: `hwnd` is the dialog's live window during the notification.
             unsafe {
                 SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -166,7 +201,17 @@ mod windows {
         0
     }
 
-    pub fn ask(title: &str, message: &str, choice: Choice) -> bool {
+    /// Presses the refusing button of the dialog `open` holds. Under its lock, so the window is
+    /// still the dialog's (it is cleared there before the dialog goes away).
+    pub fn refuse(open: &OpenDialog) {
+        let hwnd = open.0.lock().unwrap_or_else(|e| e.into_inner());
+        if *hwnd != 0 {
+            // SAFETY: a plain message to the dialog's live window.
+            unsafe { PostMessageW(*hwnd as HWND, TDM_CLICK_BUTTON as u32, TASK_REFUSE_ID as WPARAM, 0) };
+        }
+    }
+
+    pub fn ask(title: &str, message: &str, choice: Choice, open: Option<&OpenDialog>) -> bool {
         let (title, message) = (wide(title), wide(message));
         let (allow, refuse) = (wide(choice.allow), wide(choice.refuse));
         let buttons = [
@@ -185,6 +230,7 @@ mod windows {
             config.pButtons = buttons.as_ptr();
             config.nDefaultButton = TASK_REFUSE_ID;
             config.pfCallback = Some(on_event);
+            config.lpCallbackData = open.map_or(0, |open| open as *const OpenDialog as isize);
             let mut pressed = 0i32;
             let shown = TaskDialogIndirect(&config, &mut pressed, null_mut(), null_mut());
             choice.allows_task_button((shown >= 0).then_some(pressed))
@@ -197,6 +243,10 @@ mod tests {
     use super::*;
 
     const CHOICE: Choice = Choice { allow: "Allow", refuse: "Cancel" };
+
+    // A task dialog needs the common controls v6 that the app's manifest declares; the test
+    // executable has none (it would not even start), so refusing a dialog on screen is checked
+    // in the app itself.
 
     #[test]
     fn only_the_allowing_buttons_response_allows_an_alert() {

@@ -614,23 +614,41 @@ pub fn list_apps() -> Vec<AppInfo> {
 
 /// Brings a window to the front. Windows lets only the foreground's input thread do that, so the
 /// helper joins it for the call when asking alone is refused.
-fn bring_to_front(hwnd: HWND) {
-    // SAFETY: plain window calls; the input threads are detached again before returning.
+/// Brings a window to the front and reports whether it got there (within a moment). Windows
+/// lets only the process that received the last input take the foreground, so while the user
+/// works in another app it is refused: an input that changes nothing (a mouse move by zero)
+/// is sent first, which gives this process that right.
+fn bring_to_front(hwnd: HWND) -> bool {
+    let nudge = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+            mi: MOUSEINPUT { dx: 0, dy: 0, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: 0 },
+        },
+    };
+    // SAFETY: plain window calls and one valid INPUT record; the input threads are detached
+    // again before returning.
     unsafe {
         if IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, SW_RESTORE);
         }
-        if SetForegroundWindow(hwnd) != 0 {
-            return;
+        SendInput(1, &nudge, size_of::<INPUT>() as i32);
+        if SetForegroundWindow(hwnd) == 0 {
+            let foreground = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+            let own = GetCurrentThreadId();
+            let attached = foreground != 0 && foreground != own && AttachThreadInput(own, foreground, 1) != 0;
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+            if attached {
+                AttachThreadInput(own, foreground, 0);
+            }
         }
-        let foreground = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
-        let own = GetCurrentThreadId();
-        let attached = foreground != 0 && foreground != own && AttachThreadInput(own, foreground, 1) != 0;
-        BringWindowToTop(hwnd);
-        SetForegroundWindow(hwnd);
-        if attached {
-            AttachThreadInput(own, foreground, 0);
+        for _ in 0..10 {
+            if GetAncestor(GetForegroundWindow(), GA_ROOT) == hwnd {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        GetAncestor(GetForegroundWindow(), GA_ROOT) == hwnd
     }
 }
 
@@ -641,8 +659,9 @@ fn app_window_of(pid: i32) -> Option<HWND> {
 
 /// Brings an app back to the front (after a dialog took the focus).
 pub fn activate(pid: i32) {
+    // The helper checks the front app itself afterwards.
     if let Some(hwnd) = app_window_of(pid) {
-        bring_to_front(hwnd);
+        let _ = bring_to_front(hwnd);
     }
 }
 
@@ -770,8 +789,11 @@ pub fn open_app(name: &str) -> Result<(), String> {
                 if let Some(label) = blocked_reason(&id, own) {
                     return Err(off_limits(label));
                 }
-                bring_to_front(hwnd);
-                return Ok(());
+                return if bring_to_front(hwnd) {
+                    Ok(())
+                } else {
+                    Err(format!("{} is open, but Windows kept another app in front, so it is not in front.", id.name))
+                };
             }
         }
     }
@@ -1214,6 +1236,49 @@ mod tests {
         use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
         // SAFETY: plain call; the app itself is already per-monitor aware.
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    }
+
+    /// Opens Notepad, then asks for it again: the open window comes to the front, no second one
+    /// opens. Closes only the windows it opened.
+    #[test]
+    #[ignore = "interactive Windows desktop: run in the user's own session"]
+    fn opening_a_running_app_brings_its_window_to_the_front() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+        let notepads = || -> Vec<usize> {
+            top_windows()
+                .into_iter()
+                .filter(|(hwnd, window)| {
+                    window.is_app() && target_of(*hwnd).bundle_id.as_deref().is_some_and(|exe| exe.eq_ignore_ascii_case("Notepad.exe"))
+                })
+                .map(|(hwnd, _)| hwnd as usize)
+                .collect()
+        };
+        let before = notepads();
+        let close_new = |now: &[usize]| {
+            for hwnd in now.iter().filter(|hwnd| !before.contains(hwnd)) {
+                // SAFETY: a plain message to a window this test opened.
+                unsafe { PostMessageW(*hwnd as HWND, WM_CLOSE, 0, 0) };
+            }
+        };
+        open_app("notepad.exe").expect("Notepad opens");
+        let mut first = notepads();
+        for _ in 0..50 {
+            if first.len() > before.len() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            first = notepads();
+        }
+        eprintln!("before {before:x?}, after the first open {first:x?}, front {:?}", frontmost_app());
+        open_app("notepad.exe").expect("Notepad is found");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let second = notepads();
+        let front = frontmost_app();
+        eprintln!("after the second open {second:x?}, front {front:?}");
+        close_new(&second);
+        assert_eq!(first.len(), before.len() + 1, "the first open_app opens one window");
+        assert_eq!(second, first, "the second open_app opens no other window");
+        assert_eq!(front.and_then(|app| app.bundle_id).as_deref(), Some("Notepad.exe"), "Notepad is in front");
     }
 
     #[test]

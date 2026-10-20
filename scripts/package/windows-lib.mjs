@@ -3,7 +3,7 @@ import hostPath from "node:path";
 
 export const WINDOWS_USAGE =
 	"usage: package-windows [--runtime <staged-dir>] [--help]\n" +
-	"Native Windows x64 only; consumes build/runtime/windows-x64 by default. Builds NSIS; requires existing WebView2.";
+	"Native Windows x64 only; consumes build/runtime/windows-x64 by default. Builds NSIS; the installer adds WebView2 when missing (needs internet then).";
 export const WINDOWS_FILES = Object.freeze([
 	"MANIFEST.json", "node/bin/node.exe", "daemon/cli.mjs", "daemon/package.json",
 	"daemon/native/windows-stop.node", "daemon/node_modules/gentle-pi/package.json",
@@ -56,8 +56,10 @@ export function windowsPackagePlan({ repo, runtime, platform, arch, node, manife
 		bundle: {
 			resources: { [runtime]: "runtime" },
 			icon: ["icons/icon.ico"],
-			// Do not silently download/install WebView2; the target machine must already have it.
-			windows: { webviewInstallMode: { type: "skip" } },
+			// WebView2 comes with Windows 11 and most Windows 10; where it is missing, the installer
+			// runs Microsoft's embedded bootstrapper (about 1.8 MB, downloaded once at build time),
+			// which installs it from the internet.
+			windows: { webviewInstallMode: { type: "embedBootstrapper", silent: true } },
 		},
 	};
 	return {

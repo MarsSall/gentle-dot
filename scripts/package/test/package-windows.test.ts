@@ -45,7 +45,8 @@ describe("Windows package admission and plan (no commands executed)", () => {
 		expect(config.build.beforeBuildCommand).toBe("");
 		expect(config.build.frontendDist).toMatch(/^\.\//);
 		expect(resolve(options.repo, "apps/desktop/src-tauri", config.build.frontendDist)).toBe(resolve(options.runtime, "ui"));
-		expect(config.bundle.windows.webviewInstallMode).toEqual({ type: "skip" });
+		// The installer brings WebView2 only when the machine lacks it, through the embedded bootstrapper.
+		expect(config.bundle.windows.webviewInstallMode).toEqual({ type: "embedBootstrapper", silent: true });
 		expect(plan.args.join(" ")).not.toMatch(/\.cmd|stage-runtime|install|download/);
 		const windowsPath = 'C:\\staged runtime\\quoted "folder"';
 		const quoted = windowsPackagePlan({ ...options, repo: "C:\\checkout", runtime: windowsPath, path: win32 });

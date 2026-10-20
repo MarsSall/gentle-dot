@@ -153,8 +153,10 @@ staging remains responsible for release pins and dependency/integrity checks.
 The command invokes the installed Tauri JavaScript entry through Node without a `.cmd` spawn. Its
 Windows-only overlay includes the runtime as the `runtime` resource and uses the staged UI, bypassing
 the usual UI build hook. The current explicit build-plan default is **NSIS** (`--bundles nsis`), not a
-verified distribution-format decision. WebView2 install mode is `skip`: it must already exist on the
-target machine. Tauri/Rust/MSVC and any bundler tools must be provisioned separately; this command
+verified distribution-format decision. WebView2 install mode is `embedBootstrapper`: the installer
+embeds Microsoft's WebView2 bootstrapper (about 1.8 MB, fetched by Tauri when building) and runs it
+silently only when the machine lacks WebView2; that install needs an internet connection. The
+installer is not signed, so Windows SmartScreen asks the user to confirm ("More info", "Run anyway"). Tauri/Rust/MSVC and any bundler tools must be provisioned separately; this command
 is not evidence that a build can run offline. Installer artifacts, when built, use Tauri's usual
 `src-tauri/target/release/bundle/nsis` output directory.
 

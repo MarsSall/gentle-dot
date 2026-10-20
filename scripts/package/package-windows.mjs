@@ -28,7 +28,7 @@ function main() {
 		manifest, isFile: (path) => isKind(path, "isFile"), isDirectory: (path) => isKind(path, "isDirectory"),
 	});
 	// Run the repository's installed CLI via Node, never pnpm.cmd through execFile/spawn.
-	process.stdout.write(`Using ${runtime}; tauri build --bundles nsis (no staging; WebView2 must already exist).\n`);
+	process.stdout.write(`Using ${runtime}; tauri build --bundles nsis (no staging; the installer adds WebView2 when missing).\n`);
 	const result = spawnSync(plan.program, plan.args, {
 		cwd: plan.cwd, env: { ...process.env, ...plan.env }, stdio: "inherit",
 	});

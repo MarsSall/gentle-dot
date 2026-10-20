@@ -647,10 +647,19 @@ fn bring_to_front(hwnd: HWND, nudge: bool) {
     }
 }
 
-/// Whether `hwnd`, or a window it owns (its own dialog), is in front within half a second.
+/// Whether `hwnd`, or another window of its process under the same owner (its own dialog), is
+/// in front within half a second.
 fn comes_to_front(hwnd: HWND) -> bool {
-    // SAFETY: plain queries.
-    let in_front = || unsafe { GetAncestor(GetForegroundWindow(), GA_ROOTOWNER) } == hwnd;
+    let in_front = || {
+        // SAFETY: plain queries (a vanished window just reads as not in front).
+        unsafe {
+            let front = GetAncestor(GetForegroundWindow(), GA_ROOT);
+            front == hwnd
+                || (!front.is_null()
+                    && window_pid(front) == window_pid(hwnd)
+                    && GetAncestor(front, GA_ROOTOWNER) == GetAncestor(hwnd, GA_ROOTOWNER))
+        }
+    };
     for _ in 0..10 {
         if in_front() {
             return true;

@@ -80,6 +80,14 @@ To keep permissions across updates, sign every release with the same identity. `
 
 The command stages the runtime (`build/runtime/darwin-arm64`), signs the runtime's binaries, builds the release app, and writes the DMG to `apps/desktop/src-tauri/target/release/bundle/dmg/`. `--skip-stage` reuses a runtime staged earlier; `--check-dmg <dmg>` checks an existing DMG without building.
 
+## Windows
+
+- Run `Gentle Dot_<version>_x64-setup.exe`. It is not signed yet, so Windows SmartScreen asks first: choose "More info", then "Run anyway".
+- The installer adds Microsoft WebView2 only when the PC does not have it (Windows 11 and most Windows 10 already do); that step needs the internet.
+- Reinstalling keeps your data in `%USERPROFILE%\.gentle-dot`.
+- The panel shortcut is `Ctrl+Alt+Space`; the computer-control emergency stop is `Alt+Shift+Esc`.
+- GlazeWM (tiling window manager): paste `scripts/windows/glazewm/gentle-dot.yaml` under `window_rules:` in your GlazeWM config, so it leaves Gentle Dot's windows alone.
+
 ## Linux
 
 Gentle Dot ships as a self-contained package: it carries its own Node.js, assistant engine, and Engram, so nothing else needs to be installed first. Pick the file for your system (`dpkg --print-architecture` or `uname -m` tells which):

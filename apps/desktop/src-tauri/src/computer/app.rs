@@ -328,7 +328,7 @@ fn run_overlay(
                         let _ = order_overlay(&app, ns_window, &number, active);
                         shown = active;
                     }
-                    if let Some(operation) = drawing.take().filter(|_| !active) {
+                    if let Some(operation) = super::working::session_clears(&mut drawing, active) {
                         let _ = emit_working(&app, operation, false);
                     }
                 }
@@ -441,7 +441,7 @@ fn run_glow(
                         super::win::show_overlay(window, active);
                         shown = active;
                     }
-                    if let Some(operation) = drawing.take().filter(|_| !active) {
+                    if let Some(operation) = super::working::session_clears(&mut drawing, active) {
                         let _ = emit_working(&app, operation, false);
                     }
                 }

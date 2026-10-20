@@ -15,7 +15,7 @@ import {
 } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { McpOAuthState } from "@earendil-works/pi-mcp/oauth";
 import type {
@@ -27,6 +27,7 @@ import type {
 	ServerPayload,
 } from "@gentle-dot/protocol";
 import { MAX_CONNECTOR_DRAFTS } from "@gentle-dot/protocol";
+import { childGuardFile, childGuardText } from "./child-guard.ts";
 import { resolveRecord, resolveValue, storedSignIn } from "./connector-credentials.ts";
 import { type ScannedServer, scanClientConfigs, valueNotes } from "./connector-import.ts";
 import {
@@ -37,8 +38,10 @@ import {
 	recordMac,
 } from "./connector-integrity.ts";
 import { type OAuthSettings, type SignIn, SignInCancelledError, startSignIn } from "./connector-oauth.ts";
+import { directAccess, type EngineAccess } from "./engine-access.ts";
 import { type ConnectorPolicy, draftSecretProblem, POLICY_ENV } from "./extensions/approval-guard.ts";
 import type { ProxiedConnector, UpstreamCredentials } from "./mcp-proxy.ts";
+import { writePrivateFile } from "./private-file.ts";
 import { runtimeDir, runtimeModules } from "./runtime.ts";
 import { NO_APP, type SecretSource, SecretsUnavailableError } from "./secret-source.ts";
 
@@ -625,6 +628,16 @@ export interface ConnectorStoreOptions {
 	workspace?: string;
 	/** The approval guard's own file, protected like the connector files. */
 	guardPath?: string;
+	/**
+	 * Keeps the file that loads the guard (`guardPath`) into the engine's subagents in the engine's
+	 * extensions folder, written and put back like `mcp.json` and protected like the guard (S25.4).
+	 */
+	childGuard?: boolean;
+	/**
+	 * How the store reaches the engine's files (`mcp.json`, the subagents' guard, the workspace's
+	 * `.pi`, the engine's old `mcp-auth.json`); in server mode as the engine's user (S25.8, B1).
+	 */
+	engineAccess?: EngineAccess;
 	log?: (line: string) => void;
 }
 
@@ -691,12 +704,42 @@ export class ConnectorStore {
 	/** Sign-in files that appeared after the move and were reported. */
 	private readonly reported = new Set<string>();
 	private watchers: FSWatcher[] = [];
+	/** Set once a child guard that cannot be written was reported, so the checks every second stay quiet. */
+	private childGuardReported = false;
 	private readonly options: ConnectorStoreOptions;
+	/** The file that loads the guard into the engine's subagents, when the store keeps one. */
+	readonly childGuard: { file: string; text: string } | undefined;
+
+	/** Runs `fn` on the engine's files as the engine's user; the daemon's own files stay root's. */
+	private engine<T>(fn: () => T): T {
+		return (this.options.engineAccess ?? directAccess)(fn);
+	}
+
+	/** How `path` is reached: as the engine's user when it is in the engine's folders. */
+	private io(path: string): EngineAccess {
+		const { agentHome, workspace } = this.options;
+		const inside = (root: string | undefined) =>
+			root !== undefined && (path === root || path.startsWith(`${root}/`));
+		return inside(agentHome) || inside(workspace) ? (fn) => this.engine(fn) : directAccess;
+	}
+
+	/** Writes the engine's `mcp.json`, as the engine's user. */
+	private writeMcp(): void {
+		const text = this.engineMcpText();
+		this.engine(() => {
+			mkdirSync(this.options.agentHome, { recursive: true, mode: 0o700 });
+			writePrivate(this.mcpFile, text);
+		});
+	}
 
 	constructor(options: ConnectorStoreOptions) {
 		this.options = options;
 		this.file = join(options.dataDir, "connectors.json");
 		this.mcpFile = join(options.agentHome, "mcp.json");
+		this.childGuard =
+			options.childGuard && options.guardPath
+				? { file: childGuardFile(options.agentHome), text: childGuardText(options.guardPath) }
+				: undefined;
 		this.signinHome = join(options.dataDir, "connector-signin");
 		this.signinMcpFile = join(this.signinHome, "mcp.json");
 		this.authFile = join(this.signinHome, "mcp-auth.json");
@@ -705,10 +748,11 @@ export class ConnectorStore {
 		this.saved = state;
 		// A new install has nothing to move.
 		this.migrated =
-			version >= 2 || (version === 0 && ![this.authFile, this.legacyAuthFile].some((f) => existsSync(f)));
+			version >= 2 ||
+			(version === 0 && ![this.authFile, this.legacyAuthFile].some((f) => this.io(f)(() => existsSync(f))));
 		if (renamed) {
 			this.edited = true;
-			writePrivate(this.file, this.recordText());
+			writePrivateFile(this.file, this.recordText());
 		}
 	}
 
@@ -734,9 +778,8 @@ export class ConnectorStore {
 			);
 		this.saved = state;
 		this.edited = true;
-		mkdirSync(this.options.agentHome, { recursive: true, mode: 0o700 });
-		writePrivate(this.file, this.recordText());
-		writePrivate(this.mcpFile, this.engineMcpText());
+		writePrivateFile(this.file, this.recordText());
+		this.writeMcp();
 		this.onUpdated();
 	}
 
@@ -808,7 +851,7 @@ export class ConnectorStore {
 		const signedBefore = stored !== undefined || (record !== undefined && "mac" in record);
 		if (!signedBefore) {
 			this.edited = true;
-			writePrivate(this.file, this.recordText());
+			writePrivateFile(this.file, this.recordText());
 			this.log("signed connectors.json for the first time");
 			return;
 		}
@@ -883,8 +926,7 @@ export class ConnectorStore {
 		const same = endpoint?.url === this.computer?.url && endpoint?.token === this.computer?.token;
 		if (same) return false;
 		this.computer = endpoint ? { ...endpoint } : undefined;
-		mkdirSync(this.options.agentHome, { recursive: true, mode: 0o700 });
-		writePrivate(this.mcpFile, this.engineMcpText());
+		this.writeMcp();
 		return true;
 	}
 
@@ -892,8 +934,7 @@ export class ConnectorStore {
 	setProxy(endpoint: ProxyEndpoint): boolean {
 		if (endpoint.url === this.proxy?.url && endpoint.key === this.proxy?.key) return false;
 		this.proxy = { ...endpoint };
-		mkdirSync(this.options.agentHome, { recursive: true, mode: 0o700 });
-		writePrivate(this.mcpFile, this.engineMcpText());
+		this.writeMcp();
 		return true;
 	}
 
@@ -1022,17 +1063,20 @@ export class ConnectorStore {
 		// and mcp.json before any connector or the computer helper is in it.
 		const noConnectors = Object.keys(this.saved.connectors).length === 0;
 		const changed: string[] = [];
-		for (const [file, text, empty] of [
-			[this.file, this.recordText(), noConnectors],
-			[this.mcpFile, this.engineMcpText(), noConnectors && !this.computer],
-		] as const) {
-			const current = readOrUndefined(file);
-			if (current === text || (current === undefined && empty)) continue;
-			mkdirSync(this.options.agentHome, { recursive: true, mode: 0o700 });
-			writePrivate(file, text);
-			changed.push(file);
+		const record = this.recordText();
+		const current = readOrUndefined(this.file);
+		if (current !== record && !(current === undefined && noConnectors)) {
+			writePrivateFile(this.file, record);
+			changed.push(this.file);
 		}
-		if (this.removeProjectConfig()) changed.push("the workspace's .pi/mcp.json");
+		const mcp = this.engineMcpText();
+		const currentMcp = this.engine(() => readOrUndefined(this.mcpFile));
+		if (currentMcp !== mcp && !(currentMcp === undefined && noConnectors && !this.computer)) {
+			this.writeMcp();
+			changed.push(this.mcpFile);
+		}
+		if (this.engine(() => this.enforceChildGuard())) changed.push(this.childGuard?.file ?? "");
+		if (this.engine(() => this.removeProjectConfig())) changed.push("the workspace's .pi/mcp.json");
 		this.reportPlanted();
 		if (changed.length === 0 || !report) return changed.length > 0;
 		this.options.log?.(
@@ -1063,7 +1107,7 @@ export class ConnectorStore {
 		const folders = [this.options.dataDir, this.options.agentHome, this.options.workspace];
 		for (const folder of folders) {
 			if (!folder) continue;
-			mkdirSync(folder, { recursive: true, mode: 0o700 });
+			this.io(folder)(() => mkdirSync(folder, { recursive: true, mode: 0o700 }));
 			this.watchers.push(watch(folder, check));
 		}
 		this.check = check;
@@ -1108,6 +1152,7 @@ export class ConnectorStore {
 				this.file,
 				join(this.options.dataDir, "token"),
 				...(this.options.guardPath ? [this.options.guardPath] : []),
+				...(this.childGuard ? [this.childGuard.file] : []),
 			],
 			...(this.computer ? { builtin: [COMPUTER_ID] } : {}),
 		};
@@ -1127,7 +1172,7 @@ export class ConnectorStore {
 	private secrets(): SecretSource {
 		if (this.unchecked) throw new SecretsUnavailableError(INTEGRITY_UNCHECKED);
 		const source = this.options.secrets;
-		if (!source?.available) throw new SecretsUnavailableError();
+		if (!source?.available) throw new SecretsUnavailableError(source?.unavailable);
 		return source;
 	}
 
@@ -1214,7 +1259,7 @@ export class ConnectorStore {
 		const name = specOf(id, saved)?.name ?? id;
 		const locked =
 			waiting || !this.options.secrets?.available
-				? NO_APP
+				? (this.options.secrets?.unavailable ?? NO_APP)
 				: `A secret ${name} needs is missing from the app's secure store. Ask the user to set up ${name} again in Connectors.`;
 		return { open, locked };
 	}
@@ -1249,7 +1294,7 @@ export class ConnectorStore {
 			for (const [id, secret] of this.pending) this.cache.set(id, secret);
 			this.pending.clear();
 			this.edited = true;
-			writePrivate(this.file, this.recordText());
+			writePrivateFile(this.file, this.recordText());
 			this.log(`moved ${moved} connector secrets from connectors.json into the app's secure store`);
 		}
 		if (!this.migrated) {
@@ -1259,7 +1304,7 @@ export class ConnectorStore {
 			let unread = false;
 			// The daemon's own sign-ins first: they win over the engine's older ones.
 			for (const file of [this.authFile, this.legacyAuthFile]) {
-				const states = this.readSignIns(file);
+				const states = this.io(file)(() => this.readSignIns(file));
 				if (states === "unread") unread = true;
 				if (!states || states === "unread") continue;
 				const refs: Record<string, string> = {};
@@ -1286,7 +1331,7 @@ export class ConnectorStore {
 					return;
 				}
 				this.applySignIns(refs);
-				unlinkSync(file);
+				this.io(file)(() => unlinkSync(file));
 			}
 			if (moved > 0) this.log(`moved ${moved} connector sign-ins into the app's secure store`);
 			if (dropped > 0)
@@ -1301,7 +1346,7 @@ export class ConnectorStore {
 			this.migrated = true;
 			this.edited = true;
 			mkdirSync(this.options.dataDir, { recursive: true, mode: 0o700 });
-			writePrivate(this.file, this.recordText());
+			writePrivateFile(this.file, this.recordText());
 		}
 		this.reportPlanted();
 	}
@@ -1362,7 +1407,7 @@ export class ConnectorStore {
 	private reportPlanted(): void {
 		if (!this.migrated) return;
 		for (const file of [this.authFile, this.legacyAuthFile]) {
-			if (this.reported.has(file) || !existsSync(file)) continue;
+			if (this.reported.has(file) || !this.io(file)(() => existsSync(file))) continue;
 			this.reported.add(file);
 			this.log(
 				`found ${file} after the connector sign-ins moved to the app's secure store; it was not imported and was left as it is`,
@@ -1396,7 +1441,7 @@ export class ConnectorStore {
 		this.migrated = true;
 		this.edited = true;
 		mkdirSync(this.options.dataDir, { recursive: true, mode: 0o700 });
-		writePrivate(this.file, this.recordText());
+		writePrivateFile(this.file, this.recordText());
 		this.log(
 			`connectors.json was changed while Gentle Dot was closed (its signature does not match)${moved ? `; moved it to ${target}` : ""} and started with no connectors; the secrets in the app's secure store were not touched`,
 		);
@@ -1415,7 +1460,8 @@ export class ConnectorStore {
 	/** `.pi` appears after the watch starts; its folder is watched once it is there. */
 	private watchProjectConfig(): void {
 		const folder = this.options.workspace && join(this.options.workspace, ".pi");
-		if (this.projectWatcher || !folder || this.watchers.length === 0 || !isFolder(folder)) return;
+		if (this.projectWatcher || !folder || this.watchers.length === 0 || !this.engine(() => isFolder(folder)))
+			return;
 		try {
 			const watcher = watch(folder, this.check);
 			watcher.on("error", () => {
@@ -1424,6 +1470,51 @@ export class ConnectorStore {
 			});
 			this.projectWatcher = watcher;
 		} catch {}
+	}
+
+	/** True when the engine's subagents will load the guard: its file is in place, in a real folder. */
+	childGuardReady(): boolean {
+		if (!this.childGuard) return false;
+		const { file, text } = this.childGuard;
+		return this.engine(
+			() =>
+				isFolder(dirname(file)) &&
+				lstatOrUndefined(file)?.isFile() === true &&
+				readOrUndefined(file) === text,
+		);
+	}
+
+	/**
+	 * Writes the child guard's file when it differs or is missing; true when it did. An extensions
+	 * folder that is a link loses the link, never what it points to. When the folder or the file's
+	 * place holds something else, or it cannot be written, that is reported once and left alone, and
+	 * the engine starts with subagents off ({@link childGuardReady}); the other connector files are
+	 * still checked.
+	 */
+	private enforceChildGuard(): boolean {
+		if (!this.childGuard || this.childGuardReady()) return false;
+		const { file, text } = this.childGuard;
+		const folder = dirname(file);
+		const cannot = (why?: unknown) => {
+			if (!this.childGuardReported)
+				this.options.log?.(
+					`the subagents' approval guard cannot be written to ${file}${why instanceof Error ? `: ${why.message}` : ""}`,
+				);
+			this.childGuardReported = true;
+			return false;
+		};
+		try {
+			if (lstatOrUndefined(folder)?.isSymbolicLink()) unlinkSync(folder);
+			const inFolder = lstatOrUndefined(folder);
+			const inPlace = inFolder && lstatOrUndefined(file);
+			if ((inFolder && !inFolder.isDirectory()) || inPlace?.isDirectory()) return cannot();
+			mkdirSync(folder, { recursive: true, mode: 0o700 });
+			writePrivate(file, text);
+		} catch (error) {
+			return cannot(error);
+		}
+		this.childGuardReported = false;
+		return true;
 	}
 
 	/** Removes `<workspace>/.pi/mcp.json`; a `.pi` that is a link loses the link, never what it points to. */

@@ -11,6 +11,11 @@
 //! The glow (S28): once an action's input is posted, `perform` reports where it acted to the
 //! glow sink, so a refused, declined, stopped, or failed action (or batch step) reports
 //! nothing. The sink only queues the mark; it never changes a check, the order, or a result.
+//!
+//! The working rings (S1, S5): once the session is granted, every call that captures or acts
+//! (all but `list_apps`) runs prepared: the rings show and Gentle Dot's own windows are out of
+//! the way first, and they come back once the call ends, however it ends. A preparation that
+//! fails sends nothing, and a Stop during it drops the call. The guards stay as they are.
 
 use super::blocklist::{blocked_name, blocked_reason, AppIdentity};
 use super::control::Control;
@@ -19,6 +24,7 @@ use super::glow::Mark;
 use super::keys::{parse_combo, KeyCombo};
 use super::rate::{RateLimiter, MAX_ACTIONS_PER_SECOND};
 use super::risk::{assess, Act};
+use super::working::{NoPreparation, Preparation};
 use super::{Clock, Desktop, Dialogs, InputEvent, MouseButton};
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
@@ -131,6 +137,18 @@ impl From<&str> for Failed {
 
 fn text(text: impl Into<String>) -> Value {
     json!({"type": "text", "text": text.into()})
+}
+
+/// A prepared call (S1, S5); dropping it clears the rings and shows the windows again.
+struct Prepared<'a> {
+    working: &'a dyn Preparation,
+    operation: u64,
+}
+
+impl Drop for Prepared<'_> {
+    fn drop(&mut self) {
+        self.working.finish(self.operation);
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -342,6 +360,8 @@ pub struct Helper {
     seen_front: Mutex<Option<i32>>,
     /// Where an action that went through acted (S28); must return at once.
     glow: Box<dyn Fn(Mark) + Send + Sync>,
+    /// The working rings around each call that captures or acts (S1, S5).
+    working: Arc<dyn Preparation>,
 }
 
 impl Helper {
@@ -364,7 +384,14 @@ impl Helper {
             actions: Mutex::new(None),
             seen_front: Mutex::new(None),
             glow: Box::new(|_| {}),
+            working: Arc::new(NoPreparation),
         }
+    }
+
+    /// Prepares each call that captures or acts with `working` (S1, S5).
+    pub fn with_working(mut self, working: Arc<dyn Preparation>) -> Self {
+        self.working = working;
+        self
     }
 
     /// Reports each action that went through to `glow`, which must only queue it (S28).
@@ -460,7 +487,24 @@ impl Helper {
             }
             self.control.grant(self.clock.now_ms());
         }
+        // Until the call ends, however it ends, the rings show and the Dot and panel are hidden.
+        let _prepared = match call.tool {
+            Tool::ListApps => None,
+            _ => Some(self.prepare(epoch)?),
+        };
         self.act(epoch, &mut latest, call)
+    }
+
+    /// Shows the working rings and hides Gentle Dot's windows (S1, S5), then checks the session
+    /// again: a Stop meanwhile drops the call. Nothing is captured or sent when this fails.
+    fn prepare(&self, epoch: u64) -> Result<Prepared<'_>, Failed> {
+        let operation = match self.working.begin() {
+            Ok(operation) => operation,
+            Err(error) => return Err(self.still_running(epoch).err().unwrap_or(error).into()),
+        };
+        let prepared = Prepared { working: self.working.as_ref(), operation };
+        self.still_running(epoch)?;
+        Ok(prepared)
     }
 
     fn check_permissions(&self, tool: &Tool) -> Result<(), String> {
@@ -852,6 +896,48 @@ mod tests {
         states: Arc<Mutex<Vec<StateEvent>>>,
         /// Each glow mark (S28), with how many input events were posted when it came.
         marks: Arc<Mutex<Vec<(Mark, usize)>>>,
+        working: Arc<FakeWorking>,
+    }
+
+    /// What a step of the working rings saw: screenshots taken and input events posted so far.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Step {
+        Begin { captures: usize, events: usize },
+        Finish { captures: usize, events: usize },
+    }
+
+    /// Records each preparation (S1, S5); can fail it, or run something while it is under way.
+    struct FakeWorking {
+        desktop: Arc<FakeDesktop>,
+        steps: Mutex<Vec<Step>>,
+        fails: Mutex<Option<String>>,
+        during: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl FakeWorking {
+        fn seen(&self) -> (usize, usize) {
+            (self.desktop.captures.load(Ordering::SeqCst), self.desktop.events().len())
+        }
+    }
+
+    impl Preparation for FakeWorking {
+        fn begin(&self) -> Result<u64, String> {
+            let (captures, events) = self.seen();
+            self.steps.lock().unwrap().push(Step::Begin { captures, events });
+            if let Some(during) = self.during.lock().unwrap().as_ref() {
+                during();
+            }
+            match self.fails.lock().unwrap().clone() {
+                Some(error) => Err(error),
+                None => Ok(7),
+            }
+        }
+
+        fn finish(&self, operation: u64) {
+            assert_eq!(operation, 7);
+            let (captures, events) = self.seen();
+            self.steps.lock().unwrap().push(Step::Finish { captures, events });
+        }
     }
 
     fn rig_with(allow: bool, confirm: bool) -> Rig {
@@ -863,13 +949,20 @@ mod tests {
         let control = Arc::new(Control::new(move |event| sink.lock().unwrap().push(event.clone())));
         let marks = Arc::new(Mutex::new(Vec::new()));
         let (seen, posted) = (marks.clone(), desktop.clone());
+        let working = Arc::new(FakeWorking {
+            desktop: desktop.clone(),
+            steps: Mutex::new(Vec::new()),
+            fails: Mutex::new(None),
+            during: Mutex::new(None),
+        });
         let helper =
             Helper::new(desktop.clone(), dialogs.clone(), clock.clone(), control.clone(), TOKEN.into(), OWN_PID)
-                .with_glow(move |mark| seen.lock().unwrap().push((mark, posted.events().len())));
-        Rig { helper, desktop, dialogs, clock, control, states, marks }
+                .with_glow(move |mark| seen.lock().unwrap().push((mark, posted.events().len())))
+                .with_working(working.clone());
+        Rig { helper, desktop, dialogs, clock, control, states, marks, working }
     }
 
-    /// A rig whose helper has no glow sink, as before S28.
+    /// A rig whose helper has no glow sink and no working rings, as before S28.
     fn rig_without_glow(allow: bool, confirm: bool) -> Rig {
         let rig = rig_with(allow, confirm);
         let helper = Helper::new(
@@ -2021,6 +2114,297 @@ mod tests {
             assert_eq!(*with.dialogs.confirmations.lock().unwrap(), *without.dialogs.confirmations.lock().unwrap());
             assert_eq!(with.clock.now_ms(), without.clock.now_ms());
             assert!(without.marks.lock().unwrap().is_empty());
+            // The rig with the glow also prepares every call; the rig without prepares none.
+            assert!(!with.working.steps.lock().unwrap().is_empty());
         }
+    }
+
+    // --- The working rings (S1, S5) ---
+
+    fn steps(rig: &Rig) -> Vec<Step> {
+        std::mem::take(&mut *rig.working.steps.lock().unwrap())
+    }
+
+    #[test]
+    fn a_screenshot_is_taken_while_prepared() {
+        let rig = rig();
+        assert!(!is_error(&rig.call("screenshot", json!({}))));
+        assert_eq!(steps(&rig), [Step::Begin { captures: 0, events: 0 }, Step::Finish { captures: 1, events: 0 }]);
+    }
+
+    #[test]
+    fn an_action_and_the_screenshot_after_it_run_while_prepared() {
+        let rig = rig();
+        rig.ready();
+        steps(&rig);
+        assert!(!is_error(&rig.call("click", json!({"x": 10, "y": 10}))));
+        assert_eq!(steps(&rig), [Step::Begin { captures: 1, events: 0 }, Step::Finish { captures: 2, events: 1 }]);
+        for (name, args) in [("open_app", json!({"name": "Mail"})), ("wait", json!({"ms": 200}))] {
+            assert!(!is_error(&rig.call(name, args)), "{name}");
+            assert_eq!(steps(&rig).len(), 2, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_batch_is_prepared_once_for_all_its_steps() {
+        let rig = rig();
+        rig.ready();
+        steps(&rig);
+        let steps_json = json!([
+            {"tool": "click", "x": 10, "y": 10},
+            {"tool": "type", "text": "Ana"},
+            {"tool": "key", "combo": "tab"},
+        ]);
+        assert!(!is_error(&rig.call("batch", batch(steps_json))));
+        assert_eq!(steps(&rig), [Step::Begin { captures: 1, events: 0 }, Step::Finish { captures: 2, events: 3 }]);
+    }
+
+    #[test]
+    fn list_apps_and_calls_refused_before_the_session_are_never_prepared() {
+        let rig = rig();
+        assert!(!is_error(&rig.call("list_apps", json!({}))));
+        assert!(is_error(&rig.call("click", json!({"x": 1}))));
+        rig.rpc("tools/call", json!({"name": "format_disk", "arguments": {}}));
+        rig.desktop.permissions.lock().unwrap().screen_recording = false;
+        assert!(is_error(&rig.call("screenshot", json!({}))));
+        assert!(steps(&rig).is_empty());
+        // A denied session grant prepares nothing.
+        let denied = rig_with(false, true);
+        assert!(is_error(&denied.call("screenshot", json!({}))));
+        assert!(is_error(&denied.call("batch", batch(json!([{"tool": "key", "combo": "tab"}])))));
+        assert!(steps(&denied).is_empty());
+    }
+
+    #[test]
+    fn a_failed_preparation_sends_nothing() {
+        let rig = rig();
+        rig.ready();
+        steps(&rig);
+        *rig.working.fails.lock().unwrap() = Some(super::super::working::UNAVAILABLE.to_string());
+        for (name, args) in [
+            ("screenshot", json!({})),
+            ("click", json!({"x": 10, "y": 10})),
+            ("batch", batch(json!([{"tool": "type", "text": "hi"}]))),
+        ] {
+            let result = rig.call(name, args);
+            assert!(is_error(&result), "{name}");
+            assert_eq!(first_text(&result), super::super::working::UNAVAILABLE, "{name}");
+            assert_eq!(image_count(&result), 0, "{name}");
+        }
+        assert!(rig.desktop.events().is_empty());
+        assert_eq!(rig.desktop.captures.load(Ordering::SeqCst), 1);
+        // A failed begin left nothing to finish.
+        assert!(steps(&rig).iter().all(|step| matches!(step, Step::Begin { .. })));
+    }
+
+    #[test]
+    fn a_stop_while_preparing_drops_the_call() {
+        let rig = rig();
+        rig.ready();
+        steps(&rig);
+        let control = rig.control.clone();
+        *rig.working.during.lock().unwrap() = Some(Box::new(move || control.end(Reason::Stopped)));
+        let result = rig.call("click", json!({"x": 10, "y": 10}));
+        assert!(is_error(&result));
+        assert_eq!(first_text(&result), STOPPED);
+        assert!(rig.desktop.events().is_empty());
+        assert_eq!(rig.desktop.captures.load(Ordering::SeqCst), 1);
+        assert_eq!(steps(&rig), [Step::Begin { captures: 1, events: 0 }, Step::Finish { captures: 1, events: 0 }]);
+        // A preparation that failed because of the Stop says the call was stopped.
+        *rig.working.during.lock().unwrap() = None;
+        rig.ready();
+        steps(&rig);
+        let control = rig.control.clone();
+        *rig.working.during.lock().unwrap() = Some(Box::new(move || control.end(Reason::Panic)));
+        *rig.working.fails.lock().unwrap() = Some(super::super::working::UNAVAILABLE.to_string());
+        assert_eq!(first_text(&rig.call("key", json!({"combo": "tab"}))), STOPPED);
+        assert!(rig.desktop.events().is_empty());
+    }
+
+    #[test]
+    fn every_prepared_call_is_finished_once_however_it_ends() {
+        let one_each = |rig: &Rig, why: &str| {
+            let seen = steps(rig);
+            assert_eq!(seen.len(), 2, "{why}: {seen:?}");
+            assert!(matches!(seen[0], Step::Begin { .. }) && matches!(seen[1], Step::Finish { .. }), "{why}: {seen:?}");
+        };
+        // Refused by the blocklist, and with no screenshot yet.
+        let rig_refused = rig();
+        assert!(is_error(&rig_refused.call("click", json!({"x": 1, "y": 1}))));
+        one_each(&rig_refused, "no screenshot");
+        rig_refused.ready();
+        steps(&rig_refused);
+        *rig_refused.desktop.owner_at.lock().unwrap() =
+            Box::new(|_| Some(app(300, SETTINGS.0, SETTINGS.1)));
+        assert!(is_error(&rig_refused.call("click", json!({"x": 10, "y": 10}))));
+        one_each(&rig_refused, "blocked");
+        // Declined by the user.
+        let rig_declined = rig_with(true, false);
+        rig_declined.ready();
+        steps(&rig_declined);
+        *rig_declined.desktop.elements.lock().unwrap() = send_button();
+        assert!(is_error(&rig_declined.call("click", json!({"x": 10, "y": 10}))));
+        one_each(&rig_declined, "declined");
+        // Stopped in the middle of a batch.
+        let rig_stopped = rig();
+        rig_stopped.ready();
+        steps(&rig_stopped);
+        let control = rig_stopped.control.clone();
+        *rig_stopped.clock.on_sleep.lock().unwrap() = Some(Box::new(move || control.end(Reason::Panic)));
+        let steps_json = json!([{"tool": "click", "x": 10, "y": 10}, {"tool": "click", "x": 20, "y": 20}]);
+        assert!(is_error(&rig_stopped.call("batch", batch(steps_json))));
+        one_each(&rig_stopped, "stopped");
+        assert_eq!(rig_stopped.desktop.events().len(), 1);
+    }
+
+    /// Races between preparation, Stop, and late acknowledgements, with the real `Working` coordinator.
+    mod preparation_races {
+        use super::*;
+        use super::super::super::working::{self as w, MainThread, Part, Rings, Task, Visibility, Windows, Working};
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::time::{Duration, Instant};
+
+        #[derive(Default)]
+        struct Wins { vis: Mutex<Visibility>, log: Mutex<Vec<String>> }
+        impl Windows for Wins {
+            fn is_visible(&self, p: Part) -> bool { self.vis.lock().unwrap().get(p) }
+            fn hide(&self, p: Part) -> Result<(), String> {
+                let mut v = self.vis.lock().unwrap();
+                match p { Part::Dot => v.dot = false, Part::Panel => v.panel = false }
+                self.log.lock().unwrap().push(format!("hide {p:?}")); Ok(())
+            }
+            fn show(&self, p: Part) {
+                let mut v = self.vis.lock().unwrap();
+                match p { Part::Dot => v.dot = true, Part::Panel => v.panel = true }
+                self.log.lock().unwrap().push(format!("show {p:?}"));
+            }
+            fn rose_hidden(&self) -> bool { false }
+        }
+        /// Overlay: acks with `ack_offset` added (None = never acks), after `delay`.
+        struct Ring { w: Mutex<Option<std::sync::Weak<Working>>>, ack: Mutex<Option<i64>>, log: Mutex<Vec<String>>, last: AtomicU64 }
+        impl Rings for Ring {
+            fn show(&self, op: u64) -> Result<(), String> {
+                self.log.lock().unwrap().push(format!("on {op}"));
+                self.last.store(op, Ordering::SeqCst);
+                if let (Some(off), Some(w)) = (*self.ack.lock().unwrap(), self.w.lock().unwrap().as_ref().and_then(|w| w.upgrade())) {
+                    w.acknowledge("glow", (op as i64 + off) as u64).ok();
+                }
+                Ok(())
+            }
+            fn end(&self, op: u64) { self.log.lock().unwrap().push(format!("off {op}")); }
+        }
+        /// Main thread: inline, or a real separate thread with a queue.
+        struct Main { deferred: AtomicBool, q: Mutex<Vec<Task>> }
+        impl MainThread for Main {
+            fn run(&self, t: Task) -> Result<(), String> {
+                if self.deferred.load(Ordering::SeqCst) { self.q.lock().unwrap().push(t); } else { t(); }
+                Ok(())
+            }
+        }
+        impl Main { fn drain(&self) { let ts: Vec<Task> = std::mem::take(&mut *self.q.lock().unwrap()); for t in ts { t(); } } }
+
+        struct P { rig: Rig, wins: Arc<Wins>, ring: Arc<Ring>, main: Arc<Main>, working: Arc<Working> }
+        fn probe(allow: bool, confirm: bool, timeout: Duration) -> P {
+            let base = rig_with(allow, confirm);
+            let wins = Arc::new(Wins::default());
+            *wins.vis.lock().unwrap() = Visibility { dot: true, panel: true };
+            let ring = Arc::new(Ring { w: Mutex::new(None), ack: Mutex::new(Some(0)), log: Mutex::new(vec![]), last: AtomicU64::new(0) });
+            let main = Arc::new(Main { deferred: AtomicBool::new(false), q: Mutex::new(vec![]) });
+            let working = Arc::new(Working::new(wins.clone(), ring.clone(), main.clone(), timeout));
+            *ring.w.lock().unwrap() = Some(Arc::downgrade(&working));
+            let helper = Helper::new(base.desktop.clone(), base.dialogs.clone(), base.clock.clone(), base.control.clone(), TOKEN.into(), OWN_PID)
+                .with_working(working.clone());
+            P { rig: Rig { helper, ..base }, wins, ring, main, working }
+        }
+        const BOTH: Visibility = Visibility { dot: true, panel: true };
+
+        #[test]
+        fn a_stop_while_waiting_for_the_rings_posts_nothing_and_restores_the_windows() {
+            let p = probe(true, true, Duration::from_secs(3));
+            p.rig.ready();
+            let caps = p.rig.desktop.captures.load(Ordering::SeqCst);
+            *p.ring.ack.lock().unwrap() = None; // overlay never acks
+            let control = p.rig.control.clone();
+            let t = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(100)); control.end(Reason::Stopped); });
+            // The real app wires Control's notify to session_ended; emulate that wiring here.
+            let working = p.working.clone();
+            let ring = p.ring.clone();
+            let watcher = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(150)); working.session_ended(); let _ = ring; });
+            let started = Instant::now();
+            let result = p.rig.call("click", json!({"x": 10, "y": 10}));
+            t.join().unwrap(); watcher.join().unwrap();
+            assert!(is_error(&result));
+            assert_eq!(first_text(&result), STOPPED);
+            assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+            assert!(p.rig.desktop.events().is_empty());
+            assert_eq!(p.rig.desktop.captures.load(Ordering::SeqCst), caps);
+            assert_eq!(*p.wins.vis.lock().unwrap(), BOTH);
+            // A late acknowledgement for the stopped operation is ignored.
+            assert_eq!(p.working.acknowledge("glow", 2), Ok(false));
+            assert_eq!(*p.wins.vis.lock().unwrap(), BOTH);
+        }
+
+
+        #[test]
+        fn an_acknowledgement_for_an_older_operation_is_ignored() {
+            let p = probe(true, true, Duration::from_millis(150));
+            p.rig.ready(); // op 1 completes
+            *p.ring.ack.lock().unwrap() = Some(-1); // overlay acks op N-1
+            let result = p.rig.call("click", json!({"x": 10, "y": 10}));
+            assert!(is_error(&result));
+            assert_eq!(first_text(&result), w::UNAVAILABLE);
+            assert!(p.rig.desktop.events().is_empty());
+            assert_eq!(*p.wins.vis.lock().unwrap(), BOTH);
+            assert_eq!(*p.wins.log.lock().unwrap(), ["hide Dot", "hide Panel", "show Dot", "show Panel"]);
+            // Only the glow window may acknowledge.
+            assert!(p.working.acknowledge("panel", 3).is_err());
+            assert!(p.working.acknowledge("dot", 3).is_err());
+        }
+
+
+        #[test]
+        fn a_hide_that_runs_after_its_timeout_hides_nothing() {
+            let p = probe(true, true, Duration::from_millis(120));
+            p.rig.ready();
+            p.main.deferred.store(true, Ordering::SeqCst);
+            let result = p.rig.call("key", json!({"combo": "tab"}));
+            assert!(is_error(&result));
+            assert_eq!(first_text(&result), w::NOT_HIDDEN);
+            assert!(p.rig.desktop.events().is_empty());
+            p.main.drain();
+            assert_eq!(*p.wins.vis.lock().unwrap(), BOTH);
+            assert_eq!(p.wins.log.lock().unwrap().len(), 4, "{:?}", p.wins.log.lock().unwrap());
+        }
+
+
+        #[test]
+        fn a_concurrent_stop_always_restores_the_windows_and_never_acts_after_failing() {
+            // A separate "main" thread drains the queue; Stop arrives concurrently. Repeat to shake races.
+            for i in 0..50u64 {
+                let p = probe(true, true, Duration::from_millis(500));
+                p.rig.ready();
+                p.main.deferred.store(true, Ordering::SeqCst);
+                let stop = Arc::new(AtomicBool::new(false));
+                let (m, s) = (p.main.clone(), stop.clone());
+                let mainthr = std::thread::spawn(move || { while !s.load(Ordering::SeqCst) { m.drain(); std::thread::yield_now(); } m.drain(); });
+                let (c, wk) = (p.rig.control.clone(), p.working.clone());
+                let stopper = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_micros(i * 5));
+                    c.end(Reason::Stopped);
+                    wk.session_ended();
+                });
+                let r = p.rig.call("click", json!({"x": 10, "y": 10}));
+                stopper.join().unwrap();
+                std::thread::sleep(Duration::from_millis(2));
+                stop.store(true, Ordering::SeqCst);
+                mainthr.join().unwrap();
+                assert_eq!(*p.wins.vis.lock().unwrap(), BOTH, "iter {i}: {:?} {r}", p.wins.log.lock().unwrap());
+                assert!(p.rig.desktop.events().len() <= 1);
+                if is_error(&r) { assert!(p.rig.desktop.events().is_empty(), "iter {i}"); }
+                assert!(!p.working.is_current(p.ring.last.load(Ordering::SeqCst)));
+            }
+        }
+
+
     }
 }

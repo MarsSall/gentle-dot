@@ -126,7 +126,7 @@ describe("private memory ownership safeguards", () => {
 
 	it("terminates only a stable positive PID with matching health identity", async () => {
 		const f = await fixture([empty, one, one]);
-		const owned = await privateMemory(f.base, f.dataDir, () => {}, f.options);
+		const owned = await privateMemory(f.base, f.dataDir, () => {}, undefined, f.options);
 		expect(owned).toBeDefined();
 		await owned?.stop();
 		expect(f.kill).toHaveBeenCalledExactlyOnceWith(12345, "SIGTERM");
@@ -141,13 +141,13 @@ describe("private memory ownership safeguards", () => {
 		{ code: 0, stdout: "12345\n12346" },
 	])("refuses uncertain startup ownership: %j", async (output) => {
 		const f = await fixture([output]);
-		await expect(privateMemory(f.base, f.dataDir, () => {}, f.options)).rejects.toThrow("private memory");
+		await expect(privateMemory(f.base, f.dataDir, () => {}, undefined, f.options)).rejects.toThrow("private memory");
 		expect(f.kill).not.toHaveBeenCalled();
 	});
 
 	it("does not claim a pre-existing listener", async () => {
 		const f = await fixture([one]);
-		expect(await privateMemory(f.base, f.dataDir, () => {}, f.options)).toBeUndefined();
+		expect(await privateMemory(f.base, f.dataDir, () => {}, undefined, f.options)).toBeUndefined();
 		expect(f.kill).not.toHaveBeenCalled();
 	});
 
@@ -157,32 +157,32 @@ describe("private memory ownership safeguards", () => {
 		{ code: 0, stdout: "12345\n12346" },
 	])("leaves a listener alone when close lookup is uncertain: %j", async (output) => {
 		const f = await fixture([empty, output]);
-		await (await privateMemory(f.base, f.dataDir, () => {}, f.options))?.stop();
+		await (await privateMemory(f.base, f.dataDir, () => {}, undefined, f.options))?.stop();
 		expect(f.kill).not.toHaveBeenCalled();
 	});
 
 	it("does not terminate when the PID changes after the health check", async () => {
 		const f = await fixture([empty, one, { code: 0, stdout: "12346" }]);
-		await (await privateMemory(f.base, f.dataDir, () => {}, f.options))?.stop();
+		await (await privateMemory(f.base, f.dataDir, () => {}, undefined, f.options))?.stop();
 		expect(f.kill).not.toHaveBeenCalled();
 	});
 
 	it("does not terminate another memory instance", async () => {
 		const f = await fixture([empty, one], "foreign");
-		await (await privateMemory(f.base, f.dataDir, () => {}, f.options))?.stop();
+		await (await privateMemory(f.base, f.dataDir, () => {}, undefined, f.options))?.stop();
 		expect(f.kill).not.toHaveBeenCalled();
 	});
 
 	it("rejects a failed command instead of assuming an empty port", async () => {
 		const f = await fixture([]);
 		f.runListenerCommand.mockRejectedValueOnce(new Error("spawn failed"));
-		await expect(privateMemory(f.base, f.dataDir, () => {}, f.options)).rejects.toThrow("private memory");
+		await expect(privateMemory(f.base, f.dataDir, () => {}, undefined, f.options)).rejects.toThrow("private memory");
 		expect(f.kill).not.toHaveBeenCalled();
 	});
 
 	it("preserves the Unix no-match exit code and verifies stable ownership before stopping", async () => {
 		const f = await fixture([{ code: 1, stdout: "" }, one, one]);
-		await (await privateMemory(f.base, f.dataDir, () => {}, { ...f.options, platform: "linux" }))?.stop();
+		await (await privateMemory(f.base, f.dataDir, () => {}, undefined, { ...f.options, platform: "linux" }))?.stop();
 		expect(f.kill).toHaveBeenCalledExactlyOnceWith(12345, "SIGTERM");
 		expect(f.runListenerCommand.mock.calls[0]?.[0]).toBe("lsof");
 	});
@@ -190,12 +190,12 @@ describe("private memory ownership safeguards", () => {
 	it("does not terminate when health is unavailable or the stored instance id is empty", async () => {
 		const f = await fixture([empty, one]);
 		await (
-			await privateMemory(f.base, f.dataDir, () => {}, { ...f.options, health: async () => undefined })
+			await privateMemory(f.base, f.dataDir, () => {}, undefined, { ...f.options, health: async () => undefined })
 		)?.stop();
 		expect(f.kill).not.toHaveBeenCalled();
 		const other = await fixture([empty, one]);
 		writeFileSync(join(other.dataDir, "home", ".engram", ".instance-id"), "\n");
-		await (await privateMemory(other.base, other.dataDir, () => {}, other.options))?.stop();
+		await (await privateMemory(other.base, other.dataDir, () => {}, undefined, other.options))?.stop();
 		expect(other.kill).not.toHaveBeenCalled();
 	});
 
@@ -204,7 +204,7 @@ describe("private memory ownership safeguards", () => {
 		async (port) => {
 			const f = await fixture([]);
 			await expect(
-				privateMemory({ ...f.base, GENTLE_DOT_ENGRAM_PORT: port }, f.dataDir, () => {}, f.options),
+				privateMemory({ ...f.base, GENTLE_DOT_ENGRAM_PORT: port }, f.dataDir, () => {}, undefined, f.options),
 			).rejects.toThrow("private memory");
 			expect(f.runListenerCommand).not.toHaveBeenCalled();
 			expect(f.kill).not.toHaveBeenCalled();

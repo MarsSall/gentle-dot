@@ -7,6 +7,7 @@ use crate::approvals::{native::NativePrompt, ApprovalRequest, Approvals, Decisio
 use crate::computer::app as computer;
 use crate::computer::server::Endpoint;
 use crate::computer::session::Reason;
+use crate::computer::working::{self, Part};
 use crate::config::{self, ConnectionInfo, DesktopConfig, DEFAULT_SHORTCUT};
 use crate::daemon::{self, Daemon, RestartOutcome};
 use crate::geometry::{self, Rect};
@@ -66,6 +67,45 @@ struct Shell {
     full_screen: Mutex<Option<Rect>>,
     /// The shortcut that toggles the panel now; `None` while none is bound (native Wayland).
     shortcut: Mutex<Option<String>>,
+}
+
+/// The Dot and the panel as computer control hides them during a call (S1, S5): never through
+/// `hide_panel` or `show_panel`, so the remembered spot, the full-screen frame, the rose choice,
+/// and the keyboard focus stay as they were. Main thread only.
+struct ShellWindows(AppHandle);
+
+impl ShellWindows {
+    fn get(&self, part: Part) -> Option<WebviewWindow> {
+        self.0.get_webview_window(match part {
+            Part::Dot => DOT,
+            Part::Panel => PANEL,
+        })
+    }
+}
+
+impl working::Windows for ShellWindows {
+    fn is_visible(&self, part: Part) -> bool {
+        self.get(part).and_then(|window| window.is_visible().ok()).unwrap_or(false)
+    }
+
+    fn hide(&self, part: Part) -> Result<(), String> {
+        self.get(part).ok_or_else(|| format!("window {part:?} is missing"))?.hide().map_err(err)
+    }
+
+    fn show(&self, part: Part) {
+        let Some(window) = self.get(part) else { return };
+        #[cfg(target_os = "macos")]
+        let shown = computer::show_without_focus(&window);
+        #[cfg(not(target_os = "macos"))]
+        let shown = window.show().map_err(err);
+        if let Err(error) = shown {
+            eprintln!("gentle-dot: cannot show the {part:?} again: {error}");
+        }
+    }
+
+    fn rose_hidden(&self) -> bool {
+        self.0.try_state::<Shell>().is_some_and(|shell| shell.rose_hidden.load(Ordering::SeqCst))
+    }
 }
 
 /// The tray's rose item, relabeled when the rose is hidden or shown.
@@ -801,6 +841,7 @@ pub fn run() {
             computer::computer_stop,
             computer::computer_status,
             computer::computer_set_yolo,
+            computer::computer_working_ready,
             voice::voice_status,
             voice::voice_start,
             voice::voice_stop,
@@ -816,7 +857,7 @@ pub fn run() {
             let handle = app.handle().clone();
 
             // Computer control first: a daemon this app spawns gets the helper over its channel.
-            let computer = computer::start(&handle);
+            let computer = computer::start(&handle, Arc::new(ShellWindows(handle.clone())));
             let service = ChannelService {
                 approvals: Approvals::new(Arc::new(NativePrompt::new(handle.clone())), APPROVAL_TIMEOUT),
                 computer: computer.endpoint(),
@@ -966,6 +1007,22 @@ mod tests {
                 .collect();
             assert_eq!(windows, ["panel"], "{permission}");
         }
+    }
+
+    #[test]
+    fn only_the_glow_overlay_may_acknowledge_the_working_rings() {
+        let build = include_str!("../build.rs");
+        assert!(build.contains("\"computer_working_ready\","), "computer_working_ready is missing from build.rs");
+        let capabilities: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        let windows: Vec<&serde_json::Value> = capabilities["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["permissions"].as_array().unwrap().iter().any(|p| p == "allow-computer-working-ready"))
+            .flat_map(|c| c["windows"].as_array().unwrap())
+            .collect();
+        assert_eq!(windows, [computer::GLOW_WINDOW]);
     }
 
     #[test]

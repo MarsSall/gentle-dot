@@ -16,6 +16,7 @@ const COMMANDS: &[&str] = &[
     "computer_stop",
     "computer_status",
     "computer_set_yolo",
+    "computer_working_ready",
     "voice_status",
     "voice_start",
     "voice_stop",

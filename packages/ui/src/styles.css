@@ -1544,6 +1544,54 @@ html[data-surface="glow"] body {
 	}
 }
 
+/* While the Dot steps aside for an operation: the top edge of the controlled display glows in the
+   rose's neon, and a light travels along it, like the light on the rose's strokes. No text, no
+   logo. It sits apart from the fading marks and ignores the pointer. Reduce motion: the edge stays
+   lit and the traveling light is left out (frozen, it would look like a stray spot). */
+.glow-working {
+	position: fixed;
+	top: 0;
+	left: 0;
+	right: 0;
+	height: 3px;
+	overflow: hidden;
+	background: linear-gradient(
+		90deg,
+		rgba(255, 45, 122, 0.15),
+		rgba(255, 45, 122, 0.55) 50%,
+		rgba(255, 45, 122, 0.15)
+	);
+	box-shadow:
+		0 0 6px rgba(255, 45, 122, 0.55),
+		0 0 14px rgba(255, 45, 122, 0.3);
+	border-bottom: 1px solid #ff2d7a;
+	pointer-events: none;
+}
+
+.glow-working-light {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: 0;
+	width: 22%;
+	background: linear-gradient(90deg, transparent, #ffd6e8 50%, transparent);
+	filter: drop-shadow(0 0 4px #ff2d7a);
+	animation: glow-travel 1.6s ease-in-out infinite;
+}
+
+.glow-static .glow-working-light {
+	display: none;
+}
+
+@keyframes glow-travel {
+	from {
+		transform: translateX(-100%);
+	}
+	to {
+		transform: translateX(455%);
+	}
+}
+
 /* ---------- Attachments (S31) ---------- */
 
 .visually-hidden {

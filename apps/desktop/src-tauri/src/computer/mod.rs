@@ -32,6 +32,7 @@ pub mod winaccess;
 pub mod winapps;
 #[cfg(any(windows, test))]
 pub mod winput;
+pub mod working;
 
 use blocklist::AppIdentity;
 use coords::{Point, ScreenshotGeometry};

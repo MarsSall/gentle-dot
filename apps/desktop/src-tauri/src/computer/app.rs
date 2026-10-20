@@ -7,10 +7,17 @@
 //! active and out when it ends. The helper's marks reach it through a channel, so the helper
 //! never waits on the overlay; a thread of its own looks up the display (and, for keys, the
 //! focused element), moves the overlay over that display, and emits `computer://glow`.
+//!
+//! The working rings (S1, S2, S5): the same thread covers the display under the pointer, orders
+//! the overlay in, and emits `computer://working` for each prepared call; the overlay answers
+//! with `computer_working_ready`, and the end of the call or of the session clears the rings.
 
 use super::control::Control;
 use super::server::Endpoint;
 use super::session::{Reason, StateEvent};
+use super::working::Windows;
+#[cfg(target_os = "macos")]
+use super::working::{MainThread, Rings, Task, Working, WorkingEvent, READY_TIMEOUT, WORKING_EVENT};
 use super::{Clock, PermissionKind, Permissions, SystemClock};
 use crate::alert::Choice;
 use std::sync::Arc;
@@ -46,13 +53,60 @@ pub struct Computer {
     endpoint: Option<Endpoint>,
     #[cfg(any(target_os = "macos", windows))]
     desktop: Arc<dyn super::Desktop>,
+    #[cfg(target_os = "macos")]
+    working: Arc<Working>,
 }
 
-/// What the overlay thread hears: the session started or ended, or the agent acted.
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+/// What the overlay thread hears: the session started or ended, the agent acted, or a call
+/// starts (answered once the rings were told to draw, or why not) or ends its working rings
+/// (macOS; Windows has no working rings yet).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 enum Overlay {
     Session(bool),
     Mark(super::glow::Mark),
+    Working { operation: u64, reply: std::sync::mpsc::Sender<Result<(), String>> },
+    WorkingEnd(u64),
+}
+
+/// How long the overlay thread waits for the main thread to order the overlay in.
+#[cfg(target_os = "macos")]
+const OVERLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The overlay's working rings, through the overlay thread.
+#[cfg(target_os = "macos")]
+struct OverlayRings(std::sync::mpsc::Sender<Overlay>);
+
+#[cfg(target_os = "macos")]
+impl Rings for OverlayRings {
+    fn show(&self, operation: u64) -> Result<(), String> {
+        let (reply, answer) = std::sync::mpsc::channel();
+        self.0.send(Overlay::Working { operation, reply }).map_err(|_| "the glow is unavailable".to_string())?;
+        answer.recv_timeout(READY_TIMEOUT).map_err(|_| "the glow did not answer in time".to_string())?
+    }
+
+    fn end(&self, operation: u64) {
+        let _ = self.0.send(Overlay::WorkingEnd(operation));
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct AppMainThread(AppHandle);
+
+#[cfg(target_os = "macos")]
+impl MainThread for AppMainThread {
+    fn run(&self, task: Task) -> Result<(), String> {
+        self.0.run_on_main_thread(task).map_err(|error| error.to_string())
+    }
+}
+
+/// Orders one of the app's windows in without making it key or activating the app: the Dot and
+/// the panel once a computer-control call ends (S5). Main thread only.
+#[cfg(target_os = "macos")]
+pub fn show_without_focus(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let ns_window = window.ns_window().map_err(|error| error.to_string())?;
+    // SAFETY: on the main thread (the caller's contract), with the window's live NSWindow.
+    unsafe { super::macos::order_window(ns_window, true) };
+    Ok(())
 }
 
 impl Computer {
@@ -64,9 +118,27 @@ impl Computer {
 }
 
 /// Creates the session and, on macOS and Windows, starts the MCP helper, the timeout watcher, and
-/// the glow overlay. Runs in the app's setup, on the main thread.
-pub fn start(app: &AppHandle) -> Computer {
+/// the glow overlay. `windows` are the Dot and the panel, hidden during each call on macOS (S1).
+/// Runs in the app's setup, on the main thread.
+pub fn start(app: &AppHandle, windows: Arc<dyn Windows>) -> Computer {
     let (overlay, marks) = std::sync::mpsc::channel::<Overlay>();
+    #[cfg(target_os = "macos")]
+    let working = Arc::new(Working::new(
+        windows,
+        Arc::new(OverlayRings(overlay.clone())),
+        Arc::new(AppMainThread(app.clone())),
+        READY_TIMEOUT,
+    ));
+    #[cfg(target_os = "macos")]
+    let session_ended = {
+        let working = working.clone();
+        move || working.session_ended()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let session_ended = {
+        drop(windows);
+        || {}
+    };
     let events = app.clone();
     let session = overlay.clone();
     let control = Arc::new(Control::new(move |event: &StateEvent| {
@@ -79,6 +151,10 @@ pub fn start(app: &AppHandle) -> Computer {
         let _ = session.send(Overlay::Session(event.active));
         #[cfg(windows)]
         keep_out_of_capture(&events, event.active);
+        // Stop, panic, or the timeout: the call under way gives the Dot and the panel back now.
+        if !event.active {
+            session_ended();
+        }
     }));
     #[cfg(target_os = "macos")]
     {
@@ -87,15 +163,18 @@ pub fn start(app: &AppHandle) -> Computer {
         let glow = move |mark| {
             let _ = overlay.send(Overlay::Mark(mark));
         };
-        let endpoint = start_helper(app, control.clone(), desktop.clone(), glow)
+        let preparation: Arc<dyn super::working::Preparation> = working.clone();
+        let endpoint = start_helper(app, control.clone(), desktop.clone(), glow, Some(preparation))
             .map_err(|error| eprintln!("gentle-dot: computer control is unavailable: {error}"))
             .ok();
         watch_timeout(control.clone());
+        // Without the overlay, `marks` is dropped: no rings can show, so every call that
+        // captures or acts fails before doing anything (S5).
         match build_overlay(app, &number) {
-            Ok(window) => run_overlay(app.clone(), window, number, control.clone(), marks),
+            Ok(window) => run_overlay(app.clone(), window, number, control.clone(), working.clone(), marks),
             Err(error) => eprintln!("gentle-dot: the computer-control glow is unavailable: {error}"),
         }
-        Computer { control, endpoint, desktop }
+        Computer { control, endpoint, desktop, working }
     }
     #[cfg(windows)]
     {
@@ -103,7 +182,8 @@ pub fn start(app: &AppHandle) -> Computer {
         let glow = move |mark| {
             let _ = overlay.send(Overlay::Mark(mark));
         };
-        let endpoint = start_helper(app, control.clone(), desktop.clone(), glow)
+        // No working rings on Windows yet: calls are not prepared (the helper's default).
+        let endpoint = start_helper(app, control.clone(), desktop.clone(), glow, None)
             .map_err(|error| eprintln!("gentle-dot: computer control is unavailable: {error}"))
             .ok();
         watch_timeout(control.clone());
@@ -126,6 +206,7 @@ fn start_helper(
     control: Arc<Control>,
     desktop: Arc<dyn super::Desktop>,
     glow: impl Fn(super::glow::Mark) + Send + Sync + 'static,
+    working: Option<Arc<dyn super::working::Preparation>>,
 ) -> std::io::Result<Endpoint> {
     let token = super::server::new_token();
     let helper = super::mcp::Helper::new(
@@ -137,6 +218,10 @@ fn start_helper(
         std::process::id() as i32,
     )
     .with_glow(glow);
+    let helper = match working {
+        Some(working) => helper.with_working(working),
+        None => helper,
+    };
     super::server::start(Arc::new(helper), token)
 }
 
@@ -176,40 +261,103 @@ fn build_overlay(
     Ok((window, NsWindow(ns_window as usize)))
 }
 
-/// Orders the overlay in or out on the main thread and records its window number.
+/// Orders the overlay in or out on the main thread and records its window number. The receiver
+/// hears once that happened.
 #[cfg(target_os = "macos")]
-fn order_overlay(app: &AppHandle, ns_window: NsWindow, number: &Arc<std::sync::atomic::AtomicU32>, visible: bool) {
+fn order_overlay(
+    app: &AppHandle,
+    ns_window: NsWindow,
+    number: &Arc<std::sync::atomic::AtomicU32>,
+    visible: bool,
+) -> Result<std::sync::mpsc::Receiver<()>, String> {
     let number = number.clone();
-    let ordered = app.run_on_main_thread(move || {
+    let (done, ordered) = std::sync::mpsc::channel();
+    let queued = app.run_on_main_thread(move || {
         // SAFETY: on the main thread, with the overlay's live NSWindow.
         let n = unsafe { super::macos::order_overlay(ns_window.0 as *mut std::ffi::c_void, visible) };
         if n != 0 {
             number.store(n, std::sync::atomic::Ordering::SeqCst);
         }
+        let _ = done.send(());
     });
-    if let Err(error) = ordered {
+    queued.map(|()| ordered).map_err(|error| {
         eprintln!("gentle-dot: cannot show or hide the glow: {error}");
+        error.to_string()
+    })
+}
+
+/// Moves the overlay over `display` unless it already covers it.
+#[cfg(target_os = "macos")]
+fn cover(window: &tauri::WebviewWindow, covering: &mut Option<super::glow::Frame>, display: super::glow::Frame) {
+    use tauri::{LogicalPosition, LogicalSize};
+    if *covering != Some(display) {
+        let _ = window.set_position(LogicalPosition::new(display.x, display.y));
+        let _ = window.set_size(LogicalSize::new(display.width, display.height));
+        *covering = Some(display);
     }
 }
 
-/// The overlay's own thread: follows the session and draws each mark while it lasts.
+#[cfg(target_os = "macos")]
+fn emit_working(app: &AppHandle, operation: u64, active: bool) -> Result<(), String> {
+    let event = WorkingEvent { active, operation_id: operation };
+    app.emit_to(GLOW_WINDOW, WORKING_EVENT, event).map_err(|error| error.to_string())
+}
+
+/// The overlay's own thread: follows the session, draws each mark while it lasts, and shows the
+/// working rings of the call under way (`drawing`).
 #[cfg(target_os = "macos")]
 fn run_overlay(
     app: AppHandle,
     (window, ns_window): (tauri::WebviewWindow, NsWindow),
     number: Arc<std::sync::atomic::AtomicU32>,
     control: Arc<Control>,
+    working: Arc<Working>,
     marks: std::sync::mpsc::Receiver<Overlay>,
 ) {
-    use tauri::{LogicalPosition, LogicalSize};
     let spawned = std::thread::Builder::new().name("computer-glow".into()).spawn(move || {
-        let (mut shown, mut covering) = (false, None);
+        let (mut shown, mut covering, mut drawing) = (false, None, None);
         for message in marks {
             match message {
                 Overlay::Session(active) => {
                     if active != shown {
-                        order_overlay(&app, ns_window, &number, active);
+                        let _ = order_overlay(&app, ns_window, &number, active);
                         shown = active;
+                    }
+                    if let Some(operation) = drawing.take().filter(|_| !active) {
+                        let _ = emit_working(&app, operation, false);
+                    }
+                }
+                Overlay::Working { operation, reply } => {
+                    // A start that arrives after its call or the session ended draws nothing.
+                    let outcome = if !control.is_active(SystemClock.now_ms()) || !working.is_current(operation) {
+                        Err("the call already ended".to_string())
+                    } else {
+                        let at = super::macos::pointer_location();
+                        match super::macos::display_frame_at(at) {
+                            None => Err("no display under the pointer".to_string()),
+                            Some(display) => {
+                                cover(&window, &mut covering, display);
+                                let ordered = order_overlay(&app, ns_window, &number, true);
+                                shown = true;
+                                // The rings are drawn only once the overlay is in front.
+                                ordered
+                                    .and_then(|done| {
+                                        done.recv_timeout(OVERLAY_TIMEOUT)
+                                            .map_err(|_| "the glow did not show in time".to_string())
+                                    })
+                                    .and_then(|()| {
+                                        drawing = Some(operation);
+                                        emit_working(&app, operation, true)
+                                    })
+                            }
+                        }
+                    };
+                    let _ = reply.send(outcome);
+                }
+                Overlay::WorkingEnd(operation) => {
+                    if drawing == Some(operation) {
+                        drawing = None;
+                        let _ = emit_working(&app, operation, false);
                     }
                 }
                 Overlay::Mark(mark) => {
@@ -220,13 +368,9 @@ fn run_overlay(
                     let placed =
                         super::glow::place(mark, super::macos::display_frame_at, super::macos::focused_frame);
                     let Some((display, event)) = placed else { continue };
-                    if covering != Some(display) {
-                        let _ = window.set_position(LogicalPosition::new(display.x, display.y));
-                        let _ = window.set_size(LogicalSize::new(display.width, display.height));
-                        covering = Some(display);
-                    }
+                    cover(&window, &mut covering, display);
                     if !shown {
-                        order_overlay(&app, ns_window, &number, true);
+                        let _ = order_overlay(&app, ns_window, &number, true);
                         shown = true;
                     }
                     if let Err(error) = app.emit_to(GLOW_WINDOW, GLOW_EVENT, event) {
@@ -287,6 +431,11 @@ fn run_glow(app: AppHandle, window: tauri::WebviewWindow, control: Arc<Control>,
                         shown = active;
                     }
                 }
+                // No working rings on Windows yet (the helper prepares no call): a start is refused.
+                Overlay::Working { reply, .. } => {
+                    let _ = reply.send(Err("The working rings are only available on macOS.".into()));
+                }
+                Overlay::WorkingEnd(_) => {}
                 Overlay::Mark(mark) => {
                     // A mark that arrives after Stop or panic is dropped.
                     if !control.is_active(SystemClock.now_ms()) {
@@ -390,6 +539,23 @@ pub fn computer_request_permission(kind: PermissionKind) -> Result<(), String> {
 #[tauri::command]
 pub fn computer_stop(app: AppHandle) {
     stop(&app, Reason::Stopped);
+}
+
+/// The overlay drew the working rings for `operation_id` (S5): true when that is the call under
+/// way, false when it already ended. Any window but the overlay is refused.
+#[tauri::command]
+pub fn computer_working_ready(
+    window: tauri::WebviewWindow,
+    computer: State<'_, Computer>,
+    operation_id: u64,
+) -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    return computer.working.acknowledge(window.label(), operation_id);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (window, computer, operation_id);
+        Err("The working rings are only available on macOS.".into())
+    }
 }
 
 /// Turns yolo mode on after the native confirmation, or off. Blocks on the dialog, so it runs

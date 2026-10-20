@@ -1,5 +1,12 @@
 import { type CSSProperties, useEffect, useRef, useState } from "react";
-import { type ComputerGlow, onComputerGlow, onComputerState } from "../computer.ts";
+import {
+	type ComputerGlow,
+	type ComputerWorking,
+	computerWorkingReady,
+	onComputerGlow,
+	onComputerState,
+	onComputerWorking,
+} from "../computer.ts";
 
 /** The glow stays lit this long after the last action, then fades for `FADE_MS` (about 1.5 s in all). */
 const HOLD_MS = 1200;
@@ -54,14 +61,24 @@ function Mark({ glow, still }: { glow: ComputerGlow; still: boolean }) {
  * drag, short markers for moves and scrolls, and an outline around the focused element for keys.
  * It shows only while the agent acts, fades out about 1.5 s after the last action, and clears at
  * once when the session ends. With reduced motion the glow is static: no pulse and no trail.
+ *
+ * While the Dot steps aside for an operation, the top edge of the display glows in the rose's neon
+ * and a light travels along it, apart from the fading marks. Once it is painted the overlay tells
+ * the app, which waits for that before it captures or acts. With reduced motion the edge stays lit
+ * and the traveling light is left out.
  */
 export function GlowSurface() {
 	const [marks, setMarks] = useState<Lit[]>([]);
 	const [fading, setFading] = useState(false);
 	const [still] = useState(prefersReducedMotion);
+	const [operation, setOperation] = useState<number>();
 	const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
 	const ended = useRef(false);
 	const next = useRef(0);
+	/** The operation the rings show, kept in step with events before React renders them. */
+	const current = useRef<number | undefined>(undefined);
+	/** The newest operation id seen, started or ended; nothing older shows again. */
+	const latest = useRef(-1);
 
 	useEffect(() => {
 		document.documentElement.dataset.surface = "glow";
@@ -70,10 +87,15 @@ export function GlowSurface() {
 			for (const timer of timers.current) clearTimeout(timer);
 			timers.current = [];
 		};
+		const rest = () => {
+			current.current = undefined;
+			setOperation(undefined);
+		};
 		const clear = () => {
 			stopTimers();
 			setFading(false);
 			setMarks([]);
+			rest();
 		};
 		const show = (glow: ComputerGlow) => {
 			// A mark that arrives after Stop, panic, or the timeout stays dark.
@@ -88,8 +110,23 @@ export function GlowSurface() {
 				setTimeout(() => setMarks([]), HOLD_MS + FADE_MS),
 			];
 		};
+		const work = ({ active, operationId }: ComputerWorking) => {
+			if (!live) return;
+			if (active) {
+				// A start that is late (its end or a newer operation came first) or that arrives after
+				// Stop, panic, or the timeout stays dark.
+				if (ended.current || operationId <= latest.current) return;
+				latest.current = operationId;
+				current.current = operationId;
+				setOperation(operationId);
+			} else if (operationId >= latest.current) {
+				latest.current = operationId;
+				rest();
+			}
+		};
 		const subscriptions = [
 			onComputerGlow(show),
+			onComputerWorking(work),
 			onComputerState((state) => {
 				ended.current = state.session === undefined;
 				if (live && ended.current) clear();
@@ -97,17 +134,36 @@ export function GlowSurface() {
 		];
 		return () => {
 			live = false;
+			current.current = undefined;
 			stopTimers();
 			for (const s of subscriptions) void s.then((unlisten) => unlisten());
 		};
 	}, []);
 
+	// The rings are committed by now; the second frame runs once the first one has painted them.
+	useEffect(() => {
+		if (operation === undefined) return;
+		let frame = window.requestAnimationFrame(() => {
+			frame = window.requestAnimationFrame(() => {
+				if (current.current === operation) void computerWorkingReady(operation).catch(() => {});
+			});
+		});
+		return () => window.cancelAnimationFrame(frame);
+	}, [operation]);
+
 	const className = `glow-layer${fading ? " glow-fading" : ""}${still ? " glow-static" : ""}`;
 	return (
-		<div className={className} aria-hidden="true">
-			{marks.map(({ id, glow }) => (
-				<Mark key={id} glow={glow} still={still} />
-			))}
-		</div>
+		<>
+			<div className={className} aria-hidden="true">
+				{marks.map(({ id, glow }) => (
+					<Mark key={id} glow={glow} still={still} />
+				))}
+			</div>
+			{operation !== undefined && (
+				<div className={`glow-working${still ? " glow-static" : ""}`} aria-hidden="true">
+					<span className="glow-working-light" />
+				</div>
+			)}
+		</>
 	);
 }

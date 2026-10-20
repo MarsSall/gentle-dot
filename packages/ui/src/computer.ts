@@ -86,7 +86,7 @@ export async function computerStatus(): Promise<ComputerState> {
 	return stateOf(await invoke<ComputerStateEvent>("computer_status"));
 }
 
-/** The event API, imported once: the glow overlay subscribes to two events at the same time. */
+/** The event API, imported once: the glow overlay subscribes to three events at the same time. */
 let eventApi: Promise<typeof import("@tauri-apps/api/event")> | undefined;
 function events() {
 	eventApi ??= import("@tauri-apps/api/event");
@@ -116,6 +116,38 @@ export async function onComputerGlow(handler: (glow: ComputerGlow) => void) {
 		const glow = glowOf(event.payload);
 		if (glow) handler(glow);
 	});
+}
+
+/**
+ * The agent is busy on one operation (a screenshot or an action, or a batch of them) while the Dot
+ * steps aside. Operation ids only grow; the end of an operation carries the same id as its start.
+ */
+export interface ComputerWorking {
+	active: boolean;
+	operationId: number;
+}
+
+/** The overlay window's `computer://working` events; anything malformed is dropped. */
+export async function onComputerWorking(handler: (working: ComputerWorking) => void) {
+	if (!isTauri()) return () => {};
+	const { listen } = await events();
+	return listen<unknown>("computer://working", (event) => {
+		const working = workingOf(event.payload);
+		if (working) handler(working);
+	});
+}
+
+/** Tells the app the working rings for this operation are on screen, so it may go on. */
+export function computerWorkingReady(operationId: number): Promise<unknown> {
+	if (!isTauri()) return Promise.resolve();
+	return invoke("computer_working_ready", { operationId });
+}
+
+function workingOf(payload: unknown): ComputerWorking | undefined {
+	if (typeof payload !== "object" || payload === null) return undefined;
+	const { active, operationId } = payload as Record<string, unknown>;
+	if (typeof active !== "boolean" || typeof operationId !== "number") return undefined;
+	return Number.isSafeInteger(operationId) && operationId >= 0 ? { active, operationId } : undefined;
 }
 
 function glowOf(payload: unknown): ComputerGlow | undefined {

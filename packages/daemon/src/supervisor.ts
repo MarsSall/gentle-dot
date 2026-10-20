@@ -1,9 +1,11 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { agentSpawnEnv } from "./config.ts";
 import { encodeRecord, JsonlDecoder } from "./jsonl.ts";
+import { writePrivateFile } from "./private-file.ts";
 import { terminateProcessTree, WINDOWS_TASKKILL_TIMEOUT_MS } from "./process-tree.ts";
+import type { OsUser } from "./vps.ts";
 
 /** A record the agent wrote to stdout that is not a command response. */
 export type AgentRecord = { type: string; [key: string]: unknown };
@@ -35,6 +37,8 @@ export interface SupervisorOptions {
 	/** Directory for `sessions/` and `state.json` (the open session and the chains of rotated ones). */
 	dataDir: string;
 	env?: NodeJS.ProcessEnv;
+	/** The user the agent runs as (server mode, S25.8); by default the daemon's own. */
+	user?: OsUser;
 	/** Runs before every spawn (first start, restart, respawn); returns variables added to `env`. */
 	prepareSpawn?: () => NodeJS.ProcessEnv;
 	/** Respawn delays; the last value repeats. Default 1s, 2s, 4s, 8s, 16s, 30s. */
@@ -280,13 +284,14 @@ export class AgentSupervisor {
 	}
 
 	private spawnChild(): ChildProcess {
-		const { command, args = [], extraArgs = [], cwd, env, prepareSpawn } = this.options;
+		const { command, args = [], extraArgs = [], cwd, env, prepareSpawn, user } = this.options;
 		const child = spawn(command, [...args, "--mode", "rpc", "--session-dir", this.sessionDir, ...extraArgs], {
 			cwd,
 			env: agentSpawnEnv(
 				command, args, { ...(env ?? process.env), ...prepareSpawn?.() }, this.options.platform,
 			),
 			stdio: ["pipe", "pipe", "pipe"],
+			...(user ? { uid: user.uid, gid: user.gid } : {}),
 		});
 		this.child = child;
 		const decoder = new JsonlDecoder(
@@ -421,9 +426,7 @@ export class AgentSupervisor {
 
 	private persistSession(sessionFile: string): void {
 		mkdirSync(this.options.dataDir, { recursive: true });
-		const temp = `${this.stateFile}.${process.pid}.tmp`;
-		writeFileSync(temp, `${JSON.stringify({ sessionFile, chains: this.chains })}\n`, { mode: 0o600 });
-		renameSync(temp, this.stateFile);
+		writePrivateFile(this.stateFile, `${JSON.stringify({ sessionFile, chains: this.chains })}\n`);
 	}
 
 	private setState(state: SupervisorState): void {

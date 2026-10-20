@@ -204,7 +204,8 @@ fn text(chunk: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn pointer_location() -> Point {
+/// Where the pointer is, in global points: its display is the one computer control captures.
+pub fn pointer_location() -> Point {
     let event = CGEvent::new(None);
     let at = CGEvent::location(event.as_deref());
     Point { x: at.x, y: at.y }
@@ -368,6 +369,19 @@ pub unsafe fn prepare_overlay(ns_window: *mut c_void) -> u32 {
 /// # Safety
 /// `ns_window` must be a live NSWindow.
 pub unsafe fn order_overlay(ns_window: *mut c_void, visible: bool) -> u32 {
+    unsafe {
+        order_window(ns_window, visible);
+        overlay_number(&*ns_window.cast::<AnyObject>())
+    }
+}
+
+/// Orders one of the app's windows in without making it key or activating the app, or orders
+/// it out: the overlay, and the Dot and panel once a computer-control call ends (S5).
+/// Main thread only.
+///
+/// # Safety
+/// `ns_window` must be a live NSWindow.
+pub unsafe fn order_window(ns_window: *mut c_void, visible: bool) {
     let window = unsafe { &*ns_window.cast::<AnyObject>() };
     unsafe {
         if visible {
@@ -375,7 +389,6 @@ pub unsafe fn order_overlay(ns_window: *mut c_void, visible: bool) -> u32 {
         } else {
             let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
         }
-        overlay_number(window)
     }
 }
 

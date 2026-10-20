@@ -338,6 +338,8 @@ pub struct Helper {
     limiter: Mutex<RateLimiter>,
     /// Serializes actions and holds the geometry of the latest screenshot.
     actions: Mutex<Option<ScreenshotGeometry>>,
+    /// The app in front when the latest screenshot was taken: keys and text go only to it.
+    seen_front: Mutex<Option<i32>>,
     /// Where an action that went through acted (S28); must return at once.
     glow: Box<dyn Fn(Mark) + Send + Sync>,
 }
@@ -360,6 +362,7 @@ impl Helper {
             own_pid,
             limiter: Mutex::new(RateLimiter::new(MAX_ACTIONS_PER_SECOND, 1000)),
             actions: Mutex::new(None),
+            seen_front: Mutex::new(None),
             glow: Box::new(|_| {}),
         }
     }
@@ -451,6 +454,7 @@ impl Helper {
         if !self.control.is_active(self.clock.now_ms()) {
             // The screenshot of an ended session no longer describes the screen.
             *latest = None;
+            *lock(&self.seen_front) = None;
             if !self.with_dialog(|| self.dialogs.ask_grant()) {
                 return Err(NOT_ALLOWED.into());
             }
@@ -528,6 +532,13 @@ impl Helper {
     fn keyboard_target(&self) -> Result<String, String> {
         let front = self.desktop.frontmost_app().ok_or("Cannot tell which app is in front.")?;
         self.refuse_blocked(&front)?;
+        // The user may have switched apps since the agent last looked: it looks again first.
+        if *lock(&self.seen_front) != Some(front.pid) {
+            return Err(format!(
+                "{} is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first.",
+                front.name
+            ));
+        }
         match self.desktop.focused_app().filter(|focused| focused.pid != front.pid) {
             Some(focused) => self.refuse_blocked(&focused).map(|()| focused.name),
             None => Ok(front.name),
@@ -574,7 +585,9 @@ impl Helper {
         let capture = self.desktop.capture()?;
         let geometry = capture.geometry;
         *latest = Some(geometry);
-        let front = self.desktop.frontmost_app().map(|app| app.name);
+        let front = self.desktop.frontmost_app();
+        *lock(&self.seen_front) = front.as_ref().map(|app| app.pid);
+        let front = front.map(|app| app.name);
         let meta = json!({
             "imageWidth": geometry.image_width,
             "imageHeight": geometry.image_height,
@@ -1470,6 +1483,29 @@ mod tests {
         }));
         rig.call("click", json!({"x": 10, "y": 10}));
         assert_eq!(*rig.desktop.activated.lock().unwrap(), vec![200]);
+    }
+
+    // --- The front app changed since the last screenshot ---
+
+    #[test]
+    fn keys_and_text_wait_for_a_screenshot_once_the_front_app_changed() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.frontmost.lock().unwrap() = Some(app(300, "com.example.terminal", "Terminal"));
+        for (tool, args) in [("key", json!({"combo": "alt+f4"})), ("type", json!({"text": "hola"}))] {
+            let result = rig.call(tool, args);
+            assert!(is_error(&result), "{result}");
+            assert_eq!(
+                first_text(&result),
+                "Terminal is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first."
+            );
+        }
+        assert!(rig.desktop.events().is_empty());
+        // A new screenshot shows the change: keys go through again.
+        rig.ready();
+        let result = rig.call("key", json!({"combo": "alt+f4"}));
+        assert!(!is_error(&result), "{result}");
+        assert_eq!(rig.desktop.events().len(), 1);
     }
 
     // --- Typing ---

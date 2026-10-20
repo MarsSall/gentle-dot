@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { onWindows } from "../computer.ts";
 import {
 	formatShortcut,
 	isMac,
@@ -149,26 +150,29 @@ export function SettingsPanel({ close }: { close: () => void }) {
 				</button>
 			</section>
 
-			<section className="provider-section" aria-labelledby="settings-voice-language">
-				<h3 id="settings-voice-language">Voice language</h3>
-				<p className="muted">
-					The language macOS speech listens in. The local voice model detects it by itself.
-				</p>
-				<select
-					aria-label="Voice language"
-					value={language}
-					onChange={(event) => {
-						setLanguage(event.target.value);
-						setVoiceLanguage(event.target.value);
-					}}
-				>
-					{VOICE_LANGUAGES.map(([locale, label]) => (
-						<option key={locale || "auto"} value={locale}>
-							{label}
-						</option>
-					))}
-				</select>
-			</section>
+			{/* Only Apple's recognizer listens in a chosen language; the local model detects it. */}
+			{onWindows() ? null : (
+				<section className="provider-section" aria-labelledby="settings-voice-language">
+					<h3 id="settings-voice-language">Voice language</h3>
+					<p className="muted">
+						The language macOS speech listens in. The local voice model detects it by itself.
+					</p>
+					<select
+						aria-label="Voice language"
+						value={language}
+						onChange={(event) => {
+							setLanguage(event.target.value);
+							setVoiceLanguage(event.target.value);
+						}}
+					>
+						{VOICE_LANGUAGES.map(([locale, label]) => (
+							<option key={locale || "auto"} value={locale}>
+								{label}
+							</option>
+						))}
+					</select>
+				</section>
+			)}
 		</section>
 	);
 }

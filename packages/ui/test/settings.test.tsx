@@ -178,6 +178,15 @@ describe("the Settings screen (S33.1)", () => {
 });
 
 describe("voice language (S30.6)", () => {
+	it("is not offered on Windows, whose local model detects the language itself", async () => {
+		vi.spyOn(navigator, "userAgent", "get").mockReturnValue(
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
+		);
+		await openSettings();
+		expect(screen.queryByRole("combobox", { name: "Voice language" })).toBeNull();
+		expect(screen.queryByText(/macOS speech/)).toBeNull();
+	});
+
 	it("defaults to the system language and remembers the one chosen for macOS speech", async () => {
 		await openSettings();
 		const picker = screen.getByRole("combobox", { name: "Voice language" });

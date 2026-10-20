@@ -118,6 +118,19 @@ describe("DotSurface", () => {
 		if (state !== "needs_you") expect(screen.queryByText("!")).toBeNull();
 	});
 
+	it("names the computer it controls: the Mac, or the PC on Windows", () => {
+		const props = { agentState: "working" as const, connected: true, toggle: vi.fn(), startDrag: vi.fn() };
+		const { unmount } = render(<DotSurface {...props} inControl />);
+		expect(screen.getByRole("button")).toHaveAccessibleName("Gentle Dot: controlling your Mac");
+		unmount();
+		const agent = vi
+			.spyOn(navigator, "userAgent", "get")
+			.mockReturnValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)");
+		render(<DotSurface {...props} inControl yolo />);
+		expect(screen.getByRole("button")).toHaveAccessibleName("Gentle Dot: controlling your PC, yolo mode on");
+		agent.mockRestore();
+	});
+
 	it("shows a restarting rose while disconnected", () => {
 		const { dot } = setup("working", false);
 		expect(dot).toHaveAccessibleName("Gentle Dot: restarting");

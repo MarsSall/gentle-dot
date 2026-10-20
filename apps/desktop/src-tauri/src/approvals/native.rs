@@ -19,7 +19,7 @@ impl NativePrompt {
 
 impl Prompt for NativePrompt {
     fn ask(&self, dialog: &ApprovalDialog) -> bool {
-        crate::alert::ask_tracked(&self.app, &dialog.title, &dialog.message, APPROVAL_CHOICE, Some(&self.open))
+        crate::alert::ask_tracked(&self.app, &dialog.title, &dialog.message, APPROVAL_CHOICE, Some(&self.open), dialog.deadline)
     }
 
     /// macOS: aborts the modal alert on screen. `-[NSApplication abortModal]` is the one modal
@@ -27,7 +27,8 @@ impl Prompt for NativePrompt {
     /// `alert` reads as Decline. The approvals gate
     /// guarantees no other approval dialog is up, but a computer-control dialog stacked on top
     /// would be aborted instead, which also refuses (fail closed). Windows: presses the approval
-    /// dialog's own refusing button. Elsewhere the stale dialog stays until the user answers, and
+    /// dialog's own refusing button; a dialog not yet up then refuses itself at its deadline
+    /// (`ApprovalDialog::deadline`). Elsewhere the stale dialog stays until the user answers, and
     /// that answer is ignored.
     fn dismiss(&self) {
         self.open.refuse();

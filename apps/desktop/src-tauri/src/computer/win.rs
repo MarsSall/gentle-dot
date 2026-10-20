@@ -57,7 +57,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DrawIconEx, EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetCursorInfo,
     GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetIconInfo, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
     GetWindowTextLengthW, GetWindowTextW, GetWindowDisplayAffinity, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
-    ShowWindow, WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GW_OWNER,
+    ShowWindow, WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GA_ROOTOWNER, GUITHREADINFO, GWL_EXSTYLE, GW_OWNER,
     ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SW_RESTORE, SW_SHOWNORMAL, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     SetWindowLongPtrW, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
@@ -614,12 +614,12 @@ pub fn list_apps() -> Vec<AppInfo> {
 
 /// Brings a window to the front. Windows lets only the foreground's input thread do that, so the
 /// helper joins it for the call when asking alone is refused.
-/// Brings a window to the front and reports whether it got there (within a moment). Windows
-/// lets only the process that received the last input take the foreground, so while the user
-/// works in another app it is refused: an input that changes nothing (a mouse move by zero)
-/// is sent first, which gives this process that right.
-fn bring_to_front(hwnd: HWND) -> bool {
-    let nudge = INPUT {
+/// Brings a window to the front. Windows lets only the process that received the last input
+/// take the foreground: after a click on Gentle Dot's own dialog it may; for `open_app`, while
+/// the user works in another app, `nudge` first sends an input that changes nothing (a mouse
+/// move by zero), which gives it that right.
+fn bring_to_front(hwnd: HWND, nudge: bool) {
+    let zero_move = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
             mi: MOUSEINPUT { dx: 0, dy: 0, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: 0 },
@@ -631,7 +631,9 @@ fn bring_to_front(hwnd: HWND) -> bool {
         if IsIconic(hwnd) != 0 {
             ShowWindow(hwnd, SW_RESTORE);
         }
-        SendInput(1, &nudge, size_of::<INPUT>() as i32);
+        if nudge {
+            SendInput(1, &zero_move, size_of::<INPUT>() as i32);
+        }
         if SetForegroundWindow(hwnd) == 0 {
             let foreground = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
             let own = GetCurrentThreadId();
@@ -642,14 +644,20 @@ fn bring_to_front(hwnd: HWND) -> bool {
                 AttachThreadInput(own, foreground, 0);
             }
         }
-        for _ in 0..10 {
-            if GetAncestor(GetForegroundWindow(), GA_ROOT) == hwnd {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        GetAncestor(GetForegroundWindow(), GA_ROOT) == hwnd
     }
+}
+
+/// Whether `hwnd`, or a window it owns (its own dialog), is in front within half a second.
+fn comes_to_front(hwnd: HWND) -> bool {
+    // SAFETY: plain queries.
+    let in_front = || unsafe { GetAncestor(GetForegroundWindow(), GA_ROOTOWNER) } == hwnd;
+    for _ in 0..10 {
+        if in_front() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    in_front()
 }
 
 /// The frontmost app window of `pid`.
@@ -659,9 +667,10 @@ fn app_window_of(pid: i32) -> Option<HWND> {
 
 /// Brings an app back to the front (after a dialog took the focus).
 pub fn activate(pid: i32) {
-    // The helper checks the front app itself afterwards.
+    // No input is sent (the user's click on the dialog allows it), and the helper checks the
+    // front app itself afterwards.
     if let Some(hwnd) = app_window_of(pid) {
-        let _ = bring_to_front(hwnd);
+        bring_to_front(hwnd, false);
     }
 }
 
@@ -789,7 +798,9 @@ pub fn open_app(name: &str) -> Result<(), String> {
                 if let Some(label) = blocked_reason(&id, own) {
                     return Err(off_limits(label));
                 }
-                return if bring_to_front(hwnd) {
+                // Only inside a session: the helper checked it just before.
+                bring_to_front(hwnd, true);
+                return if comes_to_front(hwnd) {
                     Ok(())
                 } else {
                     Err(format!("{} is open, but Windows kept another app in front, so it is not in front.", id.name))
@@ -1239,7 +1250,7 @@ mod tests {
     }
 
     /// Opens Notepad, then asks for it again: the open window comes to the front, no second one
-    /// opens. Closes only the windows it opened.
+    /// opens. Needs no Notepad open before; closes the windows it opened (an unsaved one asks).
     #[test]
     #[ignore = "interactive Windows desktop: run in the user's own session"]
     fn opening_a_running_app_brings_its_window_to_the_front() {
@@ -1254,6 +1265,9 @@ mod tests {
                 .collect()
         };
         let before = notepads();
+        // It closes the windows it opens: with another Notepad open, which ones are its own is
+        // unknown, so it does not run.
+        assert!(before.is_empty(), "close every Notepad window first");
         let close_new = |now: &[usize]| {
             for hwnd in now.iter().filter(|hwnd| !before.contains(hwnd)) {
                 // SAFETY: a plain message to a window this test opened.

@@ -1863,7 +1863,8 @@ child.stdout.once('data', bytes => {{
 setTimeout(()=>process.exit(74),30000);
 "#, if root_exits { "process.exit(0);" } else { "" });
             let (mut child, parent, root) = owned_fixture(&script);
-            let deadline = Instant::now() + Duration::from_secs(5);
+            // Two Node starts on a cold CI runner can take more than 5 s; this only bounds the wait.
+            let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 let ready = std::fs::read_to_string(root.join("daemon.log")).unwrap().lines().any(|l| l == "READY");
                 if ready && (!root_exits || child.status().unwrap().is_some()) { break; }

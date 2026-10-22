@@ -641,7 +641,8 @@ mod tests {
         fn until_done(&self) -> Vec<ModelEvent> {
             let mut seen = Vec::new();
             loop {
-                let event = self.events.recv_timeout(Duration::from_secs(10)).expect("a model event");
+                // Unpacking the test archive can take seconds on a busy Windows machine; this only bounds the wait.
+                let event = self.events.recv_timeout(Duration::from_secs(60)).expect("a model event");
                 let done = matches!(event.state, ModelState::Installed | ModelState::Failed | ModelState::Removed);
                 seen.push(event);
                 if done {

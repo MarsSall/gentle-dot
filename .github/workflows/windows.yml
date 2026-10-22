@@ -50,6 +50,11 @@ jobs:
     name: TypeScript (daemon, protocol, UI)
     runs-on: windows-latest
     steps:
+      # Git on the runner checks text out with CRLF line endings, which biome reports as
+      # formatting errors in every file; the sources are LF.
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v7
 
       # No `version`: package.json declares the pnpm version.

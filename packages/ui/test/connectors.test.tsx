@@ -115,9 +115,16 @@ describe("ConnectorsPanel", () => {
 	}
 
 	it("shows package preparation as setup, not successful connection or sign-in", () => {
-		let state = apply(ready, { type: "connectors", connectors: [connector({ id: "discord", name: "Discord" })] });
+		let state = apply(ready, {
+			type: "connectors",
+			connectors: [connector({ id: "discord", name: "Discord" })],
+		});
 		state = reduce(state, { type: "connector_started", connectorId: "discord" });
-		state = apply(state, { type: "auth_event", flowId: "connector-setup-prepare", event: { kind: "progress", message: "Preparing Discord…" } });
+		state = apply(state, {
+			type: "auth_event",
+			flowId: "connector-setup-prepare",
+			event: { kind: "progress", message: "Preparing Discord…" },
+		});
 		panel(state);
 		expect(screen.getByText("Setting up Discord")).toBeInTheDocument();
 		expect(screen.getByText("Preparing Discord…")).toBeInTheDocument();

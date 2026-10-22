@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import type { Duplex } from "node:stream";
+import { fileURLToPath } from "node:url";
 import { inheritedAppSocket } from "./app-channel.ts";
 import { serveAuthHelper } from "./auth-helper.ts";
 import { loadConfig } from "./config.ts";
@@ -12,8 +12,8 @@ import { resolveEngramBin, runtimeDir } from "./runtime.ts";
 import { SECRETS_KEY_VAR } from "./secret-file.ts";
 import { loadVpsOptions } from "./vps.ts";
 import { IDENTITY_SOURCE } from "./white-label.ts";
-import { finishWindowsShutdown, startWithWindowsAppChannel } from "./windows-stop.ts";
 import type { WindowsAppChannel } from "./windows-app-channel.ts";
+import { finishWindowsShutdown, startWithWindowsAppChannel } from "./windows-stop.ts";
 
 /** This file (or the bundled `cli.mjs`), which the sign-in helper runs again. */
 const ENTRY = fileURLToPath(import.meta.url);
@@ -50,34 +50,41 @@ async function main(): Promise<void> {
 	// from the process environment, so no child the daemon starts can inherit it.
 	const vps = loadVpsOptions(process.env, { uid: process.getuid?.() ?? -1 });
 	delete process.env[SECRETS_KEY_VAR];
-	const start = (channel: Duplex | undefined = appChannel) => startDaemon({
-		port: config.port,
-		host: config.host,
-		dataDir: config.dataDir,
-		workspace: config.workspace,
-		...(config.preferredFolder ? { preferredFolder: config.preferredFolder } : {}),
-		uiDir: config.uiDir,
-		agentCommand: config.agentCommand,
-		agentArgs: config.agentArgs,
-		...(config.agentHome ? { agentHome: config.agentHome } : {}),
-		allowedOrigins: config.allowedOrigins,
-		...(channel ? { appChannel: channel } : {}),
-		// Sign-in runs in this same entry point as the engine's user (`--auth-helper`, B1).
-		...(vps
-			? { vps: { ...vps, authHelper: { command: process.execPath, args: [ENTRY, "--auth-helper"] } } }
-			: {}),
-		log,
-	});
+	const start = (channel: Duplex | undefined = appChannel) =>
+		startDaemon({
+			port: config.port,
+			host: config.host,
+			dataDir: config.dataDir,
+			workspace: config.workspace,
+			...(config.preferredFolder ? { preferredFolder: config.preferredFolder } : {}),
+			uiDir: config.uiDir,
+			agentCommand: config.agentCommand,
+			agentArgs: config.agentArgs,
+			...(config.agentHome ? { agentHome: config.agentHome } : {}),
+			allowedOrigins: config.allowedOrigins,
+			...(channel ? { appChannel: channel } : {}),
+			// Sign-in runs in this same entry point as the engine's user (`--auth-helper`, B1).
+			...(vps
+				? { vps: { ...vps, authHelper: { command: process.execPath, args: [ENTRY, "--auth-helper"] } } }
+				: {}),
+			log,
+		});
 	// Windows requires the L98 private exact-launch record. No implicit unmanaged bypass.
 	// Construction precedes startDaemon and therefore all descendant startup.
-	const windows = process.platform === "win32"
-		? await startWithWindowsAppChannel<Awaited<ReturnType<typeof start>>, WindowsAppChannel>(join(config.dataDir, "daemon.pid"), start)
-		: undefined;
-	const daemon = windows?.daemon ?? await start();
+	const windows =
+		process.platform === "win32"
+			? await startWithWindowsAppChannel<Awaited<ReturnType<typeof start>>, WindowsAppChannel>(
+					join(config.dataDir, "daemon.pid"),
+					start,
+				)
+			: undefined;
+	const daemon = windows?.daemon ?? (await start());
 	process.stdout.write(`${startupMessage(daemon.url, config.dataDir, process.stdout.isTTY === true)}\n`);
 
 	if (windows) {
-		const shutdown = () => { void windows.close(); };
+		const shutdown = () => {
+			void windows.close();
+		};
 		process.on("SIGINT", shutdown);
 		process.on("SIGTERM", shutdown);
 		// Only successful daemon.close AND native drain may report success. Never use

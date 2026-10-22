@@ -60,58 +60,87 @@ interface AppTransport {
  * adoption, and BOTH precede start/privateMemory/descendants. The record only
  * admits the managed launch route; the adopted connection authenticates app IPC.
  * Injection replaces orchestration participants, never production startup facts. */
-export async function startWithWindowsAppChannel<T extends Stoppable, C extends AppTransport = WindowsAppChannel>(
+export async function startWithWindowsAppChannel<
+	T extends Stoppable,
+	C extends AppTransport = WindowsAppChannel,
+>(
 	recordPath: string,
 	start: (channel: C) => Promise<T>,
 	options: StopOptions & { createAppChannel?: () => C } = {},
 ): Promise<{ daemon: T; close(): Promise<void>; closed: Promise<void> }> {
-	const managed = await startWithWindowsStop(recordPath, async () => {
-		const channel = options.createAppChannel
-			? options.createAppChannel()
-			: new WindowsAppChannel({ exclusiveFd3Startup: true }) as unknown as C;
-		let daemon: T;
-		try { daemon = await start(channel); }
-		catch (error) {
-			try { await channel.close("abort"); }
-			catch { failedWindowsOwners.add(channel); }
-			throw error;
-		}
-		let stopping: Promise<void> | undefined;
-		const owner = {
-			daemon,
-			closed: daemon.closed,
-			close(): Promise<void> {
-				if (!stopping) stopping = Promise.resolve().then(async () => {
-					let failed = false;
-					let firstError: unknown;
-					try { await daemon.close(); }
-					catch (error) { failed = true; firstError = error; }
-					// Real daemon.close also drains its AppChannel. Idempotence keeps
-					// this independent fallback safe, including partial close failure.
-					try {
-						const result = await channel.close("drain");
-						if (result.mode !== "drain" || result.drained !== true)
-							throw new Error("Windows app channel was not drained.");
-					}
-					catch (error) { if (!failed) { failed = true; firstError = error; } }
-					if (failed) { failedWindowsOwners.add(owner); throw firstError; }
-				});
-				return stopping;
-			},
-		};
-		return owner;
-	}, options);
+	const managed = await startWithWindowsStop(
+		recordPath,
+		async () => {
+			const channel = options.createAppChannel
+				? options.createAppChannel()
+				: (new WindowsAppChannel({ exclusiveFd3Startup: true }) as unknown as C);
+			let daemon: T;
+			try {
+				daemon = await start(channel);
+			} catch (error) {
+				try {
+					await channel.close("abort");
+				} catch {
+					failedWindowsOwners.add(channel);
+				}
+				throw error;
+			}
+			let stopping: Promise<void> | undefined;
+			const owner = {
+				daemon,
+				closed: daemon.closed,
+				close(): Promise<void> {
+					if (!stopping)
+						stopping = Promise.resolve().then(async () => {
+							let failed = false;
+							let firstError: unknown;
+							try {
+								await daemon.close();
+							} catch (error) {
+								failed = true;
+								firstError = error;
+							}
+							// Real daemon.close also drains its AppChannel. Idempotence keeps
+							// this independent fallback safe, including partial close failure.
+							try {
+								const result = await channel.close("drain");
+								if (result.mode !== "drain" || result.drained !== true)
+									throw new Error("Windows app channel was not drained.");
+							} catch (error) {
+								if (!failed) {
+									failed = true;
+									firstError = error;
+								}
+							}
+							if (failed) {
+								failedWindowsOwners.add(owner);
+								throw firstError;
+							}
+						});
+					return stopping;
+				},
+			};
+			return owner;
+		},
+		options,
+	);
 	return { daemon: managed.daemon.daemon, close: managed.close, closed: managed.closed };
 }
 
 /** Source lives in src/, while the bundle lives directly in daemon/. */
 export function windowsStopArtifact(entry = new URL(import.meta.url)): URL {
-	return new URL(entry.pathname.endsWith(".ts") ? "../native/windows-stop.node" : "./native/windows-stop.node", entry);
+	return new URL(
+		entry.pathname.endsWith(".ts") ? "../native/windows-stop.node" : "./native/windows-stop.node",
+		entry,
+	);
 }
 
 /** The CLI's Windows exit arbiter observes the combined close/drain result, not daemon.closed. */
 export function windowsShutdownExitCode(owner: { closed: Promise<void> }): Promise<0 | 1> {
-	return owner.closed.then(() => 0, () => 1);
+	return owner.closed.then(
+		() => 0,
+		() => 1,
+	);
 }
 
 /** Failure sets status and retains ownership; it must not force process termination. */
@@ -120,7 +149,7 @@ export async function finishWindowsShutdown(
 	processLike: { exit(code: number): void; exitCode: NodeJS.Process["exitCode"] } = process,
 	log: (line: string) => void = () => {},
 ): Promise<void> {
-	if (await windowsShutdownExitCode(owner) === 0) {
+	if ((await windowsShutdownExitCode(owner)) === 0) {
 		processLike.exit(0);
 	} else {
 		failedWindowsOwners.add(owner);
@@ -146,13 +175,19 @@ export async function startWithWindowsStop<T extends Stoppable>(
 
 	let ready!: (daemon: T) => void;
 	let startupFailed!: (error: unknown) => void;
-	const startup = new Promise<T>((resolve, reject) => { ready = resolve; startupFailed = reject; });
+	const startup = new Promise<T>((resolve, reject) => {
+		ready = resolve;
+		startupFailed = reject;
+	});
 	let capability: Buffer | undefined;
 	let listener: StopListener | undefined;
 	let stopping: Promise<void> | undefined;
 	let stopped!: () => void;
 	let failed!: (error: unknown) => void;
-	const closed = new Promise<void>((resolve, reject) => { stopped = resolve; failed = reject; });
+	const closed = new Promise<void>((resolve, reject) => {
+		stopped = resolve;
+		failed = reject;
+	});
 	// Consumers attach after asynchronous startup; retain rejection without an unhandled window.
 	void closed.catch(() => {});
 	void startup.catch(() => {});
@@ -172,34 +207,45 @@ export async function startWithWindowsStop<T extends Stoppable>(
 	// frames (144 bytes), then fail initialization rather than silently drop a stop.
 	const preinitFrames: Buffer[] = [];
 	let preinitOverflow = false;
-	const handler: RequestHandler = { onRequest(frame) {
-		if (!Buffer.isBuffer(frame) || frame.length !== 36 ||
-			!frame.subarray(0, 4).equals(FRAME_VERSION)) return;
-		if (!capability) {
-			if (preinitFrames.length < 4) preinitFrames.push(Buffer.from(frame));
-			else preinitOverflow = true;
-			return;
-		}
-		if (timingSafeEqual(frame.subarray(4), capability)) void close();
-	} };
+	const handler: RequestHandler = {
+		onRequest(frame) {
+			if (!Buffer.isBuffer(frame) || frame.length !== 36 || !frame.subarray(0, 4).equals(FRAME_VERSION))
+				return;
+			if (!capability) {
+				if (preinitFrames.length < 4) preinitFrames.push(Buffer.from(frame));
+				else preinitOverflow = true;
+				return;
+			}
+			if (timingSafeEqual(frame.subarray(4), capability)) void close();
+		},
+	};
 	// Explicit returned ownership keeps the handler alive; native owns only a weak association.
 	const lifetimeOwner = { close, closed, [HANDLER_LIFETIME]: handler };
 	const reference = options.handlerReference?.(handler) ?? new WeakRef(handler);
 	const callback = weakRequestCallback(reference);
 	try {
-		const native = (options.loadNative ?? (() => createRequire(import.meta.url)(fileURLToPath(windowsStopArtifact()))))() as
-			{ createStopListener?: (path: string, callback: (frame: Buffer) => void) => StopListener };
+		const native = (
+			options.loadNative ?? (() => createRequire(import.meta.url)(fileURLToPath(windowsStopArtifact())))
+		)() as { createStopListener?: (path: string, callback: (frame: Buffer) => void) => StopListener };
 		if (typeof native?.createStopListener !== "function") throw new Error("invalid addon");
 		listener = native.createStopListener(recordPath, callback);
-		if (!listener || typeof listener.close !== "function" ||
-			!Buffer.isBuffer(listener.capability) || listener.capability.length !== 32 || preinitOverflow) {
+		if (
+			!listener ||
+			typeof listener.close !== "function" ||
+			!Buffer.isBuffer(listener.capability) ||
+			listener.capability.length !== 32 ||
+			preinitOverflow
+		) {
 			throw new Error("invalid listener");
 		}
 		capability = Buffer.from(listener.capability);
 	} catch {
 		if (typeof listener?.close === "function") {
-			try { await listener.close(); }
-			catch { failedWindowsOwners.add(lifetimeOwner); }
+			try {
+				await listener.close();
+			} catch {
+				failedWindowsOwners.add(lifetimeOwner);
+			}
 		}
 		throw new Error("Windows stop listener initialization failed");
 	}
@@ -215,10 +261,19 @@ export async function startWithWindowsStop<T extends Stoppable>(
 		failedWindowsOwners.add(lifetimeOwner);
 		try {
 			await listener.close();
-		} catch { /* Retained owner above; cleanup must not replace the startup failure. */ }
+		} catch {
+			/* Retained owner above; cleanup must not replace the startup failure. */
+		}
 		throw error;
 	}
 	ready(daemon);
-	void daemon.closed.then(() => { void close(); }, () => { void close(); });
+	void daemon.closed.then(
+		() => {
+			void close();
+		},
+		() => {
+			void close();
+		},
+	);
 	return { daemon, ...lifetimeOwner };
 }

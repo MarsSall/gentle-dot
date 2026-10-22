@@ -55,10 +55,15 @@ export function agentSpawnEnv(
 ): NodeJS.ProcessEnv {
 	const runtime = runtimeDir(env);
 	if (
-		platform !== "win32" || !runtime || command !== process.execPath ||
-		env.GENTLE_DOT_AGENT_BIN || env.GENTLE_DOT_AGENT_SCRIPT || env.GENTLE_DOT_AGENT_ARGS ||
+		platform !== "win32" ||
+		!runtime ||
+		command !== process.execPath ||
+		env.GENTLE_DOT_AGENT_BIN ||
+		env.GENTLE_DOT_AGENT_SCRIPT ||
+		env.GENTLE_DOT_AGENT_ARGS ||
 		args[0] !== join(runtimeModules(runtime), "gentle-pi", "bin", "gentle-shell.mjs")
-	) return env;
+	)
+		return env;
 	return {
 		...env,
 		// gentle-shell's first-run companion provisioning gate.

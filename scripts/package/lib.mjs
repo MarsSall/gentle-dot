@@ -1,6 +1,7 @@
 // Pure helpers for staging the installed app's runtime (`stage-runtime.mjs`).
-import { createHash } from "node:crypto";
+
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createReadStream, existsSync, lstatSync, readdirSync, readFileSync, renameSync } from "node:fs";
 import { dirname, join, posix, win32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -66,12 +67,30 @@ export function assertHostTarget(target, host = hostTarget()) {
 export function checkWindowsCodemodeCompatibility(daemon, node) {
 	const readJson = (file) => JSON.parse(readFileSync(file, "utf8"));
 	const wanted = readJson(join(daemon, "package.json"));
-	const childOptions = { cwd: daemon, env: {}, stdio: "pipe", encoding: "utf8", timeout: 10_000, maxBuffer: 1024 * 1024 };
+	const childOptions = {
+		cwd: daemon,
+		env: {},
+		stdio: "pipe",
+		encoding: "utf8",
+		timeout: 10_000,
+		maxBuffer: 1024 * 1024,
+	};
 	// Use Node's import conditions, not require.resolve: these packages are ESM-only.
-	const resolved = JSON.parse(execFileSync(node, ["--experimental-import-meta-resolve", "--input-type=module", "-e", `
+	const resolved = JSON.parse(
+		execFileSync(
+			node,
+			[
+				"--experimental-import-meta-resolve",
+				"--input-type=module",
+				"-e",
+				`
 const engine = import.meta.resolve('@earendil-works/pi-coding-agent');
 console.log(JSON.stringify({ engine, mcp: import.meta.resolve('@earendil-works/pi-mcp', engine), declarations: import.meta.resolve('@earendil-works/pi-codemode/declarations', engine) }));
-`], childOptions));
+`,
+			],
+			childOptions,
+		),
+	);
 	// Package exports hide package.json. Walk up from a resolved entry to its owner.
 	function owner(entry, name) {
 		for (let dir = dirname(entry); ; dir = dirname(dir)) {
@@ -126,11 +145,20 @@ export function nodeArchiveName(version, target) {
 export function engramArchiveName(version, target, listing = "") {
 	const base = `engram_${version}_${TARGETS[target].engram}`;
 	if (target !== "windows-x64") return `${base}.tar.gz`;
-	const candidates = ["zip", "tar.gz"].map((ext) => `${base}.${ext}`).filter((name) => {
-		try { checksumFor(listing, name); return true; } catch { return false; }
-	});
+	const candidates = ["zip", "tar.gz"]
+		.map((ext) => `${base}.${ext}`)
+		.filter((name) => {
+			try {
+				checksumFor(listing, name);
+				return true;
+			} catch {
+				return false;
+			}
+		});
 	if (candidates.length !== 1)
-		throw new Error("Windows Engram needs exactly one supported archive in the release checksum list (ZIP or tar.gz).");
+		throw new Error(
+			"Windows Engram needs exactly one supported archive in the release checksum list (ZIP or tar.gz).",
+		);
 	return candidates[0];
 }
 
@@ -140,8 +168,16 @@ export function nodeExtractionPlan(version, target) {
 	const root = nodeArchiveName(version, target).replace(/\.(tar\.gz|zip)$/, "");
 	return {
 		flag: windows ? "-xf" : "-xzf",
-		members: (windows ? ["node.exe", "node_modules/npm", "LICENSE"] : ["bin/node", "lib/node_modules/npm", "LICENSE"]).map((path) => `${root}/${path}`),
-		moves: windows ? [["node.exe", "bin/node.exe"], ["node_modules", "lib/node_modules"]] : [],
+		members: (windows
+			? ["node.exe", "node_modules/npm", "LICENSE"]
+			: ["bin/node", "lib/node_modules/npm", "LICENSE"]
+		).map((path) => `${root}/${path}`),
+		moves: windows
+			? [
+					["node.exe", "bin/node.exe"],
+					["node_modules", "lib/node_modules"],
+				]
+			: [],
 	};
 }
 
@@ -158,7 +194,11 @@ function sleepSync(ms) {
  * 20 s). Only those errors are retried, until `timeoutMs`; any other error, or the same one after
  * the limit, is thrown as it is.
  */
-export function renameWhenReleased(from, to, { rename = renameSync, sleep = sleepSync, now = Date.now, timeoutMs = 60_000, intervalMs = 500 } = {}) {
+export function renameWhenReleased(
+	from,
+	to,
+	{ rename = renameSync, sleep = sleepSync, now = Date.now, timeoutMs = 60_000, intervalMs = 500 } = {},
+) {
 	const deadline = now() + timeoutMs;
 	for (;;) {
 		try {
@@ -173,7 +213,12 @@ export function renameWhenReleased(from, to, { rename = renameSync, sleep = slee
 /** Explicit build prerequisite only; never search or inherit the user's entire PATH. */
 export function windowsBuildGo(source, isFile) {
 	const exe = source.GENTLE_DOT_BUILD_GO;
-	if (!exe || !win32.isAbsolute(exe) || win32.basename(exe).toLowerCase() !== "go.exe" || /[;\r\n"]/.test(exe))
+	if (
+		!exe ||
+		!win32.isAbsolute(exe) ||
+		win32.basename(exe).toLowerCase() !== "go.exe" ||
+		/[;\r\n"]/.test(exe)
+	)
 		throw new Error("GENTLE_DOT_BUILD_GO must name an absolute, already provisioned go.exe.");
 	if (!isFile(exe)) throw new Error("GENTLE_DOT_BUILD_GO must name an existing regular file.");
 	return exe;
@@ -201,14 +246,23 @@ export function installerEnv(out, cache, target, source = process.env, goExecuta
 		npm_config_update_notifier: "false",
 	};
 	if (windows) {
-		const get = (key) => Object.entries(source).find(([name]) => name.toLowerCase() === key.toLowerCase())?.[1];
+		const get = (key) =>
+			Object.entries(source).find(([name]) => name.toLowerCase() === key.toLowerCase())?.[1];
 		const root = get("SystemRoot");
 		if (!root) throw new Error("Windows installers require SystemRoot.");
 		delete env.TMPDIR;
 		Object.assign(env, {
-			USERPROFILE: home, LOCALAPPDATA: path(home, "AppData", "Local"), APPDATA: path(home, "AppData", "Roaming"),
-			SystemRoot: root, ComSpec: path(root, "System32", "cmd.exe"),
-			PATH: [path(out, "node", "bin"), path(root, "System32"), root, ...(goExecutable ? [win32.dirname(goExecutable)] : [])].join(";"),
+			USERPROFILE: home,
+			LOCALAPPDATA: path(home, "AppData", "Local"),
+			APPDATA: path(home, "AppData", "Roaming"),
+			SystemRoot: root,
+			ComSpec: path(root, "System32", "cmd.exe"),
+			PATH: [
+				path(out, "node", "bin"),
+				path(root, "System32"),
+				root,
+				...(goExecutable ? [win32.dirname(goExecutable)] : []),
+			].join(";"),
 			TEMP: get("TEMP") ?? get("TMP") ?? path(home, "Temp"),
 			TMP: get("TMP") ?? get("TEMP") ?? path(home, "Temp"),
 		});
@@ -217,7 +271,12 @@ export function installerEnv(out, cache, target, source = process.env, goExecuta
 }
 
 /** No shell quoting or direct .cmd spawn: pnpm supplies its JS entry via npm_execpath. */
-export function pnpmInvocation(args, platform = process.platform, env = process.env, node = process.execPath) {
+export function pnpmInvocation(
+	args,
+	platform = process.platform,
+	env = process.env,
+	node = process.execPath,
+) {
 	if (platform !== "win32") return { command: "pnpm", args };
 	if (!/pnpm\.(?:c?js|mjs)$/i.test(env.npm_execpath ?? ""))
 		throw new Error("Run Windows staging through pnpm so npm_execpath names pnpm's JavaScript entry.");
@@ -291,7 +350,12 @@ export function formatSize(bytes) {
 }
 
 /** A copied Windows source tree has no Git revision; never manufacture one. */
-export function daemonSourceRevision(repo, platform = process.platform, present = existsSync, git = execFileSync) {
+export function daemonSourceRevision(
+	repo,
+	platform = process.platform,
+	present = existsSync,
+	git = execFileSync,
+) {
 	if (platform === "win32" && !present(join(repo, ".git"))) return "snapshot-unversioned";
 	const commit = git("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
 	const dirty = git("git", ["status", "--porcelain", "--", "packages"], { cwd: repo, encoding: "utf8" });

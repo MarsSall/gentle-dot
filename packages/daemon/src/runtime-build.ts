@@ -44,10 +44,13 @@ export function runtimePackageManifest(
 	const engine = dependencies["@earendil-works/pi-coding-agent"];
 	// Read only the selected engine snapshot, not another package's codemode edge.
 	const snapshots = lockfile.split("\nsnapshots:\n")[1] ?? "";
-	const snapshot = snapshots.split(/\n(?= {2}\S)/).find((block) =>
-		block.trimStart().startsWith(`'@earendil-works/pi-coding-agent@${engine}(`) ||
-		block.trimStart().startsWith(`'@earendil-works/pi-coding-agent@${engine}':`),
-	);
+	const snapshot = snapshots
+		.split(/\n(?= {2}\S)/)
+		.find(
+			(block) =>
+				block.trimStart().startsWith(`'@earendil-works/pi-coding-agent@${engine}(`) ||
+				block.trimStart().startsWith(`'@earendil-works/pi-coding-agent@${engine}':`),
+		);
 	const codemode = /^ {6}'@earendil-works\/pi-codemode': (\d+\.\d+\.\d+)$/m.exec(snapshot ?? "")?.[1];
 	if (!codemode) throw new Error("Windows runtime needs the engine's exact locked pi-codemode dependency.");
 	dependencies["@earendil-works/pi-codemode"] = codemode;
@@ -61,7 +64,10 @@ export function runtimeWindowsStopArtifact(
 	present: (path: string) => boolean = existsSync,
 ): string | undefined {
 	if (platform !== "win32") return undefined;
-	if (!present(artifact)) throw new Error("Windows stop addon is missing. Run build:windows-stop with existing Node headers and node.lib first.");
+	if (!present(artifact))
+		throw new Error(
+			"Windows stop addon is missing. Run build:windows-stop with existing Node headers and node.lib first.",
+		);
 	return artifact;
 }
 
@@ -140,5 +146,9 @@ export async function buildRuntime(outDir: string): Promise<void> {
 		copyFileSync(join(PACKAGE, "src", "extensions", name), join(daemon, "extensions", name));
 	}
 	writeFileSync(join(daemon, "package.json"), `${JSON.stringify(manifest, null, "\t")}\n`);
-	writeFileSync(join(outDir, "bin", process.platform === "win32" ? "pi.cmd" : "pi"), piWrapper(engineEntry()), { mode: 0o755 });
+	writeFileSync(
+		join(outDir, "bin", process.platform === "win32" ? "pi.cmd" : "pi"),
+		piWrapper(engineEntry()),
+		{ mode: 0o755 },
+	);
 }

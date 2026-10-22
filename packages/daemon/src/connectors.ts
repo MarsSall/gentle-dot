@@ -1818,7 +1818,9 @@ export class ConnectorManager {
 	/** The window that registered the computer helper; it goes away with that window. */
 	private computerOwner: object | undefined;
 	private setupFlow: Setup | undefined;
-	private preparation: { owner: object; id: string; connectorId: string; controller: AbortController } | undefined;
+	private preparation:
+		| { owner: object; id: string; connectorId: string; controller: AbortController }
+		| undefined;
 	private preparationDone: Promise<void> = Promise.resolve();
 	private closed = false;
 	private readonly failed = new Set<string>();
@@ -1904,25 +1906,37 @@ export class ConnectorManager {
 
 	/** Adds or turns on a connector: asks for the values it still needs, then signs in when it has no sign-in yet. */
 	connect(owner: object, id: string, emit: Emit): ConnectorRefusal | undefined {
-		return this.prepareConfiguration(owner, id, emit, (flowId) => this.connectPrepared(owner, id, emit, flowId));
+		return this.prepareConfiguration(owner, id, emit, (flowId) =>
+			this.connectPrepared(owner, id, emit, flowId),
+		);
 	}
 
-	private connectPrepared(owner: object, id: string, emit: Emit, flowId?: string): ConnectorRefusal | undefined {
+	private connectPrepared(
+		owner: object,
+		id: string,
+		emit: Emit,
+		flowId?: string,
+	): ConnectorRefusal | undefined {
 		const saved = this.options.store.state().connectors[id];
 		const spec = specOf(id, saved);
 		if (!spec) return REFUSALS.unknown;
 		if (this.busy()) return REFUSALS.busy;
 		if (missingValues(spec, saved?.values)) {
 			// Nothing is added until every value is there.
-			this.askValues(owner, id, spec.fields, emit, (values, flowId) =>
-				this.keepValues(
-					id,
-					values,
-					emit,
-					flowId,
-					(current) => ({ ...current, enabled: true }),
-					() => this.afterSetup(owner, id, emit, flowId),
-				),
+			this.askValues(
+				owner,
+				id,
+				spec.fields,
+				emit,
+				(values, flowId) =>
+					this.keepValues(
+						id,
+						values,
+						emit,
+						flowId,
+						(current) => ({ ...current, enabled: true }),
+						() => this.afterSetup(owner, id, emit, flowId),
+					),
 				flowId,
 			);
 			return undefined;
@@ -1937,25 +1951,37 @@ export class ConnectorManager {
 		const saved = this.options.store.state().connectors[id];
 		if (!specOf(id, saved)) return REFUSALS.unknown;
 		if (!saved) return REFUSALS.notAdded;
-		return this.prepareConfiguration(owner, id, emit, (flowId) => this.setupPrepared(owner, id, emit, flowId));
+		return this.prepareConfiguration(owner, id, emit, (flowId) =>
+			this.setupPrepared(owner, id, emit, flowId),
+		);
 	}
 
-	private setupPrepared(owner: object, id: string, emit: Emit, flowId?: string): ConnectorRefusal | undefined {
+	private setupPrepared(
+		owner: object,
+		id: string,
+		emit: Emit,
+		flowId?: string,
+	): ConnectorRefusal | undefined {
 		const saved = this.options.store.state().connectors[id];
 		const spec = specOf(id, saved);
 		if (!spec) return REFUSALS.unknown;
 		if (!saved) return REFUSALS.notAdded;
 		if (spec.fields.length === 0) return REFUSALS.noSetup;
 		if (this.busy()) return REFUSALS.busy;
-		this.askValues(owner, id, spec.fields, emit, (values, flowId) =>
-			this.keepValues(
-				id,
-				values,
-				emit,
-				flowId,
-				(current) => current,
-				() => this.afterSetup(owner, id, emit, flowId),
-			),
+		this.askValues(
+			owner,
+			id,
+			spec.fields,
+			emit,
+			(values, flowId) =>
+				this.keepValues(
+					id,
+					values,
+					emit,
+					flowId,
+					(current) => current,
+					() => this.afterSetup(owner, id, emit, flowId),
+				),
 			flowId,
 		);
 		return undefined;
@@ -2262,27 +2288,58 @@ export class ConnectorManager {
 	}
 
 	private busy(): boolean {
-		return this.closed || this.flow !== undefined || this.setupFlow !== undefined || this.preparation !== undefined;
+		return (
+			this.closed || this.flow !== undefined || this.setupFlow !== undefined || this.preparation !== undefined
+		);
 	}
 
-	private prepareConfiguration(owner: object, id: string, emit: Emit, proceed: (flowId?: string) => ConnectorRefusal | undefined): ConnectorRefusal | undefined {
+	private prepareConfiguration(
+		owner: object,
+		id: string,
+		emit: Emit,
+		proceed: (flowId?: string) => ConnectorRefusal | undefined,
+	): ConnectorRefusal | undefined {
 		const saved = this.options.store.state().connectors[id];
 		if (!specOf(id, saved)) return REFUSALS.unknown;
 		if (this.busy()) return REFUSALS.busy;
 		const prepare = this.options.prepareConnector;
 		if (!prepare || id !== "discord" || saved?.custom) return proceed();
-		const pending = { owner, id: `connector-setup-${randomUUID()}`, connectorId: id, controller: new AbortController() };
+		const pending = {
+			owner,
+			id: `connector-setup-${randomUUID()}`,
+			connectorId: id,
+			controller: new AbortController(),
+		};
 		this.preparation = pending;
-		emit({ type: "auth_event", flowId: pending.id, event: { kind: "progress", message: "Preparing Discord…" } });
+		emit({
+			type: "auth_event",
+			flowId: pending.id,
+			event: { kind: "progress", message: "Preparing Discord…" },
+		});
 		this.preparationDone = (async () => {
 			try {
 				await prepare(id, pending.controller.signal);
 				pending.controller.signal.throwIfAborted();
 				this.preparation = undefined;
 				const refused = proceed(pending.id);
-				if (refused) emit({ type: "auth_done", flowId: pending.id, providerId: id, ok: false, message: refused.message });
+				if (refused)
+					emit({
+						type: "auth_done",
+						flowId: pending.id,
+						providerId: id,
+						ok: false,
+						message: refused.message,
+					});
 			} catch {
-				emit({ type: "auth_done", flowId: pending.id, providerId: id, ok: false, message: pending.controller.signal.aborted ? "Preparation cancelled." : "Could not prepare Discord. Try connecting again." });
+				emit({
+					type: "auth_done",
+					flowId: pending.id,
+					providerId: id,
+					ok: false,
+					message: pending.controller.signal.aborted
+						? "Preparation cancelled."
+						: "Could not prepare Discord. Try connecting again.",
+				});
 			} finally {
 				if (this.preparation === pending) this.preparation = undefined;
 			}

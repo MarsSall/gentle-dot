@@ -35,13 +35,19 @@ describe("packaged agent spawn environment", () => {
 		expect(launcher).toMatch(
 			/function ensurePackageLocalGentleAi\([^\n]+\) \{\s*if \(existsSync\(binaryPath\)\) return \{ ok: true \};\s*if \(process\.env\[SKIP_GENTLE_AI_INSTALL_ENV\] === "1"\) \{\s*return \{/,
 		);
-		const installer = readFileSync(join(launcherPath, "..", "..", "scripts", "install-gentle-ai.mjs"), "utf8");
+		const installer = readFileSync(
+			join(launcherPath, "..", "..", "scripts", "install-gentle-ai.mjs"),
+			"utf8",
+		);
 		expect(installer).toMatch(/if \(process\.env\.GENTLE_PI_SKIP_GENTLE_AI_INSTALL === "1"\) \{/);
 	});
 
-	it.each(["linux", "darwin"] as const)("preserves prior %s bundled startup and operator gate values", (platform) => {
-		expect(agentSpawnEnv(process.execPath, [script], env, platform)).toEqual(env);
-	});
+	it.each(["linux", "darwin"] as const)(
+		"preserves prior %s bundled startup and operator gate values",
+		(platform) => {
+			expect(agentSpawnEnv(process.execPath, [script], env, platform)).toEqual(env);
+		},
+	);
 
 	it("preserves Windows source and explicit launch choices", () => {
 		const cases = [
@@ -99,8 +105,9 @@ describe("loadConfig", () => {
 			workspace: join(dataDir, "workspace"),
 		});
 		const home = join(dataDir, "separate-home");
-		expect(loadConfig({ ...env, GENTLE_DOT_AGENT_BIN: "custom-node", GENTLE_DOT_AGENT_HOME: home }))
-			.toMatchObject({ agentCommand: "custom-node", agentArgs: [script], agentHome: home });
+		expect(
+			loadConfig({ ...env, GENTLE_DOT_AGENT_BIN: "custom-node", GENTLE_DOT_AGENT_HOME: home }),
+		).toMatchObject({ agentCommand: "custom-node", agentArgs: [script], agentHome: home });
 		// Empty selection preserves the existing bundled default.
 		expect(loadConfig({ ...env, GENTLE_DOT_AGENT_SCRIPT: "" })).toEqual(
 			loadConfig({ GENTLE_DOT_DATA_DIR: dataDir }),

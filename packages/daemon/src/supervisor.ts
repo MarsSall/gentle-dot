@@ -288,7 +288,10 @@ export class AgentSupervisor {
 		const child = spawn(command, [...args, "--mode", "rpc", "--session-dir", this.sessionDir, ...extraArgs], {
 			cwd,
 			env: agentSpawnEnv(
-				command, args, { ...(env ?? process.env), ...prepareSpawn?.() }, this.options.platform,
+				command,
+				args,
+				{ ...(env ?? process.env), ...prepareSpawn?.() },
+				this.options.platform,
 			),
 			stdio: ["pipe", "pipe", "pipe"],
 			...(user ? { uid: user.uid, gid: user.gid } : {}),

@@ -1,6 +1,16 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -28,14 +38,20 @@ export class DiscordPackage {
 			assertDirectories(this.ready);
 			if (readFileSync(join(this.ready, "ready.json"), "utf8") !== `${VERSION}\n`) return undefined;
 			return validatedCommand(this.ready);
-		} catch { return undefined; }
+		} catch {
+			return undefined;
+		}
 	}
 
 	prepare(signal: AbortSignal): Promise<void> {
 		if (this.active) return Promise.reject(new Error("Discord preparation is already running"));
 		const operation = this.install(signal);
 		this.active = operation;
-		void operation.finally(() => { if (this.active === operation) this.active = undefined; }).catch(() => {});
+		void operation
+			.finally(() => {
+				if (this.active === operation) this.active = undefined;
+			})
+			.catch(() => {});
 		return operation;
 	}
 
@@ -52,8 +68,9 @@ export class DiscordPackage {
 		for (const name of readdirSync(this.root)) {
 			const match = /^discord-stage-(\d+)-[0-9a-f-]{36}$/.exec(name);
 			if (!match) continue;
-			try { process.kill(Number(match[1]), 0); }
-			catch (error) {
+			try {
+				process.kill(Number(match[1]), 0);
+			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "ESRCH") removeStaging(join(this.root, name));
 			}
 		}
@@ -65,8 +82,9 @@ export class DiscordPackage {
 			validatedCommand(staging);
 			if (existsSync(join(staging, "cache"))) removeStaging(join(staging, "cache"));
 			writeFileSync(join(staging, "ready.json"), `${VERSION}\n`, { flag: "wx", mode: 0o600 });
-			try { renameSync(staging, this.ready); }
-			catch (error) {
+			try {
+				renameSync(staging, this.ready);
+			} catch (error) {
 				// A concurrent owner may have published the same validated version first.
 				if (!this.command()) throw error;
 			}
@@ -88,16 +106,19 @@ function validatedCommand(directory: string): Command {
 	const pkg = join(directory, "node_modules", "@pasympa", "discord-mcp");
 	assertDirectories(pkg);
 	const manifest = join(pkg, "package.json");
-	if (!lstatSync(manifest).isFile() || lstatSync(manifest).isSymbolicLink()) throw new Error("Invalid Discord package manifest");
+	if (!lstatSync(manifest).isFile() || lstatSync(manifest).isSymbolicLink())
+		throw new Error("Invalid Discord package manifest");
 	const data = JSON.parse(readFileSync(manifest, "utf8"));
-	if (data.name !== "@pasympa/discord-mcp" || data.version !== VERSION) throw new Error("Wrong Discord package version");
+	if (data.name !== "@pasympa/discord-mcp" || data.version !== VERSION)
+		throw new Error("Wrong Discord package version");
 	const bin = typeof data.bin === "string" ? data.bin : data.bin?.["discord-mcp"];
 	if (typeof bin !== "string" || isAbsolute(bin)) throw new Error("Invalid Discord entry point");
 	const entry = resolve(pkg, bin);
 	const rel = relative(pkg, entry);
 	if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("Unconfined Discord entry point");
 	assertDirectories(dirname(entry));
-	if (!lstatSync(entry).isFile() || lstatSync(entry).isSymbolicLink() || realpathSync(entry) !== entry) throw new Error("Invalid Discord entry point");
+	if (!lstatSync(entry).isFile() || lstatSync(entry).isSymbolicLink() || realpathSync(entry) !== entry)
+		throw new Error("Invalid Discord entry point");
 	return { command: process.execPath, args: [entry] };
 }
 
@@ -125,18 +146,47 @@ function npmCli(): string {
 async function acquireDiscord(directory: string, signal: AbortSignal): Promise<void> {
 	const env: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(process.env)) {
-		if (/^(path|pathext|systemroot|windir|comspec|temp|tmp|userprofile|localappdata|appdata|home)$/i.test(key)) env[key] = value;
+		if (
+			/^(path|pathext|systemroot|windir|comspec|temp|tmp|userprofile|localappdata|appdata|home)$/i.test(key)
+		)
+			env[key] = value;
 	}
-	Object.assign(env, { npm_config_userconfig: join(directory, "empty.npmrc"), npm_config_cache: join(directory, "cache") });
+	Object.assign(env, {
+		npm_config_userconfig: join(directory, "empty.npmrc"),
+		npm_config_cache: join(directory, "cache"),
+	});
 	writeFileSync(env.npm_config_userconfig!, "", { flag: "wx", mode: 0o600 });
 	await new Promise<void>((done, fail) => {
-		const child = spawn(process.execPath, [npmCli(), "install", "--prefix", directory, "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false", "--bin-links=false", "--registry=https://registry.npmjs.org", PACKAGE], { cwd: directory, env, stdio: "ignore", windowsHide: true });
+		const child = spawn(
+			process.execPath,
+			[
+				npmCli(),
+				"install",
+				"--prefix",
+				directory,
+				"--ignore-scripts",
+				"--no-audit",
+				"--no-fund",
+				"--package-lock=false",
+				"--bin-links=false",
+				"--registry=https://registry.npmjs.org",
+				PACKAGE,
+			],
+			{ cwd: directory, env, stdio: "ignore", windowsHide: true },
+		);
 		let interrupted = false;
-		const stop = () => { interrupted = true; child.kill(); };
+		const stop = () => {
+			interrupted = true;
+			child.kill();
+		};
 		const timeout = setTimeout(stop, PREPARE_TIMEOUT_MS);
 		signal.addEventListener("abort", stop, { once: true });
 		if (signal.aborted) stop();
-		child.once("error", (error) => { clearTimeout(timeout); signal.removeEventListener("abort", stop); fail(error); });
+		child.once("error", (error) => {
+			clearTimeout(timeout);
+			signal.removeEventListener("abort", stop);
+			fail(error);
+		});
 		child.once("close", (code) => {
 			clearTimeout(timeout);
 			signal.removeEventListener("abort", stop);

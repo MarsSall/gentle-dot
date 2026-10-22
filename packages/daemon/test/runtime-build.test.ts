@@ -40,21 +40,37 @@ function listFiles(dir: string, prefix = ""): string[] {
 describe("build:runtime", () => {
 	it("pins the Windows codemode edge to the engine's lockfile snapshot, not its npm range", () => {
 		const manifest = runtimePackageManifest("win32");
-		expect(manifest.dependencies).toEqual({ ...lockedDependencies(), "@earendil-works/pi-codemode": "1.0.4" });
-		expect("overrides" in manifest ? manifest.overrides : undefined).toEqual({ "@earendil-works/pi-codemode": "1.0.4" });
+		expect(manifest.dependencies).toEqual({
+			...lockedDependencies(),
+			"@earendil-works/pi-codemode": "1.0.4",
+		});
+		expect("overrides" in manifest ? manifest.overrides : undefined).toEqual({
+			"@earendil-works/pi-codemode": "1.0.4",
+		});
 	});
 
 	it("keeps the previous Unix flat-install manifest unchanged", () => {
 		for (const platform of ["linux", "darwin"] as const) {
 			expect(runtimePackageManifest(platform)).toEqual({
-				name: "gentle-dot-runtime", private: true, type: "module", dependencies: lockedDependencies(),
+				name: "gentle-dot-runtime",
+				private: true,
+				type: "module",
+				dependencies: lockedDependencies(),
 			});
 		}
 	});
 
 	it("refuses a Windows lockfile without the engine's exact codemode edge", () => {
 		const lock = readFileSync(join(PACKAGE, "..", "..", "pnpm-lock.yaml"), "utf8");
-		expect(() => runtimePackageManifest("win32", lock.replace("      '@earendil-works/pi-codemode': 1.0.4", "      '@earendil-works/pi-codemode': ^1.0.4"))).toThrow(/codemode/);
+		expect(() =>
+			runtimePackageManifest(
+				"win32",
+				lock.replace(
+					"      '@earendil-works/pi-codemode': 1.0.4",
+					"      '@earendil-works/pi-codemode': ^1.0.4",
+				),
+			),
+		).toThrow(/codemode/);
 	});
 	it("emits a relocatable Windows cmd wrapper without relying on sh or ambient Node", () => {
 		expect(piWrapper("@earendil-works/pi-coding-agent/dist/bundle/cli.js", "win32")).toBe(
@@ -65,7 +81,7 @@ describe("build:runtime", () => {
 	it("preserves the Unix shell wrapper for Linux and macOS", () => {
 		for (const platform of ["linux", "darwin"] as const) {
 			const wrapper = piWrapper("@earendil-works/pi-coding-agent/dist/bundle/cli.js", platform);
-			expect(wrapper).toContain('#!/bin/sh\n');
+			expect(wrapper).toContain("#!/bin/sh\n");
 			expect(wrapper).toContain('exec "$runtime/node/bin/node"');
 			expect(wrapper).toContain('"$@"');
 		}

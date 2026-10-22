@@ -1307,7 +1307,8 @@ export class DotBridge {
 			const level =
 				event.notifyType === "error" ? "error" : event.notifyType === "warning" ? "warning" : "info";
 			const message = String(event.message ?? "");
-			if (shouldShowToast(level, message)) this.broadcast({ type: "toast", level, message: presentText(message) });
+			if (shouldShowToast(level, message))
+				this.broadcast({ type: "toast", level, message: presentText(message) });
 			return;
 		}
 		if (method === "setStatus" && event.statusKey === DRAFT_STATUS_KEY) {

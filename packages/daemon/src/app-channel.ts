@@ -148,10 +148,10 @@ export class AppChannel implements AppLink {
 		const windows = isWindowsAppChannel(stream);
 		this.closing = windows
 			? Promise.resolve().then(async () => {
-				const result = await stream.close("drain");
-				if (result.mode !== "drain" || result.drained !== true)
-					throw new Error("Windows app channel was not drained.");
-			})
+					const result = await stream.close("drain");
+					if (result.mode !== "drain" || result.drained !== true)
+						throw new Error("Windows app channel was not drained.");
+				})
 			: Promise.resolve();
 		void this.closing.catch(() => {}); // EOF/error initiators have no awaiter
 		if (!windows) this.stream.destroy();

@@ -19,7 +19,10 @@ export interface NativeAppChannelOwner {
 	poll(): NativeAppChannelSnapshot;
 	status(): NativeAppChannelSnapshot;
 	read(maxBytes: number): Buffer;
-	write(bytes: Buffer): { admission: "accepted" | "backpressure" | "stopped" | "invalid" | "allocation_failed"; ticket: bigint };
+	write(bytes: Buffer): {
+		admission: "accepted" | "backpressure" | "stopped" | "invalid" | "allocation_failed";
+		ticket: bigint;
+	};
 	stop(mode: "drain" | "abort"): NativeAppChannelSnapshot;
 	/** Returns PRE-disposal status. No method is legal after successful release. */
 	release(): NativeAppChannelSnapshot;
@@ -47,8 +50,12 @@ const productionChannels = new WeakSet<object>();
 /** Only production construction with actual startup facts and successful native
  * ownership transfer admits Windows descendants. Not a child-inspection proof. */
 export function isProductionWindowsAppChannel(stream: object): stream is WindowsAppChannel {
-	return productionChannels.has(stream) && stream instanceof WindowsAppChannel &&
-		!stream.destroyed && !stream.writableEnded;
+	return (
+		productionChannels.has(stream) &&
+		stream instanceof WindowsAppChannel &&
+		!stream.destroyed &&
+		!stream.writableEnded
+	);
 }
 
 /** Includes the portable adapter test seam; used only to await transport cleanup. */
@@ -76,7 +83,8 @@ export function createWindowsAppChannelForTesting(
 	options: WindowsAppChannelOptions & { loadNative: () => NativeAppChannelAPI },
 	facts: StartupFacts,
 ): WindowsAppChannel {
-	if (typeof options?.loadNative !== "function") throw new TypeError("App channel test loader must be a function");
+	if (typeof options?.loadNative !== "function")
+		throw new TypeError("App channel test loader must be a function");
 	return new WindowsAppChannelDuplex(options, facts, options.loadNative);
 }
 
@@ -101,21 +109,30 @@ class WindowsAppChannelDuplex extends Duplex {
 
 	constructor(options: WindowsAppChannelOptions, facts: StartupFacts, loadNative: () => NativeAppChannelAPI) {
 		super({ readableHighWaterMark: 65536, writableHighWaterMark: 65536, autoDestroy: true });
-		if (options.exclusiveFd3Startup !== true || !facts.mainThread) throw new Error("Exclusive main-thread fd3 startup required");
-		if (facts.ipcChannel || facts.ipcConnected || facts.channelFdPresent) throw new Error("App channel startup IPC collision");
+		if (options.exclusiveFd3Startup !== true || !facts.mainThread)
+			throw new Error("Exclusive main-thread fd3 startup required");
+		if (facts.ipcChannel || facts.ipcConnected || facts.channelFdPresent)
+			throw new Error("App channel startup IPC collision");
 		if (facts.platform !== "win32") throw new Error("Windows app channel requires Windows");
 		this.#timeoutMs = options.closeTimeoutMs ?? 5000;
-		if (!Number.isSafeInteger(this.#timeoutMs) || this.#timeoutMs < 1) throw new Error("Invalid app channel close deadline");
+		if (!Number.isSafeInteger(this.#timeoutMs) || this.#timeoutMs < 1)
+			throw new Error("Invalid app channel close deadline");
 		const native = loadNative();
-		if (typeof native?.adoptAppChannelFd3 !== "function") throw new Error("Windows app channel addon unavailable");
+		if (typeof native?.adoptAppChannelFd3 !== "function")
+			throw new Error("Windows app channel addon unavailable");
 		this.#owner = native.adoptAppChannelFd3(true);
 		try {
 			this.#snapshot = this.#owner.status();
 			if (this.#snapshot.phase !== "open" || this.#snapshot.error || this.#snapshot.eof)
 				throw new Error("Windows app channel ownership initialization failed");
 		} catch (error) {
-			try { this.#owner.stop("abort"); } catch { /* release retains uncertain native ownership */ }
-			this.dispose(); throw error;
+			try {
+				this.#owner.stop("abort");
+			} catch {
+				/* release retains uncertain native ownership */
+			}
+			this.dispose();
+			throw error;
 		}
 		this.schedule();
 	}
@@ -123,9 +140,15 @@ class WindowsAppChannelDuplex extends Duplex {
 	close(mode: "drain" | "abort" = "drain"): Promise<WindowsAppChannelCloseResult> {
 		if (this.#close) return this.#close;
 		this.#mode = mode;
-		this.#close = new Promise((resolve, reject) => { this.#resolve = resolve; this.#reject = reject; });
+		this.#close = new Promise((resolve, reject) => {
+			this.#resolve = resolve;
+			this.#reject = reject;
+		});
 		void this.#close.catch(() => {}); // observed even when destroy initiated close
-		if (this.#disposed) { this.#reject!(this.#failure ?? new Error("App channel already disposed")); return this.#close; }
+		if (this.#disposed) {
+			this.#reject!(this.#failure ?? new Error("App channel already disposed"));
+			return this.#close;
+		}
 		this.#deadline = setTimeout(() => {
 			this.#failure ??= new Error("App channel close deadline exceeded");
 			this.finish(false);
@@ -140,27 +163,45 @@ class WindowsAppChannelDuplex extends Duplex {
 		return this.#close;
 	}
 
-	override _read(): void { this.#reading = true; this.drive(); }
+	override _read(): void {
+		this.#reading = true;
+		this.drive();
+	}
 	override _write(chunk: Buffer, _encoding: BufferEncoding, callback: WriteCallback): void {
-		if (this.#disposed || this.#stopping || this.#failure) { callback(this.#failure ?? new Error("App channel stopped")); return; }
-		if (!chunk.length) { callback(); return; }
-		if (chunk.length > 2 * 1024 * 1024) { callback(new Error("App channel write exceeds 2 MiB")); return; }
+		if (this.#disposed || this.#stopping || this.#failure) {
+			callback(this.#failure ?? new Error("App channel stopped"));
+			return;
+		}
+		if (!chunk.length) {
+			callback();
+			return;
+		}
+		if (chunk.length > 2 * 1024 * 1024) {
+			callback(new Error("App channel write exceeds 2 MiB"));
+			return;
+		}
 		this.#write = { bytes: chunk, callback };
 		this.drive();
 	}
 	override _final(callback: WriteCallback): void {
 		this.#final = callback;
 		if (!this.#close) void this.close("drain");
-		this.stop("drain"); this.drive();
+		this.stop("drain");
+		this.drive();
 	}
 	override _destroy(error: Error | null, callback: WriteCallback): void {
 		if (error !== this.#abortError) this.#failure ??= error ?? undefined;
 		if (!this.#disposed) {
 			// Aborting an existing drain can discard Node-buffered writes whose
 			// bytes have no native ticket. Ticket equality cannot certify that drain.
-			if (this.#close && this.#mode === "drain") this.#failure ??= new Error("App channel drain interrupted by destruction");
+			if (this.#close && this.#mode === "drain")
+				this.#failure ??= new Error("App channel drain interrupted by destruction");
 			if (!this.#close) void this.close("abort");
-			else { this.rejectWrite(this.#failure ?? new Error("App channel aborted")); this.stop("abort"); this.schedule(); }
+			else {
+				this.rejectWrite(this.#failure ?? new Error("App channel aborted"));
+				this.stop("abort");
+				this.schedule();
+			}
 		}
 		callback(this.#failure ?? error);
 	}
@@ -169,13 +210,17 @@ class WindowsAppChannelDuplex extends Duplex {
 		this.#snapshot = status;
 		if (status.error) this.#failure ??= new Error(`Windows app channel native error ${status.error}`);
 		else if (status.eof) this.#failure ??= new Error("App channel EOF");
-		else if (status.phase === "retained_failure") this.#failure ??= new Error("App channel native ownership retained");
+		else if (status.phase === "retained_failure")
+			this.#failure ??= new Error("App channel native ownership retained");
 	}
 	private stop(mode: "drain" | "abort"): void {
 		if (this.#disposed || (this.#stopping && mode === "drain")) return;
 		this.#stopping = true;
-		try { this.observe(this.#owner.stop(mode)); }
-		catch { this.#failure ??= new Error("App channel stop failed"); }
+		try {
+			this.observe(this.#owner.stop(mode));
+		} catch {
+			this.#failure ??= new Error("App channel stop failed");
+		}
 	}
 	private drive(): void {
 		if (this.#disposed || this.#driving) return;
@@ -187,7 +232,8 @@ class WindowsAppChannelDuplex extends Duplex {
 				// cannot admit new writes. Completion still certifies an earlier ticket.
 				const delivered = this.#write;
 				if (delivered?.ticket !== undefined && delivered.ticket <= this.#snapshot.completedWrite) {
-					this.#write = undefined; delivered.callback();
+					this.#write = undefined;
+					delivered.callback();
 				}
 				this.rejectWrite(this.#failure);
 				if (!this.#close) void this.close("abort");
@@ -196,15 +242,21 @@ class WindowsAppChannelDuplex extends Duplex {
 			}
 			const pending = this.#write;
 			if (pending && !this.#failure && !this.#stopping) {
-				if (pending.ticket === undefined && (!pending.capacity ||
-					this.#snapshot.queuedBytes < pending.capacity[0] || this.#snapshot.queuedItems < pending.capacity[1])) {
+				if (
+					pending.ticket === undefined &&
+					(!pending.capacity ||
+						this.#snapshot.queuedBytes < pending.capacity[0] ||
+						this.#snapshot.queuedItems < pending.capacity[1])
+				) {
 					const admission = this.#owner.write(pending.bytes);
 					if (admission.admission === "accepted") pending.ticket = admission.ticket;
-					else if (admission.admission === "backpressure") pending.capacity = [this.#snapshot.queuedBytes, this.#snapshot.queuedItems];
+					else if (admission.admission === "backpressure")
+						pending.capacity = [this.#snapshot.queuedBytes, this.#snapshot.queuedItems];
 					else throw new Error("App channel write admission failed");
 				}
 				if (pending.ticket !== undefined && pending.ticket <= this.#snapshot.completedWrite) {
-					this.#write = undefined; pending.callback();
+					this.#write = undefined;
+					pending.callback();
 				}
 			}
 			if (this.#reading && !this.#stopping && !this.#failure && this.#snapshot.readableBytes) {
@@ -212,44 +264,70 @@ class WindowsAppChannelDuplex extends Duplex {
 				if (bytes.length) this.#reading = this.push(bytes);
 			}
 			if (this.#snapshot.phase === "closed" || this.#snapshot.phase === "retained_failure") {
-				if (!this.#close) { this.#failure ??= new Error("App channel closed unexpectedly"); void this.close("abort"); }
-				const drained = this.#mode === "drain" && !this.#failure && this.#snapshot.phase === "closed" &&
+				if (!this.#close) {
+					this.#failure ??= new Error("App channel closed unexpectedly");
+					void this.close("abort");
+				}
+				const drained =
+					this.#mode === "drain" &&
+					!this.#failure &&
+					this.#snapshot.phase === "closed" &&
 					this.#snapshot.acceptedWrite === this.#snapshot.completedWrite;
-				if (this.#mode === "drain" && !drained) this.#failure ??= new Error("App channel writes were not drained");
+				if (this.#mode === "drain" && !drained)
+					this.#failure ??= new Error("App channel writes were not drained");
 				this.finish(drained);
 			}
 		} catch {
 			// write() may have accepted before an envelope/BigInt allocation throws.
 			// Inspect for the first native error, but NEVER retry the uncertain bytes.
-			try { this.observe(this.#owner.status()); } catch { /* retain prior evidence */ }
+			try {
+				this.observe(this.#owner.status());
+			} catch {
+				/* retain prior evidence */
+			}
 			this.#failure ??= new Error("App channel native operation failed");
 			this.rejectWrite(this.#failure);
 			if (!this.#close) void this.close("abort");
-			this.stop("abort"); this.destroy(this.#failure);
-		} finally { this.#driving = false; this.schedule(); }
+			this.stop("abort");
+			this.destroy(this.#failure);
+		} finally {
+			this.#driving = false;
+			this.schedule();
+		}
 	}
 	private schedule(): void {
 		if (this.#disposed || this.#pollTimer) return;
 		// A pending read is active I/O, not idle spinning. When the native read
 		// buffer is full and JS is paused, leave it bounded until _read resumes.
 		if (!this.#stopping && !this.#write && !this.#snapshot.pendingIo && !this.#reading) return;
-		this.#pollTimer = setTimeout(() => { this.#pollTimer = undefined; this.drive(); }, 10);
+		this.#pollTimer = setTimeout(() => {
+			this.#pollTimer = undefined;
+			this.drive();
+		}, 10);
 	}
 	private rejectWrite(error: Error): void {
-		const pending = this.#write; this.#write = undefined; pending?.callback(error);
+		const pending = this.#write;
+		this.#write = undefined;
+		pending?.callback(error);
 	}
 	private dispose(): void {
 		this.#disposed = true;
-		clearTimeout(this.#pollTimer); clearTimeout(this.#deadline);
+		clearTimeout(this.#pollTimer);
+		clearTimeout(this.#deadline);
 		this.#pollTimer = this.#deadline = undefined;
-		try { this.#owner.release(); }
-		catch { retainedOwners.add(this.#owner); this.#failure ??= new Error("App channel disposal failed"); }
+		try {
+			this.#owner.release();
+		} catch {
+			retainedOwners.add(this.#owner);
+			this.#failure ??= new Error("App channel disposal failed");
+		}
 	}
 	private finish(drained: boolean): void {
 		if (this.#disposed) return;
 		this.dispose(); // release is NEVER the evidence for drain
 		this.rejectWrite(this.#failure ?? new Error("App channel closed"));
-		const final = this.#final; this.#final = undefined;
+		const final = this.#final;
+		this.#final = undefined;
 		final?.(this.#failure);
 		if (this.#failure) this.#reject?.(this.#failure);
 		else this.#resolve?.({ mode: this.#mode, drained });
@@ -264,13 +342,17 @@ export class WindowsAppChannel extends WindowsAppChannelDuplex {
 		// Refuse injection even from untyped JS or a structurally compatible object.
 		// No caller-provided loader/boolean can mint production ownership admission.
 		if ("loadNative" in options) throw new Error("Production app channel does not accept an injected loader");
-		super(options, {
-			mainThread: isMainThread,
-			ipcChannel: Boolean(process.channel),
-			ipcConnected: Boolean(process.connected),
-			channelFdPresent: process.env.NODE_CHANNEL_FD !== undefined,
-			platform: process.platform,
-		}, () => createRequire(import.meta.url)(fileURLToPath(windowsStopArtifact())) as NativeAppChannelAPI);
+		super(
+			options,
+			{
+				mainThread: isMainThread,
+				ipcChannel: Boolean(process.channel),
+				ipcConnected: Boolean(process.connected),
+				channelFdPresent: process.env.NODE_CHANNEL_FD !== undefined,
+				platform: process.platform,
+			},
+			() => createRequire(import.meta.url)(fileURLToPath(windowsStopArtifact())) as NativeAppChannelAPI,
+		);
 		productionChannels.add(this);
 	}
 }

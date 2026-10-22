@@ -5,9 +5,15 @@ export const WINDOWS_USAGE =
 	"usage: package-windows [--runtime <staged-dir>] [--help]\n" +
 	"Native Windows x64 only; consumes build/runtime/windows-x64 by default. Builds NSIS; the installer adds WebView2 when missing (needs internet then).";
 export const WINDOWS_FILES = Object.freeze([
-	"MANIFEST.json", "node/bin/node.exe", "daemon/cli.mjs", "daemon/package.json",
-	"daemon/native/windows-stop.node", "daemon/node_modules/gentle-pi/package.json",
-	"bin/engram.exe", "bin/pi.cmd", "ui/index.html",
+	"MANIFEST.json",
+	"node/bin/node.exe",
+	"daemon/cli.mjs",
+	"daemon/package.json",
+	"daemon/native/windows-stop.node",
+	"daemon/node_modules/gentle-pi/package.json",
+	"bin/engram.exe",
+	"bin/pi.cmd",
+	"ui/index.html",
 ]);
 
 export function parseWindowsArgs(argv) {
@@ -21,11 +27,23 @@ export function parseWindowsArgs(argv) {
 
 export function assertWindowsHost(platform, arch) {
 	if (platform !== "win32" || arch !== "x64")
-		throw new Error(`Packaging requires native Windows x64; got ${platform}-${arch}. No cross-build or implicit staging.`);
+		throw new Error(
+			`Packaging requires native Windows x64; got ${platform}-${arch}. No cross-build or implicit staging.`,
+		);
 }
 
 /** Pure admission/argument plan. The CLI supplies filesystem predicates; tests execute no build. */
-export function windowsPackagePlan({ repo, runtime, platform, arch, node, manifest, isFile, isDirectory, path = hostPath }) {
+export function windowsPackagePlan({
+	repo,
+	runtime,
+	platform,
+	arch,
+	node,
+	manifest,
+	isFile,
+	isDirectory,
+	path = hostPath,
+}) {
 	assertWindowsHost(platform, arch);
 	const { resolve } = path;
 	if (manifest?.name !== "gentle-dot-runtime" || manifest?.target !== "windows-x64")
@@ -34,12 +52,14 @@ export function windowsPackagePlan({ repo, runtime, platform, arch, node, manife
 	const cli = resolve(desktop, "node_modules/@tauri-apps/cli/tauri.js");
 	const icon = resolve(desktop, "src-tauri/icons/icon.ico");
 	for (const file of WINDOWS_FILES) {
-		if (!isFile(resolve(runtime, file))) throw new Error(`Missing staged artifact ${file} in ${runtime}. Stage explicitly before packaging.`);
+		if (!isFile(resolve(runtime, file)))
+			throw new Error(`Missing staged artifact ${file} in ${runtime}. Stage explicitly before packaging.`);
 	}
 	if (!isDirectory(resolve(runtime, "daemon/node_modules/gentle-pi/.gentle-ai")))
 		throw new Error("Missing staged gentle-pi/.gentle-ai agent. Stage explicitly before packaging.");
 	for (const file of [cli, icon])
-		if (!isFile(file)) throw new Error(`Missing packaging prerequisite ${file}; provision it explicitly before packaging.`);
+		if (!isFile(file))
+			throw new Error(`Missing packaging prerequisite ${file}; provision it explicitly before packaging.`);
 	// Tauri resolves directories from src-tauri, not the CLI cwd. Absolute drive
 	// paths deserialize as URLs (e.g. c:), whose relative page joins can panic.
 	const configDir = resolve(desktop, "src-tauri");
@@ -47,10 +67,13 @@ export function windowsPackagePlan({ repo, runtime, platform, arch, node, manife
 	const frontend = path.relative(configDir, frontendDir);
 	// win32.relative can traverse between shares on one server, but Windows
 	// cannot traverse above a share root. Compare roots as well as absoluteness.
-	const differentWindowsRoots = path.sep === "\\" &&
+	const differentWindowsRoots =
+		path.sep === "\\" &&
 		path.parse(configDir).root.toLowerCase() !== path.parse(frontendDir).root.toLowerCase();
 	if (differentWindowsRoots || path.isAbsolute(frontend))
-		throw new Error("frontendDist must be relative to src-tauri; place the staged runtime on the same volume/share as the checkout.");
+		throw new Error(
+			"frontendDist must be relative to src-tauri; place the staged runtime on the same volume/share as the checkout.",
+		);
 	const config = {
 		build: { beforeBuildCommand: "", frontendDist: `./${frontend.split(path.sep).join("/")}` },
 		bundle: {

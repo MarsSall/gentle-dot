@@ -24,27 +24,27 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import {
 	assertHostTarget,
-	checkWindowsCodemodeCompatibility,
-	daemonSourceRevision,
-	windowsBuildGo,
-	gentleAiIntegritySummary,
 	buildManifest,
 	checksumFor,
+	checkWindowsCodemodeCompatibility,
+	daemonSourceRevision,
 	engramArchiveName,
 	engramReleaseVersion,
 	formatSize,
+	gentleAiIntegritySummary,
+	installerEnv,
 	nodeArchiveName,
 	nodeExtractionPlan,
-	installerEnv,
-	pnpmInvocation,
 	nodeVersion,
 	npmWrapper,
 	parseArgs,
+	pnpmInvocation,
 	renameWhenReleased,
 	symlinksIn,
 	treeSize,
 	verifyChecksum,
 	versionFromReleaseUrl,
+	windowsBuildGo,
 } from "./lib.mjs";
 
 const REPO = fileURLToPath(new URL("../..", import.meta.url));
@@ -133,7 +133,11 @@ async function stageNode(out, target) {
 	}
 	const windows = target === "windows-x64";
 	for (const name of ["npm", "npx"])
-		writeFileSync(join(node, "bin", `${name}${windows ? ".cmd" : ""}`), npmWrapper(`${name}-cli.js`, windows ? "win32" : "unix"), { mode: 0o755 });
+		writeFileSync(
+			join(node, "bin", `${name}${windows ? ".cmd" : ""}`),
+			npmWrapper(`${name}-cli.js`, windows ? "win32" : "unix"),
+			{ mode: 0o755 },
+		);
 	return version;
 }
 
@@ -164,7 +168,8 @@ function installDaemonModules(out, target, goExecutable) {
 	// A clean npm setup: no user npmrc, a cache of its own, and a scratch HOME for install scripts.
 	const env = installerEnv(out, CACHE, target, process.env, goExecutable);
 	if (target === "windows-x64")
-		for (const path of [env.LOCALAPPDATA, env.APPDATA, env.TEMP, env.TMP]) mkdirSync(path, { recursive: true });
+		for (const path of [env.LOCALAPPDATA, env.APPDATA, env.TEMP, env.TMP])
+			mkdirSync(path, { recursive: true });
 	const result = spawnSync(
 		join(out, "node", "bin", target === "windows-x64" ? "node.exe" : "node"),
 		[
@@ -252,9 +257,16 @@ async function main() {
 	assertHostTarget(target);
 	// Fail before output replacement or downloads; only the chosen Go directory is
 	// added to the installer's otherwise isolated PATH. No Go setup occurs here.
-	const goExecutable = target === "windows-x64" ? windowsBuildGo(process.env, (file) => {
-		try { return lstatSync(file).isFile(); } catch { return false; }
-	}) : undefined;
+	const goExecutable =
+		target === "windows-x64"
+			? windowsBuildGo(process.env, (file) => {
+					try {
+						return lstatSync(file).isFile();
+					} catch {
+						return false;
+					}
+				})
+			: undefined;
 	const out = resolve(
 		process.env.INIT_CWD ?? process.cwd(),
 		options.out ?? join(REPO, "build", "runtime", target),
@@ -269,9 +281,14 @@ async function main() {
 	run(daemonBuild.command, daemonBuild.args, { cwd: REPO });
 	const modules = installDaemonModules(out, target, goExecutable);
 	if (target === "windows-x64") {
-		const checked = checkWindowsCodemodeCompatibility(join(out, "daemon"), join(out, "node", "bin", "node.exe"));
+		const checked = checkWindowsCodemodeCompatibility(
+			join(out, "daemon"),
+			join(out, "node", "bin", "node.exe"),
+		);
 		Object.assign(modules, checked);
-		say(`  Windows codemode declarations import verified (engine ${checked.engine}, codemode ${checked.codemode})`);
+		say(
+			`  Windows codemode declarations import verified (engine ${checked.engine}, codemode ${checked.codemode})`,
+		);
 	}
 	const engram = await stageEngram(out, target, options.engramVersion);
 	say("Web UI");

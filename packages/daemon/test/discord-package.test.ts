@@ -8,7 +8,14 @@ import { tempDir } from "./helpers.ts";
 function installed(folder: string) {
 	const pkg = join(folder, "node_modules", "@pasympa", "discord-mcp");
 	mkdirSync(join(pkg, "dist"), { recursive: true });
-	writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@pasympa/discord-mcp", version: "2.2.0", bin: { "discord-mcp": "dist/index.js" } }));
+	writeFileSync(
+		join(pkg, "package.json"),
+		JSON.stringify({
+			name: "@pasympa/discord-mcp",
+			version: "2.2.0",
+			bin: { "discord-mcp": "dist/index.js" },
+		}),
+	);
 	writeFileSync(join(pkg, "dist/index.js"), "// synthetic server; never executed\n");
 }
 
@@ -16,8 +23,14 @@ it("publishes a cold preparation only after acquisition and reuses it after owne
 	const root = tempDir();
 	let calls = 0;
 	let release!: () => void;
-	const gate = new Promise<void>((resolve) => { release = resolve; });
-	const acquire = async (folder: string) => { calls++; await gate; installed(folder); };
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const acquire = async (folder: string) => {
+		calls++;
+		await gate;
+		installed(folder);
+	};
 	const owner = new DiscordPackage(root, acquire);
 	const signal = new AbortController().signal;
 	const pending = owner.prepare(signal);
@@ -28,7 +41,9 @@ it("publishes a cold preparation only after acquisition and reuses it after owne
 	const command = owner.command();
 	expect(command?.command).toBe(process.execPath);
 	expect(existsSync(command!.args[0]!)).toBe(true);
-	const reopened = new DiscordPackage(root, async () => { throw new Error("warm start downloaded"); });
+	const reopened = new DiscordPackage(root, async () => {
+		throw new Error("warm start downloaded");
+	});
 	await reopened.prepare(signal);
 	expect(reopened.command()).toEqual(command);
 });
@@ -62,7 +77,9 @@ it("recovers staging from an exited owner without touching a live owner's stagin
 	writeFileSync(join(stale, "partial"), "interrupted");
 	mkdirSync(live);
 	writeFileSync(join(live, "partial"), "active");
-	const owner = new DiscordPackage(root, async (folder) => { installed(folder); });
+	const owner = new DiscordPackage(root, async (folder) => {
+		installed(folder);
+	});
 	await owner.prepare(new AbortController().signal);
 	expect(existsSync(stale)).toBe(false);
 	expect(existsSync(join(live, "partial"))).toBe(true);
@@ -72,7 +89,10 @@ it("recovers staging from an exited owner without touching a live owner's stagin
 it("refuses to publish a cancelled acquisition even if the installer completes", async () => {
 	const root = tempDir();
 	const controller = new AbortController();
-	const owner = new DiscordPackage(root, async (folder) => { installed(folder); controller.abort(); });
+	const owner = new DiscordPackage(root, async (folder) => {
+		installed(folder);
+		controller.abort();
+	});
 	await expect(owner.prepare(controller.signal)).rejects.toThrow();
 	expect(owner.command()).toBeUndefined();
 });

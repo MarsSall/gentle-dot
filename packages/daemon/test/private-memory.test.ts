@@ -141,7 +141,9 @@ describe("private memory ownership safeguards", () => {
 		{ code: 0, stdout: "12345\n12346" },
 	])("refuses uncertain startup ownership: %j", async (output) => {
 		const f = await fixture([output]);
-		await expect(privateMemory(f.base, f.dataDir, () => {}, undefined, f.options)).rejects.toThrow("private memory");
+		await expect(privateMemory(f.base, f.dataDir, () => {}, undefined, f.options)).rejects.toThrow(
+			"private memory",
+		);
 		expect(f.kill).not.toHaveBeenCalled();
 	});
 
@@ -176,13 +178,17 @@ describe("private memory ownership safeguards", () => {
 	it("rejects a failed command instead of assuming an empty port", async () => {
 		const f = await fixture([]);
 		f.runListenerCommand.mockRejectedValueOnce(new Error("spawn failed"));
-		await expect(privateMemory(f.base, f.dataDir, () => {}, undefined, f.options)).rejects.toThrow("private memory");
+		await expect(privateMemory(f.base, f.dataDir, () => {}, undefined, f.options)).rejects.toThrow(
+			"private memory",
+		);
 		expect(f.kill).not.toHaveBeenCalled();
 	});
 
 	it("preserves the Unix no-match exit code and verifies stable ownership before stopping", async () => {
 		const f = await fixture([{ code: 1, stdout: "" }, one, one]);
-		await (await privateMemory(f.base, f.dataDir, () => {}, undefined, { ...f.options, platform: "linux" }))?.stop();
+		await (
+			await privateMemory(f.base, f.dataDir, () => {}, undefined, { ...f.options, platform: "linux" })
+		)?.stop();
 		expect(f.kill).toHaveBeenCalledExactlyOnceWith(12345, "SIGTERM");
 		expect(f.runListenerCommand.mock.calls[0]?.[0]).toBe("lsof");
 	});
@@ -190,7 +196,10 @@ describe("private memory ownership safeguards", () => {
 	it("does not terminate when health is unavailable or the stored instance id is empty", async () => {
 		const f = await fixture([empty, one]);
 		await (
-			await privateMemory(f.base, f.dataDir, () => {}, undefined, { ...f.options, health: async () => undefined })
+			await privateMemory(f.base, f.dataDir, () => {}, undefined, {
+				...f.options,
+				health: async () => undefined,
+			})
 		)?.stop();
 		expect(f.kill).not.toHaveBeenCalled();
 		const other = await fixture([empty, one]);

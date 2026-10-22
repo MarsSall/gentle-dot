@@ -24,9 +24,9 @@ import {
 	ConnectorStore,
 	policyEnv,
 } from "./connectors.ts";
+import { DiscordPackage } from "./discord-package.ts";
 import { directAccess, type EngineAccess, engineAccess } from "./engine-access.ts";
 import { approvalRequest } from "./extensions/approval-guard.ts";
-import { DiscordPackage } from "./discord-package.ts";
 import {
 	claimEngineHome,
 	ensureMemoryProject,
@@ -157,15 +157,20 @@ export async function startDaemon(options: DaemonOptions): Promise<DotDaemon> {
 	// A generic Duplex or fd number is not Windows descendant-exclusion admission.
 	// Only actual main-thread/native ownership transfer on the production startup
 	// path admits a requested channel, before privateMemory can spawn PowerShell.
-	if (process.platform === "win32" && options.appChannel && !isProductionWindowsAppChannel(options.appChannel))
+	if (
+		process.platform === "win32" &&
+		options.appChannel &&
+		!isProductionWindowsAppChannel(options.appChannel)
+	)
 		throw new Error("Windows app channel requires validated production ownership before startup");
 	const log = options.log ?? (() => {});
-	const openApp = () => options.appChannel
-		? new AppChannel(options.appChannel, {
-				log,
-				...(options.approvalWaitMs ? { approvalWaitMs: options.approvalWaitMs } : {}),
-			})
-		: undefined;
+	const openApp = () =>
+		options.appChannel
+			? new AppChannel(options.appChannel, {
+					log,
+					...(options.approvalWaitMs ? { approvalWaitMs: options.approvalWaitMs } : {}),
+				})
+			: undefined;
 	// Observe Windows transport errors during asynchronous memory bootstrap.
 	// Unix retains its original channel-construction timing below.
 	const earlyWindowsApp = process.platform === "win32" ? openApp() : undefined;
@@ -224,12 +229,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DotDaemon> {
 	});
 	// The engine reaches every connector through the proxy (S25.4); its key changes with every launch.
 	let port = options.port;
-	const discordPackage = process.platform === "win32" && !options.connectorTransport
-		? new DiscordPackage(join(options.dataDir, "connector-packages")) : undefined;
+	const discordPackage =
+		process.platform === "win32" && !options.connectorTransport
+			? new DiscordPackage(join(options.dataDir, "connector-packages"))
+			: undefined;
 	const proxy = new McpProxy({
 		connector: (id) => {
 			const view = connectorStore.proxyView(id);
-			if (!view || !discordPackage || id !== "discord" || connectorStore.state().connectors[id]?.custom) return view;
+			if (!view || !discordPackage || id !== "discord" || connectorStore.state().connectors[id]?.custom)
+				return view;
 			const command = discordPackage.command();
 			return command
 				? { ...view, server: command, revision: `${view.revision}:${command.args[0]}` }
@@ -316,7 +324,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DotDaemon> {
 	});
 	const connectors = new ConnectorManager({
 		store: connectorStore,
-		...(discordPackage ? { prepareConnector: (_id: string, signal: AbortSignal) => discordPackage.prepare(signal) } : {}),
+		...(discordPackage
+			? { prepareConnector: (_id: string, signal: AbortSignal) => discordPackage.prepare(signal) }
+			: {}),
 		...(options.connectorOAuth ? { oauth: options.connectorOAuth } : {}),
 		...((options.importHome ?? process.env.GENTLE_DOT_IMPORT_HOME)
 			? { importHome: options.importHome ?? process.env.GENTLE_DOT_IMPORT_HOME }
@@ -419,8 +429,14 @@ export async function startDaemon(options: DaemonOptions): Promise<DotDaemon> {
 		let failed = false;
 		let firstError: unknown;
 		const attempt = async (cleanup: () => unknown) => {
-			try { await cleanup(); }
-			catch (error) { if (!failed) { failed = true; firstError = error; } }
+			try {
+				await cleanup();
+			} catch (error) {
+				if (!failed) {
+					failed = true;
+					firstError = error;
+				}
+			}
 		};
 		// Logical refusal and secret invalidation happen NOW, not after native drain.
 		// Start drain independently so a pending/failed channel cannot skip cleanup.
@@ -447,7 +463,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DotDaemon> {
 			// defer refusal, and do not recursively start another shutdown.
 			let resolveClose!: () => void;
 			let rejectClose!: (error: unknown) => void;
-			stopping = new Promise<void>((resolve, reject) => { resolveClose = resolve; rejectClose = reject; });
+			stopping = new Promise<void>((resolve, reject) => {
+				resolveClose = resolve;
+				rejectClose = reject;
+			});
 			void shutdown().then(resolveClose, rejectClose);
 			stopping.then(stopped, (error: Error) => {
 				log(`the assistant did not stop cleanly: ${error.message}`);

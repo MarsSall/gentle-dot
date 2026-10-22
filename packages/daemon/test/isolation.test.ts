@@ -27,9 +27,14 @@ describe("Windows isolation", () => {
 	it("isolates the OS home and Windows temp while preserving the real memory folder", () => {
 		const realHome = tempDir();
 		const data = tempDir();
-		const env = isolatedAgentEnv({ USERPROFILE: realHome, TEMP: "/user/temp", TMP: "/user/tmp" }, data, undefined, {
-			platform: "win32",
-		});
+		const env = isolatedAgentEnv(
+			{ USERPROFILE: realHome, TEMP: "/user/temp", TMP: "/user/tmp" },
+			data,
+			undefined,
+			{
+				platform: "win32",
+			},
+		);
 		expect(env.HOME).toBe(join(data, "home"));
 		expect(env.USERPROFILE).toBe(env.HOME);
 		expect(env.TEMP).toBe(join(data, "home", ".cache", "tmp"));

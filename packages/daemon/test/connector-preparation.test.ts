@@ -7,14 +7,20 @@ import { tempDir } from "./helpers.ts";
 
 it("waits for Discord preparation during configuration before enabling or reporting success", async () => {
 	const dataDir = tempDir();
-	const store = new ConnectorStore({ dataDir, agentHome: join(dataDir, "agent"), secrets: new MemorySecretSource() });
+	const store = new ConnectorStore({
+		dataDir,
+		agentHome: join(dataDir, "agent"),
+		secrets: new MemorySecretSource(),
+	});
 	await store.checkIntegrity();
 	await store.keepValues("discord", { token: "synthetic-discord-token" });
 	const messages: ServerPayload[] = [];
 	const restarts: boolean[] = [];
 	let started = false;
 	let release!: () => void;
-	const gate = new Promise<void>((resolve) => { release = resolve; });
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
 	const options = {
 		store,
 		prepareConnector: async (id: string, _signal: AbortSignal) => {
@@ -32,7 +38,9 @@ it("waits for Discord preparation during configuration before enabling or report
 		expect(store.state().connectors.discord?.enabled).not.toBe(true);
 		expect(restarts).not.toContain(true);
 		expect(messages.some((message) => message.type === "auth_done")).toBe(false);
-		expect(messages.some((message) => message.type === "auth_event" && message.event.kind === "progress")).toBe(true);
+		expect(
+			messages.some((message) => message.type === "auth_event" && message.event.kind === "progress"),
+		).toBe(true);
 		release();
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(store.state().connectors.discord?.enabled).toBe(true);

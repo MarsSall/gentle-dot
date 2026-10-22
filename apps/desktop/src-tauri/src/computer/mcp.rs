@@ -628,11 +628,15 @@ impl Helper {
     }
 
     fn screenshot(&self, latest: &mut Option<ScreenshotGeometry>) -> Result<Content, String> {
+        let before = self.desktop.frontmost_app().map(|app| app.pid);
         let capture = self.desktop.capture()?;
         let geometry = capture.geometry;
         *latest = Some(geometry);
         let front = self.desktop.frontmost_app();
-        *lock(&self.seen_front) = front.as_ref().map(|app| app.pid);
+        // The image shows the app in front before and after it was taken; one that changed while
+        // it was taken is not what the agent saw, so keys wait for the next screenshot.
+        let seen = front.as_ref().map(|app| app.pid).filter(|pid| before == Some(*pid));
+        *lock(&self.seen_front) = seen;
         let front = front.map(|app| app.name);
         let meta = json!({
             "imageWidth": geometry.image_width,
@@ -1377,6 +1381,24 @@ mod tests {
         assert!(first_text(&result).contains("Gentle Dot does not control Gentle Dot. The action was refused."), "{result}");
         assert!(first_text(&result).contains("Typing stopped after 20 of 45 characters."), "{result}");
         assert_eq!(rig.desktop.events(), vec![InputEvent::Text("a".repeat(20))]);
+    }
+
+    #[test]
+    fn a_switch_during_a_screenshot_is_not_taken_as_what_the_agent_saw() {
+        let rig = rig();
+        rig.ready();
+        // The image shows Safari; Mail comes to the front while it is taken.
+        *rig.desktop.front_during_capture.lock().unwrap() = Some(app(400, "com.apple.mail", "Mail"));
+        assert!(!is_error(&rig.call("screenshot", json!({}))));
+        let result = rig.call("type", json!({"text": "hello"}));
+        assert_eq!(
+            first_text(&result),
+            "Mail is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first."
+        );
+        assert!(rig.desktop.events().is_empty());
+        // A screenshot taken with Mail steady in front lets the keys through.
+        assert!(!is_error(&rig.call("screenshot", json!({}))));
+        assert!(!is_error(&rig.call("type", json!({"text": "hello"}))));
     }
 
     #[test]

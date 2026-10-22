@@ -137,12 +137,31 @@ pub fn hosted_page(executable: Option<&str>, title: &str) -> Option<&'static str
     (explorer && CREDENTIAL_MANAGER_TITLES.iter().any(|t| t.eq_ignore_ascii_case(title))).then_some("Credential Manager")
 }
 
+/// Whether the window in front stands for an app window being brought forward: the same process
+/// (`front_pid`, `pid`) and the same root owner (`front_owner`, `owner`, as addresses), as when the
+/// app shows its own dialog. A window that vanished reads as process 0 and owner 0, so two vanished
+/// windows never match (that would report an app in front with nothing there).
+pub fn fronts_same_app(front_pid: i32, pid: i32, front_owner: usize, owner: usize) -> bool {
+    front_pid != 0 && front_owner != 0 && front_pid == pid && front_owner == owner
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn window(pid: i32, title: &str) -> TopWindow {
         TopWindow { pid, title: title.into(), visible: true, cloaked: false, tool: false, app_window: false, owned: false }
+    }
+
+    #[test]
+    fn a_window_counts_as_in_front_only_with_a_real_process() {
+        // The window itself, or another window of its process under the same owner (its dialog).
+        assert!(fronts_same_app(7, 7, 100, 100));
+        assert!(!fronts_same_app(7, 8, 100, 100));
+        assert!(!fronts_same_app(7, 7, 100, 200));
+        // Both windows gone: no process (0) and no owner (0) on either side is not a match.
+        assert!(!fronts_same_app(0, 0, 0, 0));
+        assert!(!fronts_same_app(0, 0, 100, 100));
     }
 
     #[test]

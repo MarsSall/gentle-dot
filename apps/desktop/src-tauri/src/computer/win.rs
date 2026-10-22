@@ -24,7 +24,8 @@ use super::risk::{AxElement, Focus};
 use super::glow::Frame;
 use super::winaccess::{element, is_default, unreadable, UIA_BUTTON, UIA_WINDOW};
 use super::winapps::{
-    answers_to, app_pids, executable_target, hosted_page, request, shortcut_named, strip_ci, Request, TopWindow,
+    answers_to, app_pids, executable_target, fronts_same_app, hosted_page, request, shortcut_named, strip_ci, Request,
+    TopWindow,
 };
 use super::winput::{checks_typing_target, releases, send_batches, settles, steps, Step, VirtualScreen};
 use super::{AppInfo, Capture, InputEvent, KeyboardRecipient, MouseButton};
@@ -760,10 +761,14 @@ fn comes_to_front(hwnd: HWND) -> bool {
         // SAFETY: plain queries (a vanished window just reads as not in front).
         unsafe {
             let front = GetAncestor(GetForegroundWindow(), GA_ROOT);
-            front == hwnd
+            (!front.is_null() && front == hwnd)
                 || (!front.is_null()
-                    && window_pid(front) == window_pid(hwnd)
-                    && GetAncestor(front, GA_ROOTOWNER) == GetAncestor(hwnd, GA_ROOTOWNER))
+                    && fronts_same_app(
+                        window_pid(front),
+                        window_pid(hwnd),
+                        GetAncestor(front, GA_ROOTOWNER) as usize,
+                        GetAncestor(hwnd, GA_ROOTOWNER) as usize,
+                    ))
         }
     };
     for _ in 0..10 {

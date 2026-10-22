@@ -21,6 +21,8 @@ pub struct FakeDesktop {
     pub focused_app: Mutex<Option<AppIdentity>>,
     /// Changes the foreground app after this many recorded posts; disabled by default.
     pub front_after_posts: Mutex<Option<(usize, AppIdentity)>>,
+    /// What comes to the front while the next capture is taken (once).
+    pub front_during_capture: Mutex<Option<AppIdentity>>,
     pub focused_after_posts: Mutex<Option<(usize, AppIdentity)>>,
     /// One-shot hook after the initial keyboard guard, before input is posted.
     pub during_focused_element: Mutex<Option<Hook>>,
@@ -52,6 +54,7 @@ impl Default for FakeDesktop {
             frontmost: Mutex::new(Some(safari)),
             focused_app: Mutex::new(None),
             front_after_posts: Mutex::new(None),
+            front_during_capture: Mutex::new(None),
             focused_after_posts: Mutex::new(None),
             during_focused_element: Mutex::new(None),
             fail_post: Mutex::new(None),
@@ -81,6 +84,9 @@ impl Desktop for FakeDesktop {
 
     fn capture(&self) -> Result<Capture, String> {
         self.captures.fetch_add(1, Ordering::SeqCst);
+        if let Some(app) = self.front_during_capture.lock().unwrap().take() {
+            *self.frontmost.lock().unwrap() = Some(app);
+        }
         Ok(Capture { data: b"jpeg".to_vec(), mime_type: "image/jpeg", geometry: self.geometry })
     }
 

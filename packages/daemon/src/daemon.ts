@@ -236,7 +236,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DotDaemon> {
 	const proxy = new McpProxy({
 		connector: (id) => {
 			const view = connectorStore.proxyView(id);
-			if (!view || !discordPackage || id !== "discord" || connectorStore.state().connectors[id]?.custom)
+			// A connector that cannot run anyway (no app for its secret) keeps that reason: preparing
+			// Discord would not help, and its advice would hide the real cause.
+			if (
+				!view ||
+				view.unavailable ||
+				!discordPackage ||
+				id !== "discord" ||
+				connectorStore.state().connectors[id]?.custom
+			)
 				return view;
 			const command = discordPackage.command();
 			return command

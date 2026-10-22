@@ -112,7 +112,7 @@ describe("upload store", () => {
 			uploadId,
 		});
 		expect(over).toMatchObject({ ok: false, status: 413, code: "message_too_large" });
-		expect(listUploads(workspace)).toEqual([uploadId, `${uploadId}/a.bin`]);
+		expect(listUploads(workspace)).toEqual([uploadId, join(uploadId, "a.bin")]);
 		await uploads.receive(Readable.from(["x"]), { name: "c.bin", uploadId });
 		await uploads.receive(Readable.from(["x"]), { name: "d.bin", uploadId });
 		const fourth = await uploads.receive(Readable.from(["x"]), { name: "e.bin", uploadId });

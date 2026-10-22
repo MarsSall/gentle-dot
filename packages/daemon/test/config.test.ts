@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { agentSpawnEnv, bundledGentleShell, loadConfig } from "../src/config.ts";
 import { tempDir } from "./helpers.ts";
@@ -80,7 +80,9 @@ describe("loadConfig", () => {
 		});
 		expect(config.preferredFolder).toBeUndefined();
 		expect(config.agentArgs).toHaveLength(1);
-		expect(config.agentArgs[0]).toMatch(/node_modules\/gentle-pi\/bin\/gentle-shell\.mjs$/);
+		expect(config.agentArgs[0]?.endsWith(join("node_modules", "gentle-pi", "bin", "gentle-shell.mjs"))).toBe(
+			true,
+		);
 		expect(existsSync(config.agentArgs[0] ?? "")).toBe(true);
 	});
 
@@ -91,7 +93,9 @@ describe("loadConfig", () => {
 			agentArgs: [],
 			agentHome: join(dataDir, "agent"),
 		});
-		expect(loadConfig({ GENTLE_DOT_DATA_DIR: dataDir, GENTLE_DOT_AGENT_HOME: "/h" }).agentHome).toBe("/h");
+		expect(loadConfig({ GENTLE_DOT_DATA_DIR: dataDir, GENTLE_DOT_AGENT_HOME: "/h" }).agentHome).toBe(
+			resolve("/h"),
+		);
 	});
 
 	it("runs an explicit Gentle Shell script with Node and keeps its separate home", () => {
@@ -131,7 +135,7 @@ describe("loadConfig", () => {
 		writeFileSync(join(dataDir, "config.json"), JSON.stringify({ port: 5000, workspace: "/projects" }));
 		expect(loadConfig({ GENTLE_DOT_DATA_DIR: dataDir })).toMatchObject({
 			port: 5000,
-			preferredFolder: "/projects",
+			preferredFolder: resolve("/projects"),
 		});
 		expect(loadConfig({ GENTLE_DOT_DATA_DIR: dataDir, GENTLE_DOT_PORT: "6000" }).port).toBe(6000);
 	});
@@ -140,7 +144,10 @@ describe("loadConfig", () => {
 		const dataDir = tempDir();
 		const config = loadConfig({ GENTLE_DOT_DATA_DIR: dataDir, GENTLE_DOT_WORKSPACE: "/work/repo" });
 		// The workspace holds the memory project setting, so the engine always works there.
-		expect(config).toMatchObject({ workspace: join(dataDir, "workspace"), preferredFolder: "/work/repo" });
+		expect(config).toMatchObject({
+			workspace: join(dataDir, "workspace"),
+			preferredFolder: resolve("/work/repo"),
+		});
 		const same = loadConfig({
 			GENTLE_DOT_DATA_DIR: dataDir,
 			GENTLE_DOT_WORKSPACE: join(dataDir, "workspace"),

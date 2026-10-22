@@ -1,6 +1,7 @@
 import * as childProcess from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSupervisor } from "../src/supervisor.ts";
 import { FAKE_AGENT, fakeSupervisor, tempDir, waitFor } from "./helpers.ts";
@@ -229,7 +230,7 @@ describe("AgentSupervisor", () => {
 		let spawns = 0;
 		const { supervisor } = track(
 			fakeSupervisor({
-				args: ["--import", recorder, FAKE_AGENT],
+				args: ["--import", pathToFileURL(recorder).href, FAKE_AGENT],
 				prepareSpawn: () => {
 					spawns++;
 					return {};

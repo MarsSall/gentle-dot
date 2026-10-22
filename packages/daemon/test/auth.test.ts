@@ -1,5 +1,5 @@
 import { readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { ServerMessage } from "@gentle-dot/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
@@ -291,10 +291,10 @@ describe("createModelAuthRuntime (Pi's runtime, offline)", () => {
 describe("resolveAgentHome", () => {
 	it("belongs to the assistant: <dataDir>/agent unless overridden, never the user's Gentle Shell home", () => {
 		const dataDir = tempDir();
-		expect(resolveAgentHome({}, dataDir)).toBe(`${dataDir}/agent`);
+		expect(resolveAgentHome({}, dataDir)).toBe(join(dataDir, "agent"));
 		expect(resolveAgentHome({ GENTLE_SHELL_HOME: "/x", PI_CODING_AGENT_DIR: "/z" }, dataDir)).toBe(
-			`${dataDir}/agent`,
+			join(dataDir, "agent"),
 		);
-		expect(resolveAgentHome({ GENTLE_DOT_AGENT_HOME: "/y" }, dataDir)).toBe("/y");
+		expect(resolveAgentHome({ GENTLE_DOT_AGENT_HOME: "/y" }, dataDir)).toBe(resolve("/y"));
 	});
 });

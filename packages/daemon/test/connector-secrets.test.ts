@@ -4,11 +4,11 @@
 // refreshed tokens go there and to no file; without the app, connectors that need a secret fail
 // closed while the others keep working; and the secrets that files held before move there once.
 import {
-	chmodSync,
 	existsSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
@@ -590,15 +590,18 @@ describe("one-time migration into the app's store", () => {
 
 		const other = legacyInstall();
 		const unreadable = join(other.agentHome, "mcp-auth.json");
-		chmodSync(unreadable, 0o000);
-		const blocked = statSync(unreadable).mode;
+		// A directory cannot be read as a sign-in file on Linux, macOS, or Windows.
+		const saved = `${unreadable}.saved`;
+		renameSync(unreadable, saved);
+		mkdirSync(unreadable);
+		const before = readFileSync(saved, "utf8");
 		const second = storeWith(other.dataDir, new MemorySecretSource(), logs);
 		await second.migrate();
 		expect(await (await second.credentials("notion")).authProvider?.token()).toBe("notion-access");
 		expect((await second.credentials("discord")).env).toEqual({ DISCORD_TOKEN: TOKEN });
 		expect(existsSync(unreadable)).toBe(true);
-		expect(statSync(unreadable).mode).toBe(blocked);
-		chmodSync(unreadable, 0o600);
+		expect(statSync(unreadable).isDirectory()).toBe(true);
+		expect(readFileSync(saved, "utf8")).toBe(before);
 		expect(logs.join("\n")).not.toMatch(/notion-access|linear-access/);
 	});
 

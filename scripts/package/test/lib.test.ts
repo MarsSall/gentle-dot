@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { runtimePackageManifest } from "../../../packages/daemon/src/runtime-build.ts";
@@ -335,11 +335,17 @@ describe("Windows codemode compatibility", () => {
 	it("verifies the available installed 1.0.4 declarations in isolated state without starting an agent", () => {
 		const daemon = mkdtempSync(join(tmpdir(), "codemode-installed-check-"));
 		writeFileSync(join(daemon, "package.json"), JSON.stringify(runtimePackageManifest("win32")));
-		symlinkSync(
-			fileURLToPath(new URL("../../../packages/daemon/node_modules", import.meta.url)),
-			join(daemon, "node_modules"),
-			"junction",
-		);
+		// Link the packages the check reads, each by its real path. A link to the checkout's whole
+		// node_modules breaks on Windows: pnpm's package links there are relative, and Windows resolves
+		// them from the path they were reached by (the temp folder), not from where they live.
+		for (const name of ["@earendil-works/pi-coding-agent", "gentle-pi"]) {
+			const real = realpathSync(
+				fileURLToPath(new URL(`../../../packages/daemon/node_modules/${name}`, import.meta.url)),
+			);
+			const link = join(daemon, "node_modules", ...name.split("/"));
+			mkdirSync(dirname(link), { recursive: true });
+			symlinkSync(real, link, "junction");
+		}
 		expect(checkWindowsCodemodeCompatibility(daemon, process.execPath)).toEqual({
 			engine: "1.0.4",
 			mcp: "1.0.4",

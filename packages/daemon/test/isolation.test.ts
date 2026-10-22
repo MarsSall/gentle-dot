@@ -7,7 +7,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { type DotDaemon, startDaemon } from "../src/daemon.ts";
 import {
@@ -68,10 +68,11 @@ describe("Windows isolation", () => {
 
 describe("isolatedAgentEnv PATH", () => {
 	it("puts the bundled `pi` first so the engine's first-run setup works on a clean machine", () => {
-		const env = isolatedAgentEnv({ PATH: "/usr/bin:/bin", HOME: tempDir() }, tempDir());
-		const [first, ...rest] = (env.PATH ?? "").split(":");
-		expect(first).toMatch(/node_modules\/\.bin$/);
-		expect(existsSync(join(first ?? "", "pi"))).toBe(true);
+		const env = isolatedAgentEnv({ PATH: ["/usr/bin", "/bin"].join(delimiter), HOME: tempDir() }, tempDir());
+		const [first, ...rest] = (env.PATH ?? "").split(delimiter);
+		expect(first?.endsWith(join("node_modules", ".bin"))).toBe(true);
+		const shims = process.platform === "win32" ? ["pi", "pi.cmd", "pi.exe"] : ["pi"];
+		expect(shims.some((name) => existsSync(join(first ?? "", name)))).toBe(true);
 		expect(rest).toEqual(["/usr/bin", "/bin"]);
 	});
 
@@ -188,10 +189,12 @@ describe("isolatedAgentEnv temporary folder", () => {
 		expectPosixMode(statSync(env.TMPDIR ?? "").mode, 0o700);
 	});
 
-	it("keeps the user's own TMPDIR", () => {
-		expect(isolatedAgentEnv({ HOME: tempDir(), TMPDIR: "/var/tmp/me" }, tempDir()).TMPDIR).toBe(
-			"/var/tmp/me",
-		);
+	it("keeps the Unix user's own TMPDIR (Windows always isolates TEMP/TMP)", () => {
+		expect(
+			isolatedAgentEnv({ HOME: tempDir(), TMPDIR: "/var/tmp/me" }, tempDir(), undefined, {
+				platform: "linux",
+			}).TMPDIR,
+		).toBe("/var/tmp/me");
 	});
 });
 

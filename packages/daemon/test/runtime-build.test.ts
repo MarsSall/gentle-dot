@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 import { lockedDependencies, piWrapper, runtimePackageManifest } from "../src/runtime-build.ts";
 import { tempDir } from "./helpers.ts";
+import { WINDOWS_STOP_ADDON } from "./support/windows.ts";
 
 const PACKAGE = fileURLToPath(new URL("..", import.meta.url));
 const BUILD = join(PACKAGE, "scripts", "build-runtime.ts");
@@ -22,7 +23,14 @@ const ENGINE_CLI = join("@earendil-works", "pi-coding-agent", "dist", "bundle", 
 
 let out: string;
 
+// The real build stages the Windows stop addon, which is built with MSVC (build:windows-stop) and
+// is absent on CI runners; staging rightly refuses without it.
+const addonMissing =
+	process.platform === "win32" && !existsSync(join(PACKAGE, "native", "windows-stop.node"));
+if (addonMissing) console.info(`Windows-only test skip: ${WINDOWS_STOP_ADDON}`);
+
 beforeAll(() => {
+	if (addonMissing) return;
 	out = tempDir();
 	const build = spawnSync(process.execPath, [BUILD, "--out", out], { encoding: "utf8" });
 	expect(build.stderr).toBe("");
@@ -37,7 +45,7 @@ function listFiles(dir: string, prefix = ""): string[] {
 	);
 }
 
-describe("build:runtime", () => {
+describe.skipIf(addonMissing)("build:runtime", () => {
 	it("pins the Windows codemode edge to the engine's lockfile snapshot, not its npm range", () => {
 		const manifest = runtimePackageManifest("win32");
 		expect(manifest.dependencies).toEqual({

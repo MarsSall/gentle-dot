@@ -12,6 +12,7 @@ import {
 } from "../src/daemon.ts";
 import { HIDDEN_NAMES, presentText } from "../src/white-label.ts";
 import { FAKE_AGENT, tempDir, waitFor } from "./helpers.ts";
+import { expectPosixMode } from "./support/windows.ts";
 
 const daemons: DotDaemon[] = [];
 afterEach(async () => {
@@ -550,8 +551,8 @@ describe("own instance", () => {
 		writeFileSync(join(dataDir, "token"), `${"k".repeat(43)}\n`, { mode: 0o644 });
 		chmodSync(join(dataDir, "token"), 0o644);
 		expect(ensureToken(dataDir)).toBe("k".repeat(43));
-		expect(statSync(dataDir).mode & 0o777).toBe(0o700);
-		expect(statSync(join(dataDir, "token")).mode & 0o777).toBe(0o600);
+		expectPosixMode(statSync(dataDir).mode, 0o700);
+		expectPosixMode(statSync(join(dataDir, "token")).mode, 0o600);
 	});
 
 	it("shows the access key only on an interactive terminal", () => {

@@ -7,6 +7,7 @@ import { createModelAuthRuntime, resolveAgentHome } from "../src/auth.ts";
 import { type DotDaemon, startDaemon } from "../src/daemon.ts";
 import { fakeAuthRuntime } from "./fake-auth-runtime.ts";
 import { FAKE_AGENT, tempDir, waitFor } from "./helpers.ts";
+import { expectPosixMode } from "./support/windows.ts";
 
 const daemons: DotDaemon[] = [];
 afterEach(async () => {
@@ -252,7 +253,7 @@ describe("createModelAuthRuntime (Pi's runtime, offline)", () => {
 			await first.login("openai", "api_key", { prompt: async () => "sk-test-not-real", notify: () => {} });
 			const fresh = await createModelAuthRuntime(home, home);
 			expect(fresh.getProviderAuthStatus("openai")).toEqual({ configured: true, source: "stored" });
-			expect(statSync(join(home, "auth.json")).mode & 0o777).toBe(0o600);
+			expectPosixMode(statSync(join(home, "auth.json")).mode, 0o600);
 			await fresh.logout("openai");
 			expect((await createModelAuthRuntime(home, home)).getProviderAuthStatus("openai").configured).toBe(
 				false,

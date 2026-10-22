@@ -17,6 +17,7 @@ import {
 	PRIVATE_ENGRAM_PORT,
 } from "../src/isolation.ts";
 import { FAKE_AGENT, tempDir } from "./helpers.ts";
+import { expectPosixMode } from "./support/windows.ts";
 
 const daemons: DotDaemon[] = [];
 afterEach(async () => {
@@ -184,7 +185,7 @@ describe("isolatedAgentEnv temporary folder", () => {
 		const dataDir = tempDir();
 		const env = isolatedAgentEnv({ HOME: tempDir() }, dataDir);
 		expect(env.TMPDIR).toBe(join(dataDir, "home", ".cache", "tmp"));
-		expect(statSync(env.TMPDIR ?? "").mode & 0o777).toBe(0o700);
+		expectPosixMode(statSync(env.TMPDIR ?? "").mode, 0o700);
 	});
 
 	it("keeps the user's own TMPDIR", () => {

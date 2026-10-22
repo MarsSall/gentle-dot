@@ -1669,7 +1669,10 @@ mod packaged_runtime_tests {
         assert!(checked.status.success(), "Node rejected bundled entry: {}", String::from_utf8_lossy(&checked.stderr));
         assert!(checked.stdout.is_empty());
         assert!(checked.stderr.is_empty());
-        assert_eq!(spec, launch_spec(|_| None, false, Some(&runtime)));
+        // The same folder without the verbatim prefix. Not `runtime` itself: a temp folder given in
+        // its 8.3 short form (`RUNNER~1`, as on CI runners) comes back long from `canonicalize`.
+        let plain = PathBuf::from(&extended.to_str().unwrap()[r"\\?\".len()..]);
+        assert_eq!(spec, launch_spec(|_| None, false, Some(&plain)));
         assert!(!spec.program.starts_with(r"\\?\"));
         assert!(!spec.args[0].starts_with(r"\\?\"));
         for (name, value) in &spec.envs {

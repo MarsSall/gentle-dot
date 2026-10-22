@@ -839,7 +839,7 @@ impl Helper {
                 } else {
                     Act::Other
                 };
-                let action = format!("Press {}", combo.key);
+                let action = format!("Press {}", combo.label());
                 self.confirm_if_risky(assess(act, intent), &action, &target)?;
                 self.post(epoch, InputEvent::Key(combo))?;
                 (self.glow)(Mark::Key);
@@ -1308,6 +1308,14 @@ mod tests {
         let result = rig.call("key", json!({"combo": "tab"}));
         assert!(first_text(&result).contains("Accessibility"), "{result}");
         assert_eq!(rig.dialogs.grants.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_key_result_names_the_whole_combo() {
+        let rig = rig();
+        rig.ready();
+        assert_eq!(first_text(&rig.call("key", json!({"combo": "ctrl+a"}))), "Press ctrl+a in Safari: done.");
+        assert_eq!(first_text(&rig.call("key", json!({"combo": "tab"}))), "Press tab in Safari: done.");
     }
 
     #[test]

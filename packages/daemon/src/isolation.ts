@@ -279,6 +279,15 @@ function memoryHealth(port: string): Promise<{ instance_id?: unknown } | undefin
 		.catch(() => undefined);
 }
 
+/**
+ * How long the listener lookup may take. Windows starts PowerShell and queries CIM, which can take
+ * several seconds on a busy machine (startup, many processes); a lookup that runs out is a failed
+ * lookup, and private memory then refuses to start.
+ */
+export function listenerLookupTimeoutMs(platform: NodeJS.Platform): number {
+	return platform === "win32" ? 15_000 : 5000;
+}
+
 function runListenerCommand(
 	command: string,
 	args: readonly string[],
@@ -287,7 +296,11 @@ function runListenerCommand(
 		execFile(
 			command,
 			[...args],
-			{ encoding: "utf8", timeout: 5000, windowsHide: true },
+			{
+				encoding: "utf8",
+				timeout: listenerLookupTimeoutMs(command === "powershell.exe" ? "win32" : process.platform),
+				windowsHide: true,
+			},
 			(error, stdout, stderr) => {
 				resolve({
 					code: error ? (typeof error.code === "number" ? error.code : -1) : 0,

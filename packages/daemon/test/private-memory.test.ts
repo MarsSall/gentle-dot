@@ -8,7 +8,7 @@ import { createServer } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startDaemon } from "../src/daemon.ts";
-import { privateMemory } from "../src/isolation.ts";
+import { listenerLookupTimeoutMs, privateMemory } from "../src/isolation.ts";
 import { FAKE_AGENT, tempDir, waitFor } from "./helpers.ts";
 
 const hasLsof = (() => {
@@ -98,6 +98,14 @@ describe.skipIf(!hasLsof)("private memory server (A4)", () => {
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		expect(running(already)).toBe(true);
 		expect(running(foreign)).toBe(true);
+	});
+});
+
+describe("private memory listener lookup", () => {
+	it("gives Windows' PowerShell lookup time to start on a busy machine, and lsof the usual bound", () => {
+		expect(listenerLookupTimeoutMs("win32")).toBe(15_000);
+		expect(listenerLookupTimeoutMs("linux")).toBe(5000);
+		expect(listenerLookupTimeoutMs("darwin")).toBe(5000);
 	});
 });
 

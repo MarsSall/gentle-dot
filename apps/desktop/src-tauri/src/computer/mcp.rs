@@ -25,7 +25,7 @@ use super::keys::{parse_combo, KeyCombo};
 use super::rate::{RateLimiter, MAX_ACTIONS_PER_SECOND};
 use super::risk::{assess, Act};
 use super::working::{NoPreparation, Preparation};
-use super::{Clock, Desktop, Dialogs, InputEvent, MouseButton};
+use super::{Clock, Desktop, Dialogs, InputEvent, KeyboardRecipient, MouseButton};
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -573,7 +573,7 @@ impl Helper {
 
     /// The frontmost app and the app owning the focused element (they differ for a
     /// non-activating panel), each refused when blocked. The one receiving the keys, for messages.
-    fn keyboard_target(&self) -> Result<String, String> {
+    fn keyboard_target(&self) -> Result<(String, KeyboardRecipient), String> {
         let front = self.desktop.frontmost_app().ok_or("Cannot tell which app is in front.")?;
         self.refuse_blocked(&front)?;
         // The user may have switched apps since the agent last looked: it looks again first.
@@ -583,10 +583,12 @@ impl Helper {
                 front.name
             ));
         }
-        match self.desktop.focused_app().filter(|focused| focused.pid != front.pid) {
-            Some(focused) => self.refuse_blocked(&focused).map(|()| focused.name),
-            None => Ok(front.name),
+        let focused = self.desktop.focused_app().filter(|focused| focused.pid != front.pid);
+        if let Some(focused) = &focused {
+            self.refuse_blocked(focused)?;
         }
+        let recipient = KeyboardRecipient { front_pid: front.pid, focused_pid: focused.as_ref().map(|app| app.pid) };
+        Ok((focused.map_or(front.name, |app| app.name), recipient))
     }
 
     fn confirm_if_risky(&self, risk: Option<String>, action: &str, target: &str) -> Result<(), String> {
@@ -788,18 +790,37 @@ impl Helper {
                 Ok((format!("{action}: done."), SETTLE_MS))
             }
             Tool::Type { text: typed } => {
-                let target = self.keyboard_target()?;
+                let (target, recipient) = self.keyboard_target()?;
                 let typed = typed.replace("\r\n", "\n").replace('\r', "\n");
                 let focus = self.desktop.focused_element();
                 let action = format!("Type {} characters", typed.chars().count());
                 self.confirm_if_risky(assess(Act::Type(&typed, focus.as_ref()), intent), &action, &target)?;
                 let return_key = parse_combo("return")?;
+                let total = typed.chars().count();
+                let mut posted = 0;
+                let mut post_typed = |event, characters| -> Result<(), String> {
+                    self.keyboard_target().and_then(|(_, current)| {
+                        if current != recipient {
+                            Err("The app receiving the keys changed while typing, so the rest was not sent.".into())
+                        } else {
+                            Ok(())
+                        }
+                    }).map_err(|error| {
+                        format!("{error} Typing stopped after {posted} of {total} characters.")
+                    })?;
+                    self.still_running(epoch).and_then(|()| self.desktop.post_typed(&event, &recipient)).map_err(|error| {
+                        format!("{error} Typing stopped within characters {}-{} of {total}.", posted + 1, posted + characters)
+                    })?;
+                    posted += characters;
+                    Ok(())
+                };
                 for (i, line) in typed.split('\n').enumerate() {
                     if i > 0 {
-                        self.post(epoch, InputEvent::Key(return_key))?;
+                        post_typed(InputEvent::Key(return_key), 1)?;
                     }
                     for chunk in chunks(line) {
-                        self.post(epoch, InputEvent::Text(chunk))?;
+                        let characters = chunk.chars().count();
+                        post_typed(InputEvent::Text(chunk), characters)?;
                     }
                 }
                 // The glow marks posted input only; an empty text posts none.
@@ -809,7 +830,7 @@ impl Helper {
                 Ok((format!("{action} in {target}: done."), SETTLE_MS))
             }
             Tool::Key { combo } => {
-                let target = self.keyboard_target()?;
+                let (target, _) = self.keyboard_target()?;
                 let focus = self.desktop.focused_element();
                 let act = if combo.is_return() {
                     Act::Return(focus.as_ref())
@@ -1335,6 +1356,137 @@ mod tests {
         *rig.desktop.owner_at.lock().unwrap() =
             Box::new(|_| Some(AppIdentity { pid: OWN_PID, bundle_id: None, name: "gentle-dot".into() }));
         assert!(is_error(&rig.call("click", json!({"x": 10, "y": 10}))));
+    }
+
+    #[test]
+    fn typing_stops_between_chunks_when_gentle_dot_comes_to_front() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.front_after_posts.lock().unwrap() = Some((1,
+            AppIdentity { pid: OWN_PID, bundle_id: None, name: "gentle-dot".into() }));
+        let result = rig.call("type", json!({"text": "a".repeat(45)}));
+        assert!(is_error(&result), "{result}");
+        assert!(first_text(&result).contains("Gentle Dot does not control Gentle Dot. The action was refused."), "{result}");
+        assert!(first_text(&result).contains("Typing stopped after 20 of 45 characters."), "{result}");
+        assert_eq!(rig.desktop.events(), vec![InputEvent::Text("a".repeat(20))]);
+    }
+
+    #[test]
+    fn typing_stops_between_chunks_when_another_app_comes_to_front() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.front_after_posts.lock().unwrap() = Some((1, app(400, "com.apple.mail", "Mail")));
+        let result = rig.call("type", json!({"text": "a".repeat(45)}));
+        assert!(is_error(&result), "{result}");
+        assert!(first_text(&result).contains("Mail is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first."), "{result}");
+        assert!(first_text(&result).contains("Typing stopped after 20 of 45 characters."), "{result}");
+        assert_eq!(rig.desktop.events(), vec![InputEvent::Text("a".repeat(20))]);
+    }
+
+    #[test]
+    fn typing_rechecks_before_return_and_counts_unicode_characters() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.front_after_posts.lock().unwrap() = Some((1, app(400, "com.apple.mail", "Mail")));
+        let result = rig.call("type", json!({"text": "🦀é\nsecond"}));
+        assert!(is_error(&result), "{result}");
+        assert_eq!(first_text(&result), "Mail is in front now, not the app of the latest screenshot, so nothing was sent. Take a screenshot first. Typing stopped after 2 of 9 characters.");
+        assert_eq!(rig.desktop.events(), vec![InputEvent::Text("🦀é".into())]);
+    }
+
+    #[test]
+    fn typing_rechecks_after_a_leading_return_and_keeps_the_blocked_app_refusal() {
+        let rig = rig();
+        rig.ready();
+        *rig.desktop.front_after_posts.lock().unwrap() = Some((1, app(302, KEYCHAIN.0, KEYCHAIN.1)));
+        let result = rig.call("type", json!({"text": "\r\nnext"}));
+        assert!(is_error(&result), "{result}");
+        assert_eq!(first_text(&result), format!("Gentle Dot does not control {}. The action was refused. Typing stopped after 1 of 5 characters.", KEYCHAIN.1));
+        assert_eq!(rig.desktop.events(), vec![InputEvent::Key(parse_combo("return").unwrap())]);
+    }
+
+    #[test]
+    fn typing_stops_when_an_unblocked_focused_recipient_changes() {
+        // Both replacing an existing recipient and moving focus away from the front app.
+        for initial in [None, Some(app(401, "editor.exe", "Editor"))] {
+            let rig = rig();
+            rig.ready();
+            *rig.desktop.focused_app.lock().unwrap() = initial;
+            *rig.desktop.focused_after_posts.lock().unwrap() = Some((1, app(402, "panel.exe", "Panel")));
+            let result = rig.call("type", json!({"text": "a".repeat(45)}));
+            assert!(is_error(&result), "{result}");
+            assert_eq!(first_text(&result), "The app receiving the keys changed while typing, so the rest was not sent. Typing stopped after 20 of 45 characters.");
+            assert_eq!(rig.desktop.events(), vec![InputEvent::Text("a".repeat(20))]);
+        }
+    }
+
+    #[test]
+    fn typing_rechecks_front_and_recipient_before_the_first_post() {
+        for change_front in [true, false] {
+            let rig = rig();
+            rig.ready();
+            let desktop = rig.desktop.clone();
+            *rig.desktop.during_focused_element.lock().unwrap() = Some(Box::new(move || {
+                let changed = Some(app(402, "panel.exe", "Panel"));
+                if change_front {
+                    *desktop.frontmost.lock().unwrap() = changed;
+                } else {
+                    *desktop.focused_app.lock().unwrap() = changed;
+                }
+            }));
+            let result = rig.call("type", json!({"text": "hello"}));
+            assert!(is_error(&result), "{result}");
+            assert!(first_text(&result).ends_with("Typing stopped after 0 of 5 characters."), "{result}");
+            assert!(rig.desktop.events().is_empty());
+        }
+    }
+
+    #[test]
+    fn typing_post_failures_keep_the_error_and_report_the_uncertain_character_range() {
+        for (text, failed_post, expected, sent) in [
+            ("a".repeat(45), 2, "Typing stopped within characters 21-40 of 45.", vec![InputEvent::Text("a".repeat(20))]),
+            ("🦀é".into(), 1, "Typing stopped within characters 1-2 of 2.", vec![]),
+            ("a\nnext".into(), 2, "Typing stopped within characters 2-2 of 6.", vec![InputEvent::Text("a".into())]),
+        ] {
+            let rig = rig();
+            rig.ready();
+            *rig.desktop.fail_post.lock().unwrap() = Some((failed_post, "Native input failed.".into()));
+            let result = rig.call("type", json!({"text": text}));
+            assert!(is_error(&result), "{result}");
+            assert_eq!(first_text(&result), format!("Native input failed. {expected}"));
+            assert_eq!(rig.desktop.events(), sent);
+        }
+    }
+
+    #[test]
+    fn typing_binds_every_chunk_and_return_to_the_original_approval() {
+        for focused_pid in [None, Some(401)] {
+            let rig = rig();
+            rig.ready();
+            *rig.desktop.focused_app.lock().unwrap() = focused_pid.map(|pid| app(pid, "editor.exe", "Editor"));
+            let result = rig.call("type", json!({"text": format!("{}\nend", "a".repeat(45))}));
+            assert!(!is_error(&result), "{result}");
+            let recipient = KeyboardRecipient { front_pid: 200, focused_pid };
+            let events = rig.desktop.events();
+            assert_eq!(events.len(), 5);
+            assert_eq!(*rig.desktop.typed_posts.lock().unwrap(),
+                events.into_iter().map(|event| (event, recipient)).collect::<Vec<_>>());
+            let before = rig.desktop.typed_posts.lock().unwrap().len();
+            assert!(!is_error(&rig.call("key", json!({"combo": "tab"}))));
+            assert_eq!(rig.desktop.typed_posts.lock().unwrap().len(), before);
+        }
+    }
+
+    #[test]
+    fn typing_with_unchanged_front_posts_all_chunks() {
+        let rig = rig();
+        rig.ready();
+        let result = rig.call("type", json!({"text": "a".repeat(45)}));
+        assert!(!is_error(&result), "{result}");
+        assert!(first_text(&result).contains("Type 45 characters in Safari: done."), "{result}");
+        assert_eq!(rig.desktop.events(), vec![
+            InputEvent::Text("a".repeat(20)), InputEvent::Text("a".repeat(20)), InputEvent::Text("a".repeat(5)),
+        ]);
     }
 
     #[test]

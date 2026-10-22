@@ -123,11 +123,34 @@ fn wheel(horizontal: bool, pixels: i32) -> Option<Step> {
     Some(Step::Wheel { horizontal, delta: if horizontal { delta } else { -delta } })
 }
 
+/// Re-check the recipient before each character's first key-down (S5), not between surrogate
+/// halves. Releases must still go through, and combos may change the foreground on purpose.
+pub fn checks_typing_target(step: &Step) -> bool {
+    matches!(step, Step::Unicode { unit, down: true } if !(0xDC00..=0xDFFF).contains(unit))
+}
+
 /// Whether the helper waits after `step` until the window in front handles its input (S4): after
 /// every key release. Input queued while that window's thread stalls reaches it as other
 /// characters, or not at all.
 pub fn settles(step: &Step) -> bool {
     matches!(step, Step::Key { down: false, .. } | Step::Unicode { down: false, .. })
+}
+
+/// A surrogate pair's down/up/down/up is one SendInput batch, with no wait between halves.
+/// Every other step stays separate, preserving BMP, combo, and mouse timing.
+pub fn send_batches(mut plan: &[Step]) -> Vec<&[Step]> {
+    let mut batches = Vec::new();
+    while !plan.is_empty() {
+        let paired = matches!(plan,
+            [Step::Unicode { unit: high, down: true }, Step::Unicode { unit: high_up, down: false },
+             Step::Unicode { unit: low, down: true }, Step::Unicode { unit: low_up, down: false }, ..]
+                if (0xD800..=0xDBFF).contains(high) && high == high_up
+                    && (0xDC00..=0xDFFF).contains(low) && low == low_up);
+        let count = if paired { 4 } else { 1 };
+        batches.push(&plan[..count]);
+        plan = &plan[count..];
+    }
+    batches
 }
 
 /// What releases every key and button `sent` left pressed, latest first: posted when an input
@@ -217,6 +240,45 @@ mod tests {
 
     fn plan(event: InputEvent) -> Vec<Step> {
         steps(&event, &SCREEN).unwrap()
+    }
+
+    #[test]
+    fn surrogate_pairs_are_one_send_batch_and_other_steps_stay_separate() {
+        let text = plan(InputEvent::Text("a🦀éb".into()));
+        let batches = send_batches(&text);
+        assert_eq!(batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(), [1, 1, 4, 1, 1, 1, 1]);
+        assert_eq!(batches[2], &text[2..6]);
+        assert!(checks_typing_target(&batches[2][0]));
+        assert!(settles(batches[2].last().unwrap()));
+        assert!(releases(batches[2]).is_empty());
+        // A partial SendInput result must still release whichever half was pressed.
+        for count in [1, 3] {
+            assert_eq!(releases(&batches[2][..count]).len(), 1);
+        }
+        for event in [
+            InputEvent::Key(parse_combo("alt+tab").unwrap()),
+            InputEvent::Click { at: at(0.0, 0.0), button: MouseButton::Left, count: 1 },
+            InputEvent::Scroll { at: at(0.0, 0.0), dx: 50, dy: 50 },
+        ] {
+            let planned = plan(event);
+            assert!(send_batches(&planned).iter().all(|batch| batch.len() == 1));
+        }
+    }
+
+    #[test]
+    fn only_character_start_key_downs_recheck_the_typing_target() {
+        assert_eq!(
+            plan(InputEvent::Text("a🦀".into())).iter().map(checks_typing_target).collect::<Vec<_>>(),
+            [true, false, true, false, false, false]
+        );
+        for event in [
+            InputEvent::Key(parse_combo("alt+tab").unwrap()),
+            InputEvent::Click { at: at(0.0, 0.0), button: MouseButton::Left, count: 1 },
+            InputEvent::Drag { from: at(0.0, 0.0), to: at(10.0, 10.0) },
+            InputEvent::Scroll { at: at(0.0, 0.0), dx: 50, dy: 50 },
+        ] {
+            assert!(plan(event).iter().all(|step| !checks_typing_target(step)));
+        }
     }
 
     #[test]

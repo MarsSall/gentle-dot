@@ -26,8 +26,8 @@ use super::winaccess::{element, is_default, unreadable, UIA_BUTTON, UIA_WINDOW};
 use super::winapps::{
     answers_to, app_pids, executable_target, hosted_page, request, shortcut_named, strip_ci, Request, TopWindow,
 };
-use super::winput::{releases, settles, steps, Step, VirtualScreen};
-use super::{AppInfo, Capture, InputEvent, MouseButton};
+use super::winput::{checks_typing_target, releases, send_batches, settles, steps, Step, VirtualScreen};
+use super::{AppInfo, Capture, InputEvent, KeyboardRecipient, MouseButton};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
@@ -161,14 +161,19 @@ fn input(step: Step) -> INPUT {
     }
 }
 
-fn send(step: Step) -> Result<(), String> {
-    let record = input(step);
-    // SAFETY: one valid INPUT record of the size passed.
-    if unsafe { SendInput(1, &record, size_of::<INPUT>() as i32) } == 1 {
+fn send_batch(batch: &[Step]) -> Result<(), (usize, String)> {
+    let records: Vec<INPUT> = batch.iter().copied().map(input).collect();
+    // SAFETY: a contiguous array of valid INPUT records of the size passed.
+    let sent = unsafe { SendInput(records.len() as u32, records.as_ptr(), size_of::<INPUT>() as i32) } as usize;
+    if sent == records.len() {
         Ok(())
     } else {
-        Err(format!("Windows refused the input: {}", std::io::Error::last_os_error()))
+        Err((sent, format!("Windows refused the input: {}", std::io::Error::last_os_error())))
     }
+}
+
+fn send(step: Step) -> Result<(), String> {
+    send_batch(&[step]).map_err(|(_, error)| error)
 }
 
 /// Waits until the thread of the window in front handles messages again (S4). Keys queued while
@@ -192,18 +197,82 @@ fn catch_up() -> Result<(), String> {
     Ok(())
 }
 
-/// Posts `event`, one input at a time with a short gap, like the macOS helper, waiting after each
-/// key release for the window in front to take it. When an input fails halfway, whatever it left
-/// pressed is released before the error is reported.
+/// The foreground root and the foreground thread's actual keyboard recipient. A failed query
+/// is not a stable target, even when a later query also fails.
+fn typing_windows() -> Option<(HWND, HWND)> {
+    // SAFETY: plain queries; `info` is a valid out-pointer with its size set.
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.is_null() {
+            return None;
+        }
+        let root = GetAncestor(foreground, GA_ROOT);
+        let thread = GetWindowThreadProcessId(foreground, null_mut());
+        let mut info: GUITHREADINFO = zeroed();
+        info.cbSize = size_of::<GUITHREADINFO>() as u32;
+        if root.is_null() || thread == 0 || GetGUIThreadInfo(thread, &mut info) == 0 {
+            return None;
+        }
+        Some((root, info.hwndFocus))
+    }
+}
+
+/// Posts `event` with a short gap between steps (surrogate pairs form one batch), waiting after
+/// key releases or a complete pair for the window in front to take it. A failure releases the
+/// keys and buttons left pressed by the successfully sent prefix before reporting the error.
 pub fn post(event: &InputEvent) -> Result<(), String> {
+    post_input(event, None)
+}
+
+fn post_input(event: &InputEvent, approved: Option<&KeyboardRecipient>) -> Result<(), String> {
+    const CHANGED: &str = "The app receiving the keys changed while typing, so the rest was not sent.";
+    // Bind both type chunks and their Returns. Standalone combos remain free to switch apps.
+    let typing_target = (approved.is_some() || matches!(event, InputEvent::Text(_))).then(typing_windows);
+    if let Some(approved) = approved {
+        // The identities the shared guard approved, computed as it does (`frontmost_app` is
+        // `target_of` the foreground root; a hosted app's frame belongs to its host process, so
+        // raw window owners would never match). The front comes from the pinned root itself;
+        // `focused_app` is a global query, so the windows are pinned again after it and must not
+        // have moved in between.
+        let valid = typing_target.flatten().is_some_and(|(root, focus)| {
+            let front = target_of(root).pid;
+            let focused = focused_app().map(|app| app.pid).filter(|pid| *pid != front);
+            // The pinned focus window itself must belong to an approved process (the root's own,
+            // the front app's, or the approved focused one): the global query above could have
+            // seen the focus for a moment elsewhere.
+            let owner = window_pid(focus);
+            let owned = owner == window_pid(root) || owner == front || Some(owner) == approved.focused_pid;
+            !focus.is_null()
+                && owned
+                && front == approved.front_pid
+                && focused == approved.focused_pid
+                && typing_windows() == Some((root, focus))
+        });
+        if !valid {
+            return Err(CHANGED.into());
+        }
+    }
     let plan = steps(event, &virtual_screen())?;
-    for (done, step) in plan.iter().enumerate() {
-        // The steps that reached Windows when this one fails: the step itself once it was sent.
-        let failed = match send(*step) {
-            Err(error) => Some((done, error)),
-            Ok(()) => {
-                std::thread::sleep(EVENT_GAP);
-                if settles(step) { catch_up().err().map(|error| (done + 1, error)) } else { None }
+    let mut done = 0;
+    for batch in send_batches(&plan) {
+        let checked = checks_typing_target(&batch[0])
+            || (approved.is_some() && matches!(batch[0], Step::Key { down: true, .. }));
+        let changed = checked
+            && typing_target.is_some_and(|target| target.is_none() || typing_windows() != target);
+        let failed = if changed {
+            Some((done, CHANGED.to_string()))
+        } else {
+            match send_batch(batch) {
+                Err((sent, error)) => Some((done + sent, error)),
+                Ok(()) => {
+                    // No sleep or catch_up inside a surrogate pair's single SendInput call.
+                    std::thread::sleep(EVENT_GAP);
+                    if settles(batch.last().unwrap()) {
+                        catch_up().err().map(|error| (done + batch.len(), error))
+                    } else {
+                        None
+                    }
+                }
             }
         };
         if let Some((sent, error)) = failed {
@@ -212,6 +281,7 @@ pub fn post(event: &InputEvent) -> Result<(), String> {
             }
             return Err(error);
         }
+        done += batch.len();
     }
     Ok(())
 }
@@ -1269,6 +1339,10 @@ impl super::Desktop for WinDesktop {
 
     fn post(&self, event: &InputEvent) -> Result<(), String> {
         post(event)
+    }
+
+    fn post_typed(&self, event: &InputEvent, recipient: &KeyboardRecipient) -> Result<(), String> {
+        post_input(event, Some(recipient))
     }
 
     fn list_apps(&self) -> Result<Vec<AppInfo>, String> {

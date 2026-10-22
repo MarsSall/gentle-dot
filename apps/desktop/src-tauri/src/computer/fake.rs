@@ -3,7 +3,7 @@
 use super::blocklist::AppIdentity;
 use super::coords::{Point, ScreenshotGeometry};
 use super::risk::{AxElement, Focus};
-use super::{AppInfo, Capture, Clock, Desktop, Dialogs, InputEvent, Permissions};
+use super::{AppInfo, Capture, Clock, Desktop, Dialogs, InputEvent, KeyboardRecipient, Permissions};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -15,9 +15,17 @@ type OwnerAt = Box<dyn Fn(Point) -> Option<AppIdentity> + Send + Sync>;
 
 pub struct FakeDesktop {
     pub events: Mutex<Vec<InputEvent>>,
+    pub typed_posts: Mutex<Vec<(InputEvent, KeyboardRecipient)>>,
     pub permissions: Mutex<Permissions>,
     pub frontmost: Mutex<Option<AppIdentity>>,
     pub focused_app: Mutex<Option<AppIdentity>>,
+    /// Changes the foreground app after this many recorded posts; disabled by default.
+    pub front_after_posts: Mutex<Option<(usize, AppIdentity)>>,
+    pub focused_after_posts: Mutex<Option<(usize, AppIdentity)>>,
+    /// One-shot hook after the initial keyboard guard, before input is posted.
+    pub during_focused_element: Mutex<Option<Hook>>,
+    /// Refuse the Nth post before recording it.
+    pub fail_post: Mutex<Option<(usize, String)>>,
     pub owner_at: Mutex<OwnerAt>,
     pub elements: Mutex<Vec<AxElement>>,
     pub focus: Mutex<Option<Focus>>,
@@ -39,9 +47,14 @@ impl Default for FakeDesktop {
         let owner = safari.clone();
         FakeDesktop {
             events: Mutex::new(Vec::new()),
+            typed_posts: Mutex::new(Vec::new()),
             permissions: Mutex::new(Permissions { accessibility: true, screen_recording: true, screenshots_supported: true }),
             frontmost: Mutex::new(Some(safari)),
             focused_app: Mutex::new(None),
+            front_after_posts: Mutex::new(None),
+            focused_after_posts: Mutex::new(None),
+            during_focused_element: Mutex::new(None),
+            fail_post: Mutex::new(None),
             owner_at: Mutex::new(Box::new(move |_| Some(owner.clone()))),
             elements: Mutex::new(Vec::new()),
             focus: Mutex::new(None),
@@ -72,8 +85,32 @@ impl Desktop for FakeDesktop {
     }
 
     fn post(&self, event: &InputEvent) -> Result<(), String> {
-        self.events.lock().unwrap().push(event.clone());
+        let count = {
+            let mut events = self.events.lock().unwrap();
+            if let Some((post, error)) = self.fail_post.lock().unwrap().as_ref() {
+                if events.len() + 1 == *post {
+                    return Err(error.clone());
+                }
+            }
+            events.push(event.clone());
+            events.len()
+        };
+        if let Some((posts, app)) = self.front_after_posts.lock().unwrap().as_ref() {
+            if count == *posts {
+                *self.frontmost.lock().unwrap() = Some(app.clone());
+            }
+        }
+        if let Some((posts, app)) = self.focused_after_posts.lock().unwrap().as_ref() {
+            if count == *posts {
+                *self.focused_app.lock().unwrap() = Some(app.clone());
+            }
+        }
         Ok(())
+    }
+
+    fn post_typed(&self, event: &InputEvent, recipient: &KeyboardRecipient) -> Result<(), String> {
+        self.typed_posts.lock().unwrap().push((event.clone(), *recipient));
+        self.post(event)
     }
 
     fn list_apps(&self) -> Result<Vec<AppInfo>, String> {
@@ -93,6 +130,10 @@ impl Desktop for FakeDesktop {
     }
 
     fn focused_element(&self) -> Option<Focus> {
+        let during = self.during_focused_element.lock().unwrap().take();
+        if let Some(during) = during {
+            during();
+        }
         self.focus.lock().unwrap().clone()
     }
 

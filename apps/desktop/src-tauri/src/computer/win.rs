@@ -61,7 +61,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ShowWindow, WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GA_ROOTOWNER, GUITHREADINFO, GWL_EXSTYLE, GW_OWNER,
     ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SW_RESTORE, SW_SHOWNORMAL, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-    SetWindowLongPtrW, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
+    SetWindowLongPtrW, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
     SetWindowPos,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -1234,6 +1234,12 @@ pub fn show_without_activating(hwnd: *mut c_void) {
 pub fn hide_window(hwnd: *mut c_void) {
     // SAFETY: a plain call on a window of this process.
     unsafe { ShowWindow(hwnd, SW_HIDE) };
+}
+
+/// Shows one of this process's windows as the user asked, activating it like tao's own show.
+pub fn show_window(hwnd: *mut c_void) {
+    // SAFETY: a plain call on a window of this process.
+    unsafe { ShowWindow(hwnd, SW_SHOW) };
 }
 
 /// Moves the glow over a display, without activating it.

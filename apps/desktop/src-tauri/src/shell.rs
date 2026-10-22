@@ -256,7 +256,10 @@ fn hide_panel(app: AppHandle) -> CommandResult {
             *shell.panel_spot.lock().unwrap() = Some((rect.x, rect.y));
         }
     }
-    panel.hide().map_err(err)
+    panel.hide().map_err(err)?;
+    #[cfg(windows)]
+    computer::set_shown(&panel, false)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -276,6 +279,8 @@ fn set_rose_hidden(app: AppHandle, hidden: bool) -> CommandResult<bool> {
     } else {
         dot.show().map_err(err)?;
     }
+    #[cfg(windows)]
+    computer::set_shown(&dot, !hidden)?;
     if let Some(item) = app.try_state::<RoseMenuItem>() {
         item.0.set_text(rose_menu_label(hidden)).map_err(err)?;
     }
@@ -490,6 +495,8 @@ fn show_panel(app: &AppHandle) -> CommandResult {
     place_panel(app)?;
     let panel = window(app, PANEL)?;
     panel.show().map_err(err)?;
+    #[cfg(windows)]
+    computer::set_shown(&panel, true)?;
     panel.set_focus().map_err(err)?;
     app.emit("dot://panel-shown", ()).map_err(err)
 }

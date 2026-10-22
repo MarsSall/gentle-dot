@@ -128,6 +128,21 @@ pub fn hide_for_call(window: &tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+/// Shows or hides the Dot or the panel as the user asked, after tao's own show or hide. During a
+/// call they are hidden behind tao's back (`hide_for_call`), so tao's flag can disagree with the
+/// screen, and then tao does nothing: opening the panel mid-call would not show it, and its focus
+/// call could activate the hidden window.
+#[cfg(windows)]
+pub fn set_shown(window: &tauri::WebviewWindow, shown: bool) -> Result<(), String> {
+    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    if shown {
+        super::win::show_window(hwnd.0);
+    } else {
+        super::win::hide_window(hwnd.0);
+    }
+    Ok(())
+}
+
 impl Computer {
     /// The helper's address and key for this launch, registered with the daemon over the app's
     /// channel (S24.7, L61); `None` off macOS and Windows, or when the helper did not start.

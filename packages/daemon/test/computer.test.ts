@@ -140,7 +140,13 @@ describe("computer control registration (S24.7)", () => {
 		await new Promise((resolve) => setTimeout(resolve, 1300));
 		expect(logs.filter((line) => line.includes("put back"))).toEqual([]);
 		expect(messages.filter((m) => m.type === "toast")).toEqual([]);
-		expect(existsSync(join(dataDir, "connectors.json"))).toBe(false);
+		// The first start may write the signed empty record (so a later start does not read a
+		// missing file as a deletion); computer control is never saved in it.
+		const file = join(dataDir, "connectors.json");
+		const saved = existsSync(file)
+			? (JSON.parse(readFileSync(file, "utf8")) as { connectors: object }).connectors
+			: {};
+		expect(saved).toEqual({});
 	});
 
 	it("renders the helper as a built-in direct server with the key in its header, and the key goes nowhere else", async () => {

@@ -337,8 +337,8 @@ describe("AgentSupervisor", () => {
 			} finally {
 				vi.useRealTimers();
 				const pid = supervisor.pid;
-				if (pid !== undefined) {
-					if (pid <= 0) throw new Error("Missing positive owned fixture PID");
+				// Only a positive PID is the owned fixture; a throw here would hide the test's own failure.
+				if (pid !== undefined && pid > 0) {
 					process.kill(pid, "SIGKILL");
 					await waitFor(() => supervisor.state === "stopped");
 				}
@@ -379,10 +379,11 @@ describe("AgentSupervisor", () => {
 			expect(supervisor.sessionId).toBe(sessionId);
 		} finally {
 			vi.useRealTimers();
-			if (!pid || pid <= 0 || supervisor.pid !== pid)
-				throw new Error("Missing current positive owned fixture PID");
-			process.kill(pid, "SIGKILL");
-			await waitFor(() => supervisor.state === "stopped");
+			// Only the current positive PID is the owned fixture; a throw here would hide the test's own failure.
+			if (pid && pid > 0 && supervisor.pid === pid) {
+				process.kill(pid, "SIGKILL");
+				await waitFor(() => supervisor.state === "stopped");
+			}
 		}
 	});
 

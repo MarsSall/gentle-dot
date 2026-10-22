@@ -2507,14 +2507,17 @@ mod tests {
             let caps = p.rig.desktop.captures.load(Ordering::SeqCst);
             *p.ring.ack.lock().unwrap() = None; // overlay never acks
             let control = p.rig.control.clone();
-            let t = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(100)); control.end(Reason::Stopped); });
-            // The real app wires Control's notify to session_ended; emulate that wiring here.
+            // The real app wires Control's notify to session_ended, so the session is already over
+            // when the call is given up; one thread keeps that order (two timers could swap it).
             let working = p.working.clone();
-            let ring = p.ring.clone();
-            let watcher = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(150)); working.session_ended(); let _ = ring; });
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                control.end(Reason::Stopped);
+                working.session_ended();
+            });
             let started = Instant::now();
             let result = p.rig.call("click", json!({"x": 10, "y": 10}));
-            t.join().unwrap(); watcher.join().unwrap();
+            t.join().unwrap();
             assert!(is_error(&result));
             assert_eq!(first_text(&result), STOPPED);
             assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());

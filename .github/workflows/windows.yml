@@ -47,7 +47,7 @@ jobs:
         run: cargo test --locked --lib
 
   typescript:
-    name: TypeScript (install, typecheck, lint)
+    name: TypeScript (daemon, protocol, UI)
     runs-on: windows-latest
     steps:
       # Git on the runner checks text out with CRLF line endings, which biome reports as
@@ -81,6 +81,5 @@ jobs:
       - name: Lint
         run: pnpm lint
 
-      # No `pnpm test` yet: the vitest suite still assumes POSIX (file modes, server mode's setuid,
-      # TMPDIR, the login shell) and starts daemons without the Windows app channel, so 29 files
-      # fail on Windows. Porting it is tracked separately; the Rust job carries the Windows tests.
+      - name: Test
+        run: pnpm test

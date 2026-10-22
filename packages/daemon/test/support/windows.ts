@@ -6,6 +6,9 @@ export const WINDOWS_APP_CHANNEL =
 export const POSIX_FILE_MODE =
 	"Windows has no POSIX permission bits; private files rely on the user profile's ACL. Linux and macOS cover these mode assertions";
 
+export const SERVER_MODE =
+	"Server mode runs the engine as another POSIX user (setuid); it is Linux only and covered on Linux";
+
 const windows = process.platform === "win32";
 
 /** Keep the test and its stat/lstat running; only POSIX permission bits are platform-specific. */
@@ -17,6 +20,11 @@ export function expectPosixMode(actualMode: number, expectedMode: number): void 
 export const describeWithAppChannel: ReturnType<typeof describe.skipIf> = describe.skipIf(windows);
 export const itWithAppChannel: ReturnType<typeof it.skipIf> = it.skipIf(windows);
 
+/** Server-mode suites are absent on Windows; desktop and generic file behavior remain active. */
+export const describeServerMode: ReturnType<typeof describe.skipIf> = describe.skipIf(windows);
+export const itServerMode: ReturnType<typeof it.skipIf> = it.skipIf(windows);
+
 if (windows) {
 	console.info(`Windows-only test skip: ${WINDOWS_APP_CHANNEL}`);
+	console.info(`Windows-only test skip: ${SERVER_MODE}`);
 }

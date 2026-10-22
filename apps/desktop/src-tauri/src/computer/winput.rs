@@ -123,6 +123,13 @@ fn wheel(horizontal: bool, pixels: i32) -> Option<Step> {
     Some(Step::Wheel { horizontal, delta: if horizontal { delta } else { -delta } })
 }
 
+/// Whether the helper waits after `step` until the window in front handles its input (S4): after
+/// every key release. Input queued while that window's thread stalls reaches it as other
+/// characters, or not at all.
+pub fn settles(step: &Step) -> bool {
+    matches!(step, Step::Key { down: false, .. } | Step::Unicode { down: false, .. })
+}
+
 /// What releases every key and button `sent` left pressed, latest first: posted when an input
 /// fails halfway, so a failed action never leaves Ctrl or a mouse button held.
 pub fn releases(sent: &[Step]) -> Vec<Step> {
@@ -349,6 +356,16 @@ mod tests {
             assert!(virtual_key(name).is_some(), "{name} has no virtual-key code");
         }
         assert_eq!(virtual_key("hyper"), None);
+    }
+
+    #[test]
+    fn the_target_catches_up_after_each_key_release_only() {
+        let mut sent = plan(InputEvent::Text("hé".into()));
+        sent.extend(plan(InputEvent::Key(parse_combo("ctrl+a").unwrap())));
+        sent.extend(plan(InputEvent::Click { at: at(10.0, 10.0), button: MouseButton::Left, count: 1 }));
+        let waits: Vec<Step> = sent.iter().copied().filter(settles).collect();
+        // Both characters and the A of ctrl+a, then Ctrl: never a press or the mouse.
+        assert_eq!(waits, [Step::Unicode { unit: 0x68, down: false }, Step::Unicode { unit: 0xE9, down: false }, key(0x41, false), key(0x11, false)]);
     }
 
     #[test]

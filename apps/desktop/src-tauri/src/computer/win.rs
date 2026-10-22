@@ -26,13 +26,13 @@ use super::winaccess::{element, is_default, unreadable, UIA_BUTTON, UIA_WINDOW};
 use super::winapps::{
     answers_to, app_pids, executable_target, hosted_page, request, shortcut_named, strip_ci, Request, TopWindow,
 };
-use super::winput::{releases, steps, Step, VirtualScreen};
+use super::winput::{releases, settles, steps, Step, VirtualScreen};
 use super::{AppInfo, Capture, InputEvent, MouseButton};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SetLastError, ERROR_TIMEOUT, HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
@@ -57,6 +57,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, DrawIconEx, EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetCursorInfo,
     GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetIconInfo, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
     GetWindowTextLengthW, GetWindowTextW, GetWindowDisplayAffinity, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
+    SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_NULL,
     ShowWindow, WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GA_ROOTOWNER, GUITHREADINFO, GWL_EXSTYLE, GW_OWNER,
     ICONINFO, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SW_RESTORE, SW_SHOWNORMAL, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
@@ -67,6 +68,12 @@ use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
 /// Pause between the events of one action, so apps see distinct presses (as on macOS).
 const EVENT_GAP: Duration = Duration::from_millis(15);
+
+/// How long the window in front may take to handle a key before the action stops (S4).
+const CATCH_UP_MS: u32 = 2000;
+
+const NOT_CAUGHT_UP: &str =
+    "The app in front did not take the keys in time, so the rest was not sent. Take a screenshot to see what arrived.";
 
 /// A monitor's rectangle in physical pixels of the virtual screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,18 +171,47 @@ fn send(step: Step) -> Result<(), String> {
     }
 }
 
-/// Posts `event`, one input at a time with a short gap, like the macOS helper. When an input
-/// fails halfway, whatever it left pressed is released before the error is reported.
+/// Waits until the thread of the window in front handles messages again (S4). Keys queued while
+/// it stalls reach it as other characters (a stalled Notepad turned "tres" into "eees"), so each
+/// key waits for the previous one to be taken. A window that cannot be asked (another integrity
+/// level) is not waited for; one that does not answer in time stops the action.
+fn catch_up() -> Result<(), String> {
+    // SAFETY: plain calls; `result` is a valid out-pointer.
+    unsafe {
+        let window = GetForegroundWindow();
+        if window.is_null() {
+            return Ok(());
+        }
+        let mut result = 0;
+        if SendMessageTimeoutW(window, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, CATCH_UP_MS, &mut result) == 0
+            && GetLastError() == ERROR_TIMEOUT
+        {
+            return Err(NOT_CAUGHT_UP.into());
+        }
+    }
+    Ok(())
+}
+
+/// Posts `event`, one input at a time with a short gap, like the macOS helper, waiting after each
+/// key release for the window in front to take it. When an input fails halfway, whatever it left
+/// pressed is released before the error is reported.
 pub fn post(event: &InputEvent) -> Result<(), String> {
     let plan = steps(event, &virtual_screen())?;
     for (done, step) in plan.iter().enumerate() {
-        if let Err(error) = send(*step) {
-            for release in releases(&plan[..done]) {
+        // The steps that reached Windows when this one fails: the step itself once it was sent.
+        let failed = match send(*step) {
+            Err(error) => Some((done, error)),
+            Ok(()) => {
+                std::thread::sleep(EVENT_GAP);
+                if settles(step) { catch_up().err().map(|error| (done + 1, error)) } else { None }
+            }
+        };
+        if let Some((sent, error)) = failed {
+            for release in releases(&plan[..sent]) {
                 let _ = send(release);
             }
             return Err(error);
         }
-        std::thread::sleep(EVENT_GAP);
     }
     Ok(())
 }

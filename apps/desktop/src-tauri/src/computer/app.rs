@@ -117,6 +117,17 @@ pub fn show_without_focus(window: &tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+/// Hides the Dot or the panel for a computer-control call (S1). tao hides a window only when its
+/// own visibility flag changes, and `show_without_focus` shows it again behind tao's back, so a
+/// second call hiding through tao would leave it on screen; both sides go through Win32 instead,
+/// and tao's flag keeps the state from before the call, which is the state restored after it.
+#[cfg(windows)]
+pub fn hide_for_call(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+    super::win::hide_window(hwnd.0);
+    Ok(())
+}
+
 impl Computer {
     /// The helper's address and key for this launch, registered with the daemon over the app's
     /// channel (S24.7, L61); `None` off macOS and Windows, or when the helper did not start.

@@ -1191,6 +1191,15 @@ pub fn show_without_activating(hwnd: *mut c_void) {
     unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
 }
 
+/// Hides one of this process's windows for a computer-control call, the counterpart of
+/// `show_without_activating`. Both bypass tao, which hides and shows only when its own visibility
+/// flag changes: a window it hid and this function showed again would stay on screen at the next
+/// hide.
+pub fn hide_window(hwnd: *mut c_void) {
+    // SAFETY: a plain call on a window of this process.
+    unsafe { ShowWindow(hwnd, SW_HIDE) };
+}
+
 /// Moves the glow over a display, without activating it.
 pub fn cover(hwnd: *mut c_void, display: Frame) {
     // SAFETY: a plain call on a window of this process.

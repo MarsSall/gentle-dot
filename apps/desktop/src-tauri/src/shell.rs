@@ -89,7 +89,11 @@ impl working::Windows for ShellWindows {
     }
 
     fn hide(&self, part: Part) -> Result<(), String> {
-        self.get(part).ok_or_else(|| format!("window {part:?} is missing"))?.hide().map_err(err)
+        let window = self.get(part).ok_or_else(|| format!("window {part:?} is missing"))?;
+        #[cfg(windows)]
+        return computer::hide_for_call(&window);
+        #[cfg(not(windows))]
+        window.hide().map_err(err)
     }
 
     fn show(&self, part: Part) {

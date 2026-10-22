@@ -76,6 +76,24 @@ describe("isolatedAgentEnv PATH", () => {
 		expect(rest).toEqual(["/usr/bin", "/bin"]);
 	});
 
+	it("keeps the user's Windows Path, under one spelling, after the bundled folder (Row0902's finding)", () => {
+		// A copy of Windows' environment keeps the key as Windows spells it, `Path`. Reading `PATH`
+		// found nothing, and a second `PATH` key beside it won: the engine had only the bundled folder.
+		const bin = tempDir();
+		writeFileSync(join(bin, "pi.cmd"), "");
+		const env = isolatedAgentEnv(
+			{ Path: "C:\\Windows\\System32;C:\\Git\\cmd", HOME: tempDir() },
+			tempDir(),
+			undefined,
+			{
+				platform: "win32",
+				sourceBinDirs: [bin],
+			},
+		);
+		expect(Object.keys(env).filter((key) => key.toUpperCase() === "PATH")).toEqual(["PATH"]);
+		expect(env.PATH).toBe([bin, "C:\\Windows\\System32", "C:\\Git\\cmd"].join(";"));
+	});
+
 	it("does not add the bundled folder twice", () => {
 		const once = isolatedAgentEnv({ PATH: "/bin", HOME: tempDir() }, tempDir());
 		const twice = isolatedAgentEnv({ PATH: once.PATH, HOME: tempDir() }, tempDir());

@@ -125,7 +125,7 @@ export function ensureMemoryProject(workspace: string, access: EngineAccess = di
 /**
  * The engine's environment: its own HOME (`<dataDir>/home`, mode 0700) with
  * the XDG folders under it, because parts of the engine write to fixed places
- * under the home folder. PATH is kept, with the bundled `pi` folder first, and so is the user's git identity,
+ * under the home folder. PATH is kept (on Windows as one `PATH` key, whatever its spelling), with the bundled `pi` folder first, and so is the user's git identity,
  * through `GIT_CONFIG_GLOBAL` pointing at their real `~/.gitconfig`.
  *
  * Memory is the user's global Engram: Engram ties a server to its data folder
@@ -174,10 +174,20 @@ export function isolatedAgentEnv(
 		env.TMPDIR = tmp;
 		access(() => ensurePrivateDir(tmp));
 	}
+	// Windows spells the variable `Path`, and a copy of its environment keeps that key: reading
+	// `PATH` found nothing, and a second `PATH` key beside it won, leaving the engine only the bundled
+	// folder (found by Row0902). On Windows it is read whatever its spelling and kept as one `PATH`.
+	let path = base.PATH;
+	if (platform === "win32") {
+		const keys = Object.keys(env).filter((key) => key.toUpperCase() === "PATH");
+		path = keys.map((key) => env[key]).find((value) => value !== undefined);
+		for (const key of keys) delete env[key];
+		if (path !== undefined) env.PATH = path;
+	}
 	const bin = bundledBinDir(base, options);
 	if (bin) {
 		const separator = platform === "win32" ? ";" : delimiter;
-		const rest = (base.PATH ?? "").split(separator).filter((part) => part && part !== bin);
+		const rest = (path ?? "").split(separator).filter((part) => part && part !== bin);
 		env.PATH = [bin, ...rest].join(separator);
 	}
 	// The user's own Gentle Shell setting is not the assistant's.

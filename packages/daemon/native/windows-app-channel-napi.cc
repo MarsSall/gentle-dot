@@ -114,8 +114,10 @@ napi_value Snapshot(napi_env e, Stream* s) {
   if (!Check(e, napi_create_object(e, &o)) ||
       !Text(e, o, "phase", Phase(v.phase)) || !Number(e, o, "error", v.error) ||
       !Bool(e, o, "eof", v.eof) || !Bool(e, o, "pendingIo", v.pending_io) ||
-      !Number(e, o, "readableBytes", v.readable_bytes) ||
-      !Number(e, o, "queuedBytes", v.queued_bytes) || !Number(e, o, "queuedItems", v.queued_items) ||
+      // Bounded by 64 KiB, 2 MiB and 64 items: exact as doubles.
+      !Number(e, o, "readableBytes", static_cast<double>(v.readable_bytes)) ||
+      !Number(e, o, "queuedBytes", static_cast<double>(v.queued_bytes)) ||
+      !Number(e, o, "queuedItems", static_cast<double>(v.queued_items)) ||
       !Big(e, o, "acceptedWrite", v.accepted_write) || !Big(e, o, "completedWrite", v.completed_write)) return nullptr;
   return o;
 }

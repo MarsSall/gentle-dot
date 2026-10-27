@@ -5,6 +5,7 @@ import { WindowsAppChannel, type WindowsAppChannelCloseResult } from "./windows-
 
 interface StopListener {
 	capability: Buffer;
+	// Closing drops queued authenticated frames; close() is only reached during shutdown already in progress.
 	close(): Promise<void>;
 }
 interface Stoppable {
@@ -31,6 +32,8 @@ const HANDLER_LIFETIME = Symbol("Windows stop handler lifetime");
 const failedWindowsOwners = new Set<object>();
 
 /** A separate lexical scope ensures the native-rooted callback captures ONLY the weak reference. */
+// Native delivers via a thread-safe function: an onRequest exception reaches napi_fatal_exception,
+// terminating the process by design.
 function weakRequestCallback(reference: HandlerReference): (frame: Buffer) => void {
 	return (frame) => reference.deref()?.onRequest(frame);
 }
@@ -193,7 +196,12 @@ export async function startWithWindowsStop<T extends Stoppable>(
 	void startup.catch(() => {});
 	const close = (): Promise<void> => {
 		if (!stopping) {
-			stopping = startup.then((daemon) => closeDaemonAndListener(daemon, listener!));
+			stopping = startup.then((daemon) => {
+				// startup resolves only after the listener is assigned, so this guard never fires.
+				const activeListener = listener;
+				if (!activeListener) throw new Error("Windows stop listener missing after startup");
+				return closeDaemonAndListener(daemon, activeListener);
+			});
 			void stopping.then(stopped, (error) => {
 				failedWindowsOwners.add(lifetimeOwner);
 				failed(error);
@@ -207,6 +215,8 @@ export async function startWithWindowsStop<T extends Stoppable>(
 	// frames (144 bytes), then fail initialization rather than silently drop a stop.
 	const preinitFrames: Buffer[] = [];
 	let preinitOverflow = false;
+	// Buffer.isBuffer, length/tag checks and timingSafeEqual on equal 32-byte lengths cannot throw
+	// for any input; void close() only schedules asynchronous shutdown.
 	const handler: RequestHandler = {
 		onRequest(frame) {
 			if (!Buffer.isBuffer(frame) || frame.length !== 36 || !frame.subarray(0, 4).equals(FRAME_VERSION))

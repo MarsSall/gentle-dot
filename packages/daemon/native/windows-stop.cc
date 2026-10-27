@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <intrin.h>
 #include <aclapi.h>
 #include <node_api.h>
 #include "windows-app-channel-napi.h"
@@ -288,7 +289,9 @@ bool ClientIsOwner(State& s) {
       matches = EqualSid(sid.data(), s.sid.data()) != FALSE;
     }
   } catch (...) { matches = false; }
-  if (!RevertToSelf()) { s.Fail(GetLastError()); s.Stop(); return false; }
+  // A failed revert leaves this thread running as the client, and no later step is
+  // safe under that token: terminate the process at once (Microsoft's guidance).
+  if (!RevertToSelf()) __fastfail(FAST_FAIL_FATAL_APP_EXIT);
   return matches;
 }
 bool CapabilityMatches(const State& s, const std::array<BYTE, 36>& frame) {

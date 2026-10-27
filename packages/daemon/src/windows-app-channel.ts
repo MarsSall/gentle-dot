@@ -146,7 +146,7 @@ class WindowsAppChannelDuplex extends Duplex {
 		});
 		void this.#close.catch(() => {}); // observed even when destroy initiated close
 		if (this.#disposed) {
-			this.#reject!(this.#failure ?? new Error("App channel already disposed"));
+			this.#reject?.(this.#failure ?? new Error("App channel already disposed"));
 			return this.#close;
 		}
 		this.#deadline = setTimeout(() => {

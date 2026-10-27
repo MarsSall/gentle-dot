@@ -31,6 +31,7 @@ function fixture() {
 	let bytes: Buffer = Buffer.alloc(0);
 	let pressure = false;
 	let uncertain = false;
+	let released: NativeAppChannelSnapshot | undefined;
 	const calls: string[] = [];
 	const owner: NativeAppChannelOwner = {
 		status() {
@@ -69,7 +70,7 @@ function fixture() {
 		release() {
 			expect(this).toBe(owner);
 			calls.push("release");
-			return { ...status };
+			return released ?? { ...status };
 		},
 	};
 	const factory = vi.fn(() => ({
@@ -100,6 +101,9 @@ function fixture() {
 		},
 		uncertain() {
 			uncertain = true;
+		},
+		releaseReturns(snapshot: NativeAppChannelSnapshot) {
+			released = snapshot;
 		},
 	};
 }
@@ -360,6 +364,72 @@ describe("Windows app channel orchestration", () => {
 		await tick();
 		await expect(close).resolves.toEqual({ mode: "abort", drained: false });
 		expect(f.calls).toContain("release");
+	});
+	it("waits through the native stopping phase and certifies drain only at closed", async () => {
+		const f = fixture();
+		const s = f.stream();
+		let settled = false;
+		const close = s.close("drain");
+		void close.then(
+			() => (settled = true),
+			() => (settled = true),
+		);
+		await tick();
+		expect(f.calls).toContain("stop:drain");
+		expect(f.status.phase).toBe("stopping");
+		await tick();
+		await tick();
+		expect(settled).toBe(false);
+		expect(f.calls).not.toContain("release");
+		f.status.phase = "closed";
+		f.status.pendingIo = false;
+		await tick();
+		await expect(close).resolves.toEqual({ mode: "drain", drained: true });
+		expect(f.calls.filter((x) => x === "release")).toHaveLength(1);
+	});
+	it("rejects drain at retained_failure even with every admitted ticket completed", async () => {
+		const f = fixture();
+		const s = f.stream();
+		const close = s.close("drain");
+		await tick();
+		f.status.phase = "retained_failure";
+		f.status.pendingIo = false;
+		await tick();
+		expect(f.status.acceptedWrite).toBe(f.status.completedWrite);
+		await expect(close).rejects.toThrow("native ownership retained");
+		expect(f.calls.filter((x) => x === "release")).toHaveLength(1);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+	it("never takes release()'s pre-release snapshot as drain evidence", async () => {
+		const drainedLooking: NativeAppChannelSnapshot = {
+			phase: "closed",
+			error: 0,
+			eof: false,
+			pendingIo: false,
+			readableBytes: 0,
+			queuedBytes: 0,
+			queuedItems: 0,
+			acceptedWrite: 0n,
+			completedWrite: 0n,
+		};
+		const failed = fixture();
+		failed.releaseReturns(drainedLooking);
+		const failing = failed.stream().close("drain");
+		await tick();
+		failed.status.phase = "retained_failure";
+		failed.status.pendingIo = false;
+		await tick();
+		await expect(failing).rejects.toThrow("native ownership retained");
+
+		const drained = fixture();
+		drained.releaseReturns({ ...drainedLooking, phase: "open", pendingIo: true, acceptedWrite: 5n });
+		const draining = drained.stream().close("drain");
+		await tick();
+		drained.status.phase = "closed";
+		drained.status.pendingIo = false;
+		await tick();
+		await expect(draining).resolves.toEqual({ mode: "drain", drained: true });
+		expect(drained.calls.filter((x) => x === "release")).toHaveLength(1);
 	});
 	it("rejects false drain, EOF and deadline while safely disposing uncertain ownership", async () => {
 		for (const cause of ["mismatch", "eof", "deadline"]) {

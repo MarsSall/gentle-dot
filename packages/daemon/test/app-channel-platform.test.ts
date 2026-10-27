@@ -13,7 +13,9 @@ vi.mock("node:fs", () => ({
 }));
 vi.mock("node:net", () => ({ Socket: vi.fn() }));
 
-const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
+const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+if (!descriptor) throw new Error("process.platform has no own property descriptor");
+const platformDescriptor: PropertyDescriptor = descriptor;
 afterEach(() => {
 	Object.defineProperty(process, "platform", platformDescriptor);
 	vi.clearAllMocks();

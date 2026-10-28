@@ -280,6 +280,10 @@ mod native {
         pid: u32,
         assigned: bool,
         failed: bool,
+        // Set once the daemon resumed. An established launch whose status later turns
+        // uncertain is retained as failed (no replacement, no health) but still stops
+        // through the authenticated, channel-open path, never as a failed startup.
+        established: bool,
         record: Option<OwnedRecord>,
         // Reuse the authenticated client with a duplicate of the created process
         // handle, never a fresh PID lookup. Keep pending I/O installed on errors.
@@ -374,7 +378,7 @@ mod native {
     impl ChildProcess for WindowsChild {
         fn id(&self) -> u32 { self.pid }
         fn launch_failed(&self) -> bool { self.failed || self.stopping }
-        fn shutdown_requires_channel(&self) -> bool { !self.failed || self.stopping }
+        fn shutdown_requires_channel(&self) -> bool { !self.failed || self.stopping || self.established }
         fn retain_failure(&mut self) { self.failed = true; }
         fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
             if self.launch_failed() { return Err(io::Error::other("retained failed launch requires checked shutdown")); }
@@ -392,7 +396,7 @@ mod native {
         }
         fn shutdown_owned(&mut self, grace: Duration) -> io::Result<()> {
             if self.completed { return self.finish_record(); }
-            if self.failed && !self.stopping {
+            if self.failed && !self.stopping && !self.established {
                 // Failed startup may never have installed its listener.
                 self.complete(grace)?;
                 self.completed = true;
@@ -532,7 +536,7 @@ mod native {
         let mut child = WindowsChild {
             process: unsafe { OwnedHandle::from_raw_handle(process.hProcess) },
             thread: Some(unsafe { OwnedHandle::from_raw_handle(process.hThread) }), job,
-            pid: process.dwProcessId, assigned: false, failed: false, record: None, stop: None, stopping: false,
+            pid: process.dwProcessId, assigned: false, failed: false, established: false, record: None, stop: None, stopping: false,
             force_requested: false, completed: false,
             #[cfg(test)] faults,
         };
@@ -556,6 +560,7 @@ mod native {
             let previous = unsafe { ResumeThread(child.thread.as_ref().unwrap().as_raw_handle()) };
             if previous == u32::MAX { return Err(io::Error::last_os_error()); }
             if previous != 1 { return Err(io::Error::other("unexpected daemon suspension state")); }
+            child.established = true;
             drop(child.thread.take());
             Ok(())
         })();
@@ -1491,12 +1496,6 @@ mod native {
                 &mut descriptor, null_mut()))?; }
             Ok(Self(descriptor))
         }
-        fn new() -> io::Result<Self> {
-            let text = wide(std::ffi::OsStr::new("D:P(A;;GA;;;OW)"))?;
-            let mut descriptor = null_mut();
-            unsafe { checked(ConvertStringSecurityDescriptorToSecurityDescriptorW(text.as_ptr(), SDDL_REVISION_1, &mut descriptor, null_mut()))?; }
-            Ok(Self(descriptor))
-        }
         fn attributes(&self) -> SECURITY_ATTRIBUTES {
             SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: self.0, bInheritHandle: 0 }
@@ -1528,8 +1527,13 @@ mod native {
         if result != ERROR_SUCCESS { return Err(io::Error::from_raw_os_error(result as i32)); }
         Ok(File::from(handle))
     }
+    /// The daemon itself opens this directory by path (its token, config and logs), without
+    /// an inherited handle. An OWNER RIGHTS entry would follow the owner, which is the
+    /// Administrators group when an elevated app created it, and then shut out the same
+    /// user unelevated. Both the directory and the log name the user's SID instead.
     pub(crate) fn open_private_log(data_dir: &Path) -> io::Result<File> {
-        let descriptor = Descriptor::new()?;
+        let sid = current_user_sid()?;
+        let descriptor = Descriptor::for_user(sid.as_ptr() as PSID)?;
         if let Some(parent) = data_dir.parent().filter(|path| !path.as_os_str().is_empty()) { std::fs::create_dir_all(parent)?; }
         let name = wide(data_dir.as_os_str())?;
         let attributes = descriptor.attributes();
@@ -1906,6 +1910,48 @@ setTimeout(()=>process.exit(74),30000);
         }
 
         #[test]
+        fn private_log_directory_and_file_name_only_the_user() {
+            // Owner and every DACL entry must be this user's SID, never OWNER RIGHTS: the
+            // daemon reopens the directory by path, possibly unelevated (#128).
+            let mut nonce = [0u8; 16];
+            getrandom::fill(&mut nonce).unwrap();
+            let token: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+            let root = std::env::temp_dir().join(format!("gentle-private-log-{token}"));
+            let log = open_private_log(&root).unwrap();
+            let sid = current_user_sid().unwrap();
+            validate_record_security(log.as_raw_handle(), sid.as_ptr() as PSID).expect("log names only the user");
+            let name = wide(root.as_os_str()).unwrap();
+            let directory = owned(unsafe { CreateFileW(name.as_ptr(), READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, null_mut()) }).unwrap();
+            validate_record_security(directory.as_raw_handle(), sid.as_ptr() as PSID).expect("directory names only the user");
+            // Reopening repairs, never loosens: the same check holds on the second call.
+            drop(log);
+            let log = open_private_log(&root).unwrap();
+            validate_record_security(log.as_raw_handle(), sid.as_ptr() as PSID).unwrap();
+            validate_record_security(directory.as_raw_handle(), sid.as_ptr() as PSID).unwrap();
+        }
+
+        #[test]
+        fn uncertain_status_keeps_an_established_launch_on_the_channel_open_stop() {
+            let (mut child, parent, root) = owned_fixture("setTimeout(()=>{},30000)");
+            assert!(child.established);
+            // What the lifecycle does when an established launch's status query fails.
+            child.retain_failure();
+            assert!(child.launch_failed(), "uncertain status still refuses replacement and health");
+            assert!(child.try_wait().is_err());
+            assert!(child.shutdown_requires_channel(), "an established launch is not a failed startup");
+            // No stop listener here: the authenticated attempt fails and the force path
+            // waits out the caller's grace instead of the failed-startup zero grace.
+            let stopping = Instant::now();
+            child.shutdown_owned(Duration::from_millis(200)).unwrap();
+            assert!(stopping.elapsed() >= Duration::from_millis(200), "established stop must honor its grace");
+            assert!(child.force_requested);
+            assert_eq!(child.query().unwrap(), 0);
+            assert!(!root.join("daemon.pid").exists());
+            parent.shutdown().unwrap();
+        }
+
+        #[test]
         fn owned_force_failures_retain_record_and_allow_checked_retry() {
             for faults in [
                 Faults { terminate: true, ..Faults::default() },
@@ -1938,6 +1984,8 @@ setTimeout(()=>process.exit(74),30000);
             assert!(detail.contains("terminate") && detail.contains("wait") && detail.contains("job query"));
             let mut owner = failure.unfinished.take().unwrap();
             assert!(owner.launch_failed());
+            // Never resumed: cleanup may close the channel first, its listener may not exist.
+            assert!(!owner.shutdown_requires_channel());
             assert!(owner.try_wait().is_err());
             owner.faults = Faults::default();
             owner.shutdown_owned(Duration::ZERO).unwrap();

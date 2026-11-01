@@ -294,8 +294,9 @@ mod windows {
             config.Anonymous1.pszMainIcon = if error { TD_ERROR_ICON } else { TD_WARNING_ICON };
             config.pfCallback = Some(on_message);
             config.lpCallbackData = &change as *const _ as isize;
-            if TaskDialogIndirect(&config, null_mut(), null_mut(), null_mut()) < 0 {
-                eprintln!("gentle-dot: cannot show a message: {}", std::io::Error::last_os_error());
+            let shown = TaskDialogIndirect(&config, null_mut(), null_mut(), null_mut());
+            if shown < 0 {
+                eprintln!("gentle-dot: cannot show a message: HRESULT {shown:#010x}");
             }
         }
     }

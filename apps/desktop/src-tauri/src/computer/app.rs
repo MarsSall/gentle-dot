@@ -465,9 +465,16 @@ fn run_glow(app: AppHandle, window: tauri::WebviewWindow, control: Arc<Control>,
 
 /// Change only window display affinity on the main thread.
 #[cfg(windows)]
-fn keep_out_of_capture(app: &AppHandle, excluded: bool) {
+fn keep_out_of_capture(app: &AppHandle, reported: bool) {
     let handle = app.clone();
     let scheduled = app.run_on_main_thread(move || {
+        // Reports can arrive out of order (Control reports after releasing its lock), so the
+        // state applied is the session's own when this runs: a late report of an active session
+        // never excludes the windows again after Stop.
+        let excluded = handle
+            .try_state::<Computer>()
+            .map_or(reported, |computer| computer.control.is_active(SystemClock.now_ms()));
+        super::win::set_session_exclusion(excluded);
         for label in [crate::shell::DOT, crate::shell::PANEL] {
             let Some(window) = handle.get_webview_window(label) else { continue };
             let changed = window.hwnd().map_err(|e| e.to_string())

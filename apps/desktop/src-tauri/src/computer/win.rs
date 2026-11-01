@@ -39,6 +39,7 @@ use super::{
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, ERROR_TIMEOUT, HWND, LPARAM, POINT, RECT,
@@ -412,13 +413,15 @@ fn draw_pointer(canvas: &Canvas, frame: MonitorFrame, width: u32, height: u32) {
 /// A screenshot of the monitor under the pointer, downscaled to `MAX_LONG_EDGE`, Gentle Dot's
 /// windows excluded.
 pub fn capture() -> Result<Capture, String> {
+    let unexcluded = UNEXCLUDED.load(Ordering::SeqCst);
     let changed = exclude_own_windows()?;
     let shot = grab();
     // Stop gives the Dot and the panel back on the main thread while a capture may be under way:
-    // a window of ours that lost its exclusion during the copy could be in the image, so it is
-    // not returned. The windows this capture excluded go back as they were, so a Stop meanwhile
-    // keeps them visible in the user's own screenshots (#163 finding 3).
-    let clean = own_windows_excluded();
+    // a window of ours that could show at any moment of the copy could be in the image, so it is
+    // not returned, even when it was excluded again before this check. The windows this capture
+    // excluded go back as they were, so a Stop meanwhile keeps them visible in the user's own
+    // screenshots (#163 finding 3).
+    let clean = UNEXCLUDED.load(Ordering::SeqCst) == unexcluded && own_windows_excluded();
     restore_affinity(&changed);
     let shot = shot?;
     if !clean {
@@ -519,9 +522,24 @@ fn own_windows_excluded() -> bool {
     own_visible_windows().into_iter().all(is_excluded)
 }
 
-/// Lets the windows a capture excluded show in screenshots again, as they did before it. A window
-/// that vanished meanwhile just fails.
+/// How many times a window of this process was let show in captures again: a capture during which
+/// it changed may hold one of them.
+static UNEXCLUDED: AtomicU64 = AtomicU64::new(0);
+/// Whether a session keeps the Dot and the panel out of captures (set by the app on its main
+/// thread): a capture then leaves the windows it excluded excluded.
+static SESSION_EXCLUDES: AtomicBool = AtomicBool::new(false);
+
+/// Tells captures whether a session keeps this process's windows out of them.
+pub fn set_session_exclusion(excluded: bool) {
+    SESSION_EXCLUDES.store(excluded, Ordering::SeqCst);
+}
+
+/// Lets the windows a capture excluded show in screenshots again, as they did before it, unless a
+/// session keeps them out meanwhile. A window that vanished meanwhile just fails.
 fn restore_affinity(changed: &[HWND]) {
+    if SESSION_EXCLUDES.load(Ordering::SeqCst) {
+        return;
+    }
     for &hwnd in changed {
         let _ = set_capture_excluded(hwnd, false);
     }
@@ -530,6 +548,10 @@ fn restore_affinity(changed: &[HWND]) {
 /// Leaves a window of this process out of screenshots, or lets it show in them again.
 pub fn set_capture_excluded(hwnd: *mut c_void, excluded: bool) -> Result<(), String> {
     let affinity = if excluded { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    if !excluded {
+        // Counted before the change, so a capture under way sees it whatever happens next.
+        UNEXCLUDED.fetch_add(1, Ordering::SeqCst);
+    }
     // SAFETY: a plain call on a window handle of this process.
     if unsafe { SetWindowDisplayAffinity(hwnd, affinity) } != 0 {
         Ok(())
@@ -1715,6 +1737,23 @@ mod tests {
         unsafe { DestroyWindow(hwnd) };
         shot.expect("a screenshot");
         assert!(!excluded_after, "the capture put the window's affinity back");
+    }
+
+    /// A capture notices any window let show again while it ran, and leaves what it excluded
+    /// excluded while a session keeps the windows out. One test: both use the same counters.
+    #[test]
+    fn captures_notice_windows_let_show_meanwhile() {
+        let before = UNEXCLUDED.load(Ordering::SeqCst);
+        // Even a failed attempt (no such window) counts: the change may have happened.
+        assert!(set_capture_excluded(null_mut(), false).is_err());
+        assert!(UNEXCLUDED.load(Ordering::SeqCst) > before);
+        set_session_exclusion(true);
+        let during = UNEXCLUDED.load(Ordering::SeqCst);
+        restore_affinity(&[null_mut()]);
+        assert_eq!(UNEXCLUDED.load(Ordering::SeqCst), during, "nothing is let show during a session");
+        set_session_exclusion(false);
+        restore_affinity(&[null_mut()]);
+        assert!(UNEXCLUDED.load(Ordering::SeqCst) > during);
     }
 
     #[test]

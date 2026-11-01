@@ -121,6 +121,13 @@ pub fn hide_for_call(window: &tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+/// A window of Gentle Dot is about to be shown or hidden through tao (the panel, the Dot): a
+/// computer-control capture under way is dropped.
+#[cfg(windows)]
+pub fn note_window_change() {
+    super::win::note_own_window_change();
+}
+
 #[cfg(windows)]
 pub fn set_shown(window: &tauri::WebviewWindow, shown: bool) -> Result<(), String> {
     let hwnd = window.hwnd().map_err(|e| e.to_string())?.0;
@@ -396,13 +403,16 @@ fn run_overlay(
 
 /// A click-through, non-activating overlay excluded from capture.
 #[cfg(windows)]
-fn build_glow(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
+fn build_glow(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     let window = tauri::WebviewWindowBuilder::new(app, GLOW_WINDOW, tauri::WebviewUrl::App("index.html?surface=glow".into()))
         .title(GLOW_TITLE).inner_size(1.0, 1.0).position(0.0, 0.0).transparent(true)
         .decorations(false).always_on_top(true).resizable(false).skip_taskbar(true)
-        .shadow(false).focused(false).focusable(false).visible(false).build()?;
-    window.set_ignore_cursor_events(true)?;
-    super::win::prepare_overlay(window.hwnd()?.0);
+        .shadow(false).focused(false).focusable(false).visible(false).build().map_err(|error| error.to_string())?;
+    window.set_ignore_cursor_events(true).map_err(|error| error.to_string())?;
+    if let Err(error) = super::win::prepare_overlay(window.hwnd().map_err(|error| error.to_string())?.0) {
+        let _ = window.close();
+        return Err(error);
+    }
     Ok(window)
 }
 

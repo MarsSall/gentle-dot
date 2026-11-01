@@ -414,15 +414,15 @@ fn draw_pointer(canvas: &Canvas, frame: MonitorFrame, width: u32, height: u32) {
 /// A screenshot of the monitor under the pointer, downscaled to `MAX_LONG_EDGE`, Gentle Dot's
 /// windows excluded.
 pub fn capture() -> Result<Capture, String> {
-    let unexcluded = UNEXCLUDED.load(Ordering::SeqCst);
+    let changes = OWN_WINDOW_CHANGES.load(Ordering::SeqCst);
     let changed = exclude_own_windows()?;
     let shot = grab();
-    // Stop gives the Dot and the panel back on the main thread while a capture may be under way:
-    // a window of ours that could show at any moment of the copy could be in the image, so it is
-    // not returned, even when it was excluded again before this check. The windows this capture
-    // excluded go back as they were, so a Stop meanwhile keeps them visible in the user's own
-    // screenshots (#163 finding 3).
-    let clean = UNEXCLUDED.load(Ordering::SeqCst) == unexcluded && own_windows_excluded();
+    // A window of ours can show during the copy and be gone by now (the user opens the panel and
+    // closes it again, Stop gives the Dot back, a dialog opens and closes): every change of our
+    // windows' visibility or exclusion is counted, and an image taken while one happened is not
+    // returned. The windows this capture excluded go back as they were, so the user's own
+    // screenshots show them (#163 finding 3).
+    let clean = OWN_WINDOW_CHANGES.load(Ordering::SeqCst) == changes && own_windows_excluded();
     restore_affinity(&changed);
     let shot = shot?;
     if !clean {
@@ -499,8 +499,7 @@ fn is_excluded(hwnd: HWND) -> bool {
 }
 
 /// Makes sure no visible window of this process shows in the capture about to be taken, and
-/// returns the ones it had to exclude, for `restore_affinity` once the capture is taken: the
-/// session's own exclusion is applied on the main thread, so it is not relied on here. A window
+/// returns the ones it had to exclude, for `restore_affinity` once the capture is taken. A window
 /// newly excluded is out of the picture after the next composition (`DwmFlush`).
 fn exclude_own_windows() -> Result<Vec<HWND>, String> {
     let mut changed = Vec::new();
@@ -523,13 +522,15 @@ fn own_windows_excluded() -> bool {
     own_visible_windows().into_iter().all(is_excluded)
 }
 
-/// How many times a window of this process was let show in captures again: a capture during which
-/// it changed may hold one of them.
-static UNEXCLUDED: AtomicU64 = AtomicU64::new(0);
-/// A window of this process was shown that could not be kept out of captures (a dialog whose
-/// exclusion failed): a capture under way is dropped, as if a window had been let show.
-pub(crate) fn note_capturable_window() {
-    UNEXCLUDED.fetch_add(1, Ordering::SeqCst);
+/// How many times a window of this process was shown, hidden, or let show in captures again, or
+/// a dialog that could not be kept out of them came or went: a capture during which this changed
+/// may hold one of them.
+static OWN_WINDOW_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// Called before a window of this process is shown or hidden by any route (tao, Win32, a dialog
+/// opening or closing), so a capture under way is dropped.
+pub(crate) fn note_own_window_change() {
+    OWN_WINDOW_CHANGES.fetch_add(1, Ordering::SeqCst);
 }
 
 /// Lets the windows a capture excluded show in screenshots again, as they did before it. A window
@@ -545,7 +546,7 @@ pub fn set_capture_excluded(hwnd: *mut c_void, excluded: bool) -> Result<(), Str
     let affinity = if excluded { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
     if !excluded {
         // Counted before the change, so a capture under way sees it whatever happens next.
-        UNEXCLUDED.fetch_add(1, Ordering::SeqCst);
+        OWN_WINDOW_CHANGES.fetch_add(1, Ordering::SeqCst);
     }
     // SAFETY: a plain call on a window handle of this process.
     if unsafe { SetWindowDisplayAffinity(hwnd, affinity) } != 0 {
@@ -1431,16 +1432,15 @@ pub fn focused_frame() -> Option<Frame> {
     (width > 0 && height > 0).then(|| Frame { x: f64::from(rect.left), y: f64::from(rect.top), width: f64::from(width), height: f64::from(height) })
 }
 
-/// Prevent activation and capture of the click-through glow.
-pub fn prepare_overlay(hwnd: *mut c_void) {
+/// Prevent activation and capture of the click-through glow. A glow that cannot be kept out of
+/// screenshots is not used: without it no call captures or acts (S5).
+pub fn prepare_overlay(hwnd: *mut c_void) -> Result<(), String> {
     // SAFETY: calls on this process's window.
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize);
     }
-    if let Err(error) = exclude_from_capture(hwnd) {
-        eprintln!("gentle-dot: the glow may show in computer-control screenshots: {error}");
-    }
+    exclude_from_capture(hwnd).map_err(|error| format!("it would show in computer-control screenshots: {error}"))
 }
 
 /// Show above other windows without activation, or hide.
@@ -1455,16 +1455,19 @@ pub fn show_overlay(hwnd: *mut c_void, visible: bool) {
 }
 
 pub fn show_without_activating(hwnd: *mut c_void) {
+    note_own_window_change();
     // SAFETY: a call on this process's window.
     unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
 }
 
 pub fn hide_window(hwnd: *mut c_void) {
+    note_own_window_change();
     // SAFETY: a call on this process's window.
     unsafe { ShowWindow(hwnd, SW_HIDE) };
 }
 
 pub fn show_window(hwnd: *mut c_void) {
+    note_own_window_change();
     // SAFETY: a call on this process's window.
     unsafe { ShowWindow(hwnd, SW_SHOW) };
 }
@@ -1734,20 +1737,28 @@ mod tests {
         assert!(!excluded_after, "the capture put the window's affinity back");
     }
 
-    /// A capture notices any window let show while it ran: one let show again (even a failed
-    /// attempt, the change may have happened), one restored after another capture, or a dialog
-    /// that could not be kept out of captures.
+    /// A capture notices any change of our windows while it ran: one let show again (even a failed
+    /// attempt, the change may have happened), one restored after another capture, one shown or
+    /// hidden, or a dialog that could not be kept out of captures coming or going.
     #[test]
     fn captures_notice_windows_let_show_meanwhile() {
-        let before = UNEXCLUDED.load(Ordering::SeqCst);
+        let mut expected = OWN_WINDOW_CHANGES.load(Ordering::SeqCst);
+        let mut changed = |what: &str| {
+            expected += 1;
+            assert_eq!(OWN_WINDOW_CHANGES.load(Ordering::SeqCst), expected, "{what}");
+        };
         assert!(set_capture_excluded(null_mut(), false).is_err());
-        let after_unexclude = UNEXCLUDED.load(Ordering::SeqCst);
-        assert_eq!(after_unexclude, before + 1);
+        changed("let show again");
         restore_affinity(&[null_mut()]);
-        let after_restore = UNEXCLUDED.load(Ordering::SeqCst);
-        assert_eq!(after_restore, after_unexclude + 1);
-        note_capturable_window();
-        assert_eq!(UNEXCLUDED.load(Ordering::SeqCst), after_restore + 1);
+        changed("restored after a capture");
+        show_window(null_mut());
+        changed("shown");
+        show_without_activating(null_mut());
+        changed("shown without activation");
+        hide_window(null_mut());
+        changed("hidden");
+        note_own_window_change();
+        changed("a dialog that could not be excluded");
     }
 
     #[test]

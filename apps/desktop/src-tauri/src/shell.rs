@@ -255,6 +255,8 @@ fn hide_panel(app: AppHandle) -> CommandResult {
             *shell.panel_spot.lock().unwrap() = Some((rect.x, rect.y));
         }
     }
+    #[cfg(windows)]
+    computer::note_window_change();
     panel.hide().map_err(err)?;
     #[cfg(windows)]
     computer::set_shown(&panel, false)?;
@@ -273,6 +275,8 @@ fn set_rose_hidden(app: AppHandle, hidden: bool) -> CommandResult<bool> {
     position::save_rose_hidden(&desktop_file(&shell.config), hidden).map_err(err)?;
     shell.rose_hidden.store(hidden, Ordering::SeqCst);
     let dot = window(&app, DOT)?;
+    #[cfg(windows)]
+    computer::note_window_change();
     if hidden {
         dot.hide().map_err(err)?;
     } else {
@@ -493,6 +497,8 @@ fn show_panel(app: &AppHandle) -> CommandResult {
     restore_panel(&window(app, PANEL)?)?;
     place_panel(app)?;
     let panel = window(app, PANEL)?;
+    #[cfg(windows)]
+    computer::note_window_change();
     panel.show().map_err(err)?;
     #[cfg(windows)]
     computer::set_shown(&panel, true)?;
@@ -733,7 +739,14 @@ fn rose_hidden_state(app: &AppHandle) -> bool {
 }
 
 fn show_message(app: &AppHandle, kind: MessageDialogKind, text: &str) {
-    app.dialog().message(text).title("Gentle Dot").kind(kind).show(|_| {});
+    // The box is not kept out of screenshots, so the user's own show it: a computer-control
+    // capture while it opens or closes is dropped.
+    #[cfg(windows)]
+    computer::note_window_change();
+    app.dialog().message(text).title("Gentle Dot").kind(kind).show(|_| {
+        #[cfg(windows)]
+        computer::note_window_change();
+    });
 }
 
 fn open_in_browser(app: &AppHandle) -> CommandResult {

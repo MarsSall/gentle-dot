@@ -188,7 +188,7 @@ mod windows {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::UI::Controls::{
         TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
-        TDF_CALLBACK_TIMER, TDF_SIZE_TO_CONTENT, TDM_CLICK_BUTTON, TDN_CREATED, TDN_TIMER,
+        TDF_CALLBACK_TIMER, TDF_SIZE_TO_CONTENT, TDM_CLICK_BUTTON, TDN_CREATED, TDN_DESTROYED, TDN_TIMER,
         TD_WARNING_ICON,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -203,6 +203,8 @@ mod windows {
     struct Watch<'a> {
         open: Option<&'a OpenDialog>,
         deadline: Option<std::time::Instant>,
+        /// The dialog could not be kept out of screenshots: its closing is counted as its opening was.
+        capturable: std::sync::atomic::AtomicBool,
     }
 
     /// Called only from the dialog's own callback, where `hwnd` is its live window.
@@ -234,10 +236,15 @@ mod windows {
                 // Like Gentle Dot's other windows, kept out of computer-control screenshots.
                 if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) == 0 {
                     eprintln!("gentle-dot: a dialog may show in computer-control screenshots");
-                    // A computer-control capture under way while it shows is dropped.
-                    crate::computer::win::note_capturable_window();
+                    // A computer-control capture under way while it opens or closes is dropped,
+                    // and one taken while it is open sees it at its own check.
+                    watch.capturable.store(true, Ordering::SeqCst);
+                    crate::computer::win::note_own_window_change();
                 }
             }
+        }
+        if notification == TDN_DESTROYED as u32 && watch.capturable.load(Ordering::SeqCst) {
+            crate::computer::win::note_own_window_change();
         }
         0
     }
@@ -255,7 +262,7 @@ mod windows {
         if let Some(open) = open {
             open.0.store(false, Ordering::SeqCst);
         }
-        let watch = Watch { open, deadline };
+        let watch = Watch { open, deadline, capturable: std::sync::atomic::AtomicBool::new(false) };
         let (title, message) = (wide(title), wide(message));
         let (allow, refuse) = (wide(choice.allow), wide(choice.refuse));
         let buttons = [

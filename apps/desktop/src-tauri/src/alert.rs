@@ -234,6 +234,8 @@ mod windows {
                 // Like Gentle Dot's other windows, kept out of computer-control screenshots.
                 if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) == 0 {
                     eprintln!("gentle-dot: a dialog may show in computer-control screenshots");
+                    // A computer-control capture under way while it shows is dropped.
+                    crate::computer::win::note_capturable_window();
                 }
             }
         }

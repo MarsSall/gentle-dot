@@ -1,8 +1,9 @@
 //! The Windows desktop for computer control (S24 on Windows): input through `SendInput`, and
 //! screenshots of the monitor under the pointer through GDI. Gentle Dot's own windows are
 //! left out of captures by their display affinity (`WDA_EXCLUDEFROMCAPTURE`): the glow and the
-//! dialogs always, the Dot and the panel while a session is active (Windows cannot leave a window
-//! out of one capture only, and the user's own screenshots should still show them).
+//! dialogs always; the Dot and the panel, hidden during every call anyway, only for the length
+//! of each capture, so the user's own screenshots show them even during a session (Windows
+//! cannot leave a window out of one capture only).
 //!
 //! Points are physical pixels of the virtual screen: the app is per-monitor DPI aware, so the
 //! pointer, the monitors, and `SendInput` all use them.
@@ -525,41 +526,15 @@ fn own_windows_excluded() -> bool {
 /// How many times a window of this process was let show in captures again: a capture during which
 /// it changed may hold one of them.
 static UNEXCLUDED: AtomicU64 = AtomicU64::new(0);
-/// While a session keeps the Dot and the panel out of captures (set by the app on its main
-/// thread), the windows captures excluded meanwhile, let show again when it ends; `None` outside
-/// a session. One lock, so a capture ending as the session ends cannot keep a window out.
-static SESSION_EXCLUDED: std::sync::Mutex<Option<Vec<usize>>> = std::sync::Mutex::new(None);
-
-fn session_excluded() -> std::sync::MutexGuard<'static, Option<Vec<usize>>> {
-    SESSION_EXCLUDED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+/// A window of this process was shown that could not be kept out of captures (a dialog whose
+/// exclusion failed): a capture under way is dropped, as if a window had been let show.
+pub(crate) fn note_capturable_window() {
+    UNEXCLUDED.fetch_add(1, Ordering::SeqCst);
 }
 
-/// Tells captures whether a session keeps this process's windows out of them. At its end, the
-/// windows captures excluded during it show in screenshots again (an error dialog open meanwhile,
-/// say); the app lets the Dot and the panel show itself.
-pub fn set_session_exclusion(excluded: bool) {
-    let kept = {
-        let mut session = session_excluded();
-        match (excluded, session.take()) {
-            (true, kept) => {
-                *session = Some(kept.unwrap_or_default());
-                Vec::new()
-            }
-            (false, kept) => kept.unwrap_or_default(),
-        }
-    };
-    for hwnd in kept {
-        let _ = set_capture_excluded(hwnd as HWND, false);
-    }
-}
-
-/// Lets the windows a capture excluded show in screenshots again, as they did before it; during a
-/// session they stay out until it ends. A window that vanished meanwhile just fails.
+/// Lets the windows a capture excluded show in screenshots again, as they did before it. A window
+/// that vanished meanwhile just fails.
 fn restore_affinity(changed: &[HWND]) {
-    if let Some(kept) = session_excluded().as_mut() {
-        kept.extend(changed.iter().map(|&hwnd| hwnd as usize));
-        return;
-    }
     for &hwnd in changed {
         let _ = set_capture_excluded(hwnd, false);
     }
@@ -1759,24 +1734,20 @@ mod tests {
         assert!(!excluded_after, "the capture put the window's affinity back");
     }
 
-    /// A capture notices any window let show again while it ran, and keeps what it excluded out
-    /// while a session lasts, until it ends. One test: both use the same counters.
+    /// A capture notices any window let show while it ran: one let show again (even a failed
+    /// attempt, the change may have happened), one restored after another capture, or a dialog
+    /// that could not be kept out of captures.
     #[test]
     fn captures_notice_windows_let_show_meanwhile() {
         let before = UNEXCLUDED.load(Ordering::SeqCst);
-        // Even a failed attempt (no such window) counts: the change may have happened.
         assert!(set_capture_excluded(null_mut(), false).is_err());
-        assert!(UNEXCLUDED.load(Ordering::SeqCst) > before);
-        set_session_exclusion(true);
-        let during = UNEXCLUDED.load(Ordering::SeqCst);
+        let after_unexclude = UNEXCLUDED.load(Ordering::SeqCst);
+        assert_eq!(after_unexclude, before + 1);
         restore_affinity(&[null_mut()]);
-        assert_eq!(UNEXCLUDED.load(Ordering::SeqCst), during, "nothing is let show during a session");
-        // The end of the session lets show what captures kept out meanwhile.
-        set_session_exclusion(false);
-        let ended = UNEXCLUDED.load(Ordering::SeqCst);
-        assert_eq!(ended, during + 1, "the window kept out during the session");
-        restore_affinity(&[null_mut()]);
-        assert_eq!(UNEXCLUDED.load(Ordering::SeqCst), ended + 1, "outside a session it is let show at once");
+        let after_restore = UNEXCLUDED.load(Ordering::SeqCst);
+        assert_eq!(after_restore, after_unexclude + 1);
+        note_capturable_window();
+        assert_eq!(UNEXCLUDED.load(Ordering::SeqCst), after_restore + 1);
     }
 
     #[test]

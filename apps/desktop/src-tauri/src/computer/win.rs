@@ -39,7 +39,7 @@ use super::{
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, ERROR_TIMEOUT, HWND, LPARAM, POINT, RECT,
@@ -525,19 +525,39 @@ fn own_windows_excluded() -> bool {
 /// How many times a window of this process was let show in captures again: a capture during which
 /// it changed may hold one of them.
 static UNEXCLUDED: AtomicU64 = AtomicU64::new(0);
-/// Whether a session keeps the Dot and the panel out of captures (set by the app on its main
-/// thread): a capture then leaves the windows it excluded excluded.
-static SESSION_EXCLUDES: AtomicBool = AtomicBool::new(false);
+/// While a session keeps the Dot and the panel out of captures (set by the app on its main
+/// thread), the windows captures excluded meanwhile, let show again when it ends; `None` outside
+/// a session. One lock, so a capture ending as the session ends cannot keep a window out.
+static SESSION_EXCLUDED: std::sync::Mutex<Option<Vec<usize>>> = std::sync::Mutex::new(None);
 
-/// Tells captures whether a session keeps this process's windows out of them.
-pub fn set_session_exclusion(excluded: bool) {
-    SESSION_EXCLUDES.store(excluded, Ordering::SeqCst);
+fn session_excluded() -> std::sync::MutexGuard<'static, Option<Vec<usize>>> {
+    SESSION_EXCLUDED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Lets the windows a capture excluded show in screenshots again, as they did before it, unless a
-/// session keeps them out meanwhile. A window that vanished meanwhile just fails.
+/// Tells captures whether a session keeps this process's windows out of them. At its end, the
+/// windows captures excluded during it show in screenshots again (an error dialog open meanwhile,
+/// say); the app lets the Dot and the panel show itself.
+pub fn set_session_exclusion(excluded: bool) {
+    let kept = {
+        let mut session = session_excluded();
+        match (excluded, session.take()) {
+            (true, kept) => {
+                *session = Some(kept.unwrap_or_default());
+                Vec::new()
+            }
+            (false, kept) => kept.unwrap_or_default(),
+        }
+    };
+    for hwnd in kept {
+        let _ = set_capture_excluded(hwnd as HWND, false);
+    }
+}
+
+/// Lets the windows a capture excluded show in screenshots again, as they did before it; during a
+/// session they stay out until it ends. A window that vanished meanwhile just fails.
 fn restore_affinity(changed: &[HWND]) {
-    if SESSION_EXCLUDES.load(Ordering::SeqCst) {
+    if let Some(kept) = session_excluded().as_mut() {
+        kept.extend(changed.iter().map(|&hwnd| hwnd as usize));
         return;
     }
     for &hwnd in changed {
@@ -1739,8 +1759,8 @@ mod tests {
         assert!(!excluded_after, "the capture put the window's affinity back");
     }
 
-    /// A capture notices any window let show again while it ran, and leaves what it excluded
-    /// excluded while a session keeps the windows out. One test: both use the same counters.
+    /// A capture notices any window let show again while it ran, and keeps what it excluded out
+    /// while a session lasts, until it ends. One test: both use the same counters.
     #[test]
     fn captures_notice_windows_let_show_meanwhile() {
         let before = UNEXCLUDED.load(Ordering::SeqCst);
@@ -1751,9 +1771,12 @@ mod tests {
         let during = UNEXCLUDED.load(Ordering::SeqCst);
         restore_affinity(&[null_mut()]);
         assert_eq!(UNEXCLUDED.load(Ordering::SeqCst), during, "nothing is let show during a session");
+        // The end of the session lets show what captures kept out meanwhile.
         set_session_exclusion(false);
+        let ended = UNEXCLUDED.load(Ordering::SeqCst);
+        assert_eq!(ended, during + 1, "the window kept out during the session");
         restore_affinity(&[null_mut()]);
-        assert!(UNEXCLUDED.load(Ordering::SeqCst) > during);
+        assert_eq!(UNEXCLUDED.load(Ordering::SeqCst), ended + 1, "outside a session it is let show at once");
     }
 
     #[test]

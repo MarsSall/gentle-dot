@@ -40,7 +40,7 @@ use super::{
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, SetLastError, ERROR_TIMEOUT, HWND, LPARAM, POINT, RECT,
@@ -414,15 +414,17 @@ fn draw_pointer(canvas: &Canvas, frame: MonitorFrame, width: u32, height: u32) {
 /// A screenshot of the monitor under the pointer, downscaled to `MAX_LONG_EDGE`, Gentle Dot's
 /// windows excluded.
 pub fn capture() -> Result<Capture, String> {
-    let changes = OWN_WINDOW_CHANGES.load(Ordering::SeqCst);
+    let baseline = capture_baseline()?;
     let changed = exclude_own_windows()?;
     let shot = grab();
     // A window of ours can show during the copy and be gone by now (the user opens the panel and
-    // closes it again, Stop gives the Dot back, a dialog opens and closes): every change of our
-    // windows' visibility or exclusion is counted, and an image taken while one happened is not
-    // returned. The windows this capture excluded go back as they were, so the user's own
-    // screenshots show them (#163 finding 3).
-    let clean = OWN_WINDOW_CHANGES.load(Ordering::SeqCst) == changes && own_windows_excluded();
+    // closes it again, Stop gives the Dot back, a dialog opens and closes). Every change of our
+    // windows runs inside a `WindowChange`, and an image taken while one overlapped it is not
+    // returned. Checked after the windows, so a change ending between the two is still seen. The
+    // windows this capture excluded go back as they were, so the user's own screenshots show them
+    // (#163 finding 3).
+    let excluded = own_windows_excluded();
+    let clean = excluded && unchanged_since(baseline);
     restore_affinity(&changed);
     let shot = shot?;
     if !clean {
@@ -522,15 +524,50 @@ fn own_windows_excluded() -> bool {
     own_visible_windows().into_iter().all(is_excluded)
 }
 
-/// How many times a window of this process was shown, hidden, or let show in captures again, or
-/// a dialog that could not be kept out of them came or went: a capture during which this changed
-/// may hold one of them.
+/// How many changes of this process's windows began or ended: one shown or hidden, let show in
+/// captures again, or a dialog that could not be kept out of them, for its whole life.
 static OWN_WINDOW_CHANGES: AtomicU64 = AtomicU64::new(0);
+/// How many such changes are under way.
+static OWN_WINDOWS_CHANGING: AtomicUsize = AtomicUsize::new(0);
 
-/// Called before a window of this process is shown or hidden by any route (tao, Win32, a dialog
-/// opening or closing), so a capture under way is dropped.
-pub(crate) fn note_own_window_change() {
-    OWN_WINDOW_CHANGES.fetch_add(1, Ordering::SeqCst);
+const OWN_WINDOW_BUSY: &str =
+    "A Gentle Dot window is opening, closing, or waiting for you, so no screenshot was taken. Take another in a moment.";
+
+/// A change of this process's windows under way, from before it starts until after it ends (when
+/// dropped). A capture that overlaps one in any way is not returned: either one is under way when
+/// it starts, or the count moved by the time it ends. The order matters: a change is marked under
+/// way before it is counted, and counted before it is no longer under way; a capture reads the
+/// count before what is under way when it starts, and the other way round when it ends.
+#[must_use]
+pub(crate) struct WindowChange(());
+
+impl WindowChange {
+    pub(crate) fn begin() -> WindowChange {
+        OWN_WINDOWS_CHANGING.fetch_add(1, Ordering::SeqCst);
+        OWN_WINDOW_CHANGES.fetch_add(1, Ordering::SeqCst);
+        WindowChange(())
+    }
+}
+
+impl Drop for WindowChange {
+    fn drop(&mut self) {
+        OWN_WINDOW_CHANGES.fetch_add(1, Ordering::SeqCst);
+        OWN_WINDOWS_CHANGING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The count a capture compares with when it ends, or why it cannot start.
+fn capture_baseline() -> Result<u64, String> {
+    let changes = OWN_WINDOW_CHANGES.load(Ordering::SeqCst);
+    if OWN_WINDOWS_CHANGING.load(Ordering::SeqCst) > 0 {
+        return Err(OWN_WINDOW_BUSY.into());
+    }
+    Ok(changes)
+}
+
+/// Whether no change of our windows overlapped the capture that started at `baseline`.
+fn unchanged_since(baseline: u64) -> bool {
+    OWN_WINDOWS_CHANGING.load(Ordering::SeqCst) == 0 && OWN_WINDOW_CHANGES.load(Ordering::SeqCst) == baseline
 }
 
 /// Lets the windows a capture excluded show in screenshots again, as they did before it. A window
@@ -544,10 +581,8 @@ fn restore_affinity(changed: &[HWND]) {
 /// Leaves a window of this process out of screenshots, or lets it show in them again.
 pub fn set_capture_excluded(hwnd: *mut c_void, excluded: bool) -> Result<(), String> {
     let affinity = if excluded { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
-    if !excluded {
-        // Counted before the change, so a capture under way sees it whatever happens next.
-        OWN_WINDOW_CHANGES.fetch_add(1, Ordering::SeqCst);
-    }
+    // Letting a window show again is a change a capture under way must see, whatever its result.
+    let _change = (!excluded).then(WindowChange::begin);
     // SAFETY: a plain call on a window handle of this process.
     if unsafe { SetWindowDisplayAffinity(hwnd, affinity) } != 0 {
         Ok(())
@@ -1455,19 +1490,19 @@ pub fn show_overlay(hwnd: *mut c_void, visible: bool) {
 }
 
 pub fn show_without_activating(hwnd: *mut c_void) {
-    note_own_window_change();
+    let _change = WindowChange::begin();
     // SAFETY: a call on this process's window.
     unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
 }
 
 pub fn hide_window(hwnd: *mut c_void) {
-    note_own_window_change();
+    let _change = WindowChange::begin();
     // SAFETY: a call on this process's window.
     unsafe { ShowWindow(hwnd, SW_HIDE) };
 }
 
 pub fn show_window(hwnd: *mut c_void) {
-    note_own_window_change();
+    let _change = WindowChange::begin();
     // SAFETY: a call on this process's window.
     unsafe { ShowWindow(hwnd, SW_SHOW) };
 }
@@ -1737,28 +1772,43 @@ mod tests {
         assert!(!excluded_after, "the capture put the window's affinity back");
     }
 
-    /// A capture notices any change of our windows while it ran: one let show again (even a failed
-    /// attempt, the change may have happened), one restored after another capture, one shown or
-    /// hidden, or a dialog that could not be kept out of captures coming or going.
+    /// A capture overlapping a change of our windows in any way is not returned: one under way
+    /// when it starts stops it, and one that begins or ends before it ends moves the count. Every
+    /// route counts: letting a window show again (even a failed attempt), a capture's own restore,
+    /// showing and hiding. One test: all use the same counters.
     #[test]
-    fn captures_notice_windows_let_show_meanwhile() {
-        let mut expected = OWN_WINDOW_CHANGES.load(Ordering::SeqCst);
-        let mut changed = |what: &str| {
-            expected += 1;
-            assert_eq!(OWN_WINDOW_CHANGES.load(Ordering::SeqCst), expected, "{what}");
-        };
-        assert!(set_capture_excluded(null_mut(), false).is_err());
-        changed("let show again");
-        restore_affinity(&[null_mut()]);
-        changed("restored after a capture");
-        show_window(null_mut());
-        changed("shown");
-        show_without_activating(null_mut());
-        changed("shown without activation");
-        hide_window(null_mut());
-        changed("hidden");
-        note_own_window_change();
-        changed("a dialog that could not be excluded");
+    fn captures_notice_windows_changed_meanwhile() {
+        // Under way when the capture starts.
+        let change = WindowChange::begin();
+        assert_eq!(capture_baseline(), Err(OWN_WINDOW_BUSY.to_string()));
+        drop(change);
+        // Begins and ends within the capture.
+        let baseline = capture_baseline().expect("nothing under way");
+        drop(WindowChange::begin());
+        assert!(!unchanged_since(baseline));
+        // Begins within the capture, still under way when it ends.
+        let baseline = capture_baseline().expect("nothing under way");
+        let change = WindowChange::begin();
+        assert!(!unchanged_since(baseline));
+        drop(change);
+        // Every route is a whole change.
+        let routes: [(&str, &dyn Fn()); 5] = [
+            ("let show again", &|| { let _ = set_capture_excluded(null_mut(), false); }),
+            ("restored after a capture", &|| restore_affinity(&[null_mut()])),
+            ("shown", &|| show_window(null_mut())),
+            ("shown without activation", &|| show_without_activating(null_mut())),
+            ("hidden", &|| hide_window(null_mut())),
+        ];
+        for (what, route) in routes {
+            let baseline = capture_baseline().expect("nothing under way");
+            route();
+            assert!(!unchanged_since(baseline), "{what}");
+            assert!(capture_baseline().is_ok(), "{what} ended");
+        }
+        // Excluding a window is not a change a capture must see.
+        let baseline = capture_baseline().expect("nothing under way");
+        let _ = set_capture_excluded(null_mut(), true);
+        assert!(unchanged_since(baseline));
     }
 
     #[test]

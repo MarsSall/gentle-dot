@@ -32,7 +32,9 @@ use tauri::{
     WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
-use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+#[cfg(not(windows))]
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::MessageDialogKind;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
@@ -740,14 +742,16 @@ fn rose_hidden_state(app: &AppHandle) -> bool {
 }
 
 fn show_message(app: &AppHandle, kind: MessageDialogKind, text: &str) {
-    // The box is not kept out of screenshots, so the user's own show it: from before it opens
-    // until after it closed, no computer-control capture is returned.
+    // Gentle Dot's own task dialog on Windows: its life is known exactly, so computer-control
+    // captures are held off while it shows (the plugin's box closes on another thread, and its
+    // close can be reported late or not at all).
     #[cfg(windows)]
-    let change = computer::window_change();
-    app.dialog().message(text).title("Gentle Dot").kind(kind).show(move |_| {
-        #[cfg(windows)]
-        drop(change);
-    });
+    {
+        let _ = app;
+        crate::alert::tell("Gentle Dot", text, matches!(kind, MessageDialogKind::Error));
+    }
+    #[cfg(not(windows))]
+    app.dialog().message(text).title("Gentle Dot").kind(kind).show(|_| {});
 }
 
 fn open_in_browser(app: &AppHandle) -> CommandResult {

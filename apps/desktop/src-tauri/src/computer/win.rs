@@ -491,7 +491,7 @@ fn own_visible_windows() -> Vec<HWND> {
 fn is_excluded(hwnd: HWND) -> bool {
     let mut affinity = 0u32;
     // SAFETY: `affinity` is a valid out-pointer.
-    unsafe { GetWindowDisplayAffinity(hwnd, &mut affinity) } != 0 && affinity == WDA_EXCLUDEFROMCAPTURE
+    (unsafe { GetWindowDisplayAffinity(hwnd, &mut affinity) }) != 0 && affinity == WDA_EXCLUDEFROMCAPTURE
 }
 
 /// Makes sure no visible window of this process shows in the capture about to be taken, and

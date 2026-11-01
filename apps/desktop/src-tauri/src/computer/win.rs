@@ -412,7 +412,23 @@ fn draw_pointer(canvas: &Canvas, frame: MonitorFrame, width: u32, height: u32) {
 /// A screenshot of the monitor under the pointer, downscaled to `MAX_LONG_EDGE`, Gentle Dot's
 /// windows excluded.
 pub fn capture() -> Result<Capture, String> {
-    exclude_own_windows()?;
+    let changed = exclude_own_windows()?;
+    let shot = grab();
+    // Stop gives the Dot and the panel back on the main thread while a capture may be under way:
+    // a window of ours that lost its exclusion during the copy could be in the image, so it is
+    // not returned. The windows this capture excluded go back as they were, so a Stop meanwhile
+    // keeps them visible in the user's own screenshots (#163 finding 3).
+    let clean = own_windows_excluded();
+    restore_affinity(&changed);
+    let shot = shot?;
+    if !clean {
+        return Err("Gentle Dot's window could show in the screenshot, so it was not taken. Take another.".into());
+    }
+    Ok(shot)
+}
+
+/// The screenshot itself, once Gentle Dot's windows are out of it.
+fn grab() -> Result<Capture, String> {
     let pointer = pointer_location().ok_or("cannot read the pointer position")?;
     let frame = monitor_at(pointer).ok_or("no display under the pointer")?;
     if frame.width <= 0 || frame.height <= 0 {
@@ -456,10 +472,8 @@ pub fn exclude_from_capture(hwnd: *mut c_void) -> Result<(), String> {
     set_capture_excluded(hwnd, true)
 }
 
-/// Makes sure no visible window of this process shows in the capture about to be taken: the
-/// session's own exclusion is applied later on the main thread, so it is not relied on here. A
-/// window newly excluded is out of the picture after the next composition (`DwmFlush`).
-fn exclude_own_windows() -> Result<(), String> {
+/// The visible top-level windows of this process.
+fn own_visible_windows() -> Vec<HWND> {
     unsafe extern "system" fn collect(hwnd: HWND, state: LPARAM) -> i32 {
         // SAFETY: `state` is the vector passed below, alive for the whole enumeration.
         unsafe { (*(state as *mut Vec<HWND>)).push(hwnd) };
@@ -469,24 +483,48 @@ fn exclude_own_windows() -> Result<(), String> {
     // SAFETY: the callback only appends to `handles`, which outlives the call.
     unsafe { EnumWindows(Some(collect), &mut handles as *mut Vec<HWND> as LPARAM) };
     let own = std::process::id() as i32;
-    let mut changed = false;
-    for hwnd in handles {
-        // SAFETY: plain queries on a window handle (a vanished window just reads as hidden).
-        if window_pid(hwnd) != own || unsafe { IsWindowVisible(hwnd) } == 0 {
-            continue;
+    // SAFETY: plain queries on a window handle (a vanished window just reads as hidden).
+    handles.retain(|&hwnd| window_pid(hwnd) == own && unsafe { IsWindowVisible(hwnd) } != 0);
+    handles
+}
+
+fn is_excluded(hwnd: HWND) -> bool {
+    let mut affinity = 0u32;
+    // SAFETY: `affinity` is a valid out-pointer.
+    unsafe { GetWindowDisplayAffinity(hwnd, &mut affinity) } != 0 && affinity == WDA_EXCLUDEFROMCAPTURE
+}
+
+/// Makes sure no visible window of this process shows in the capture about to be taken, and
+/// returns the ones it had to exclude, for `restore_affinity` once the capture is taken: the
+/// session's own exclusion is applied on the main thread, so it is not relied on here. A window
+/// newly excluded is out of the picture after the next composition (`DwmFlush`).
+fn exclude_own_windows() -> Result<Vec<HWND>, String> {
+    let mut changed = Vec::new();
+    for hwnd in own_visible_windows().into_iter().filter(|&hwnd| !is_excluded(hwnd)) {
+        if let Err(error) = set_capture_excluded(hwnd, true) {
+            restore_affinity(&changed);
+            return Err(format!("Gentle Dot's window would show in the screenshot: {error}"));
         }
-        let mut affinity = 0u32;
-        // SAFETY: `affinity` is a valid out-pointer.
-        if unsafe { GetWindowDisplayAffinity(hwnd, &mut affinity) } == 0 || affinity != WDA_EXCLUDEFROMCAPTURE {
-            set_capture_excluded(hwnd, true).map_err(|e| format!("Gentle Dot's window would show in the screenshot: {e}"))?;
-            changed = true;
-        }
+        changed.push(hwnd);
     }
-    if changed {
+    if !changed.is_empty() {
         // SAFETY: a plain call; it waits for the next composition.
         unsafe { DwmFlush() };
     }
-    Ok(())
+    Ok(changed)
+}
+
+/// Whether every visible window of this process is still out of captures.
+fn own_windows_excluded() -> bool {
+    own_visible_windows().into_iter().all(is_excluded)
+}
+
+/// Lets the windows a capture excluded show in screenshots again, as they did before it. A window
+/// that vanished meanwhile just fails.
+fn restore_affinity(changed: &[HWND]) {
+    for &hwnd in changed {
+        let _ = set_capture_excluded(hwnd, false);
+    }
 }
 
 /// Leaves a window of this process out of screenshots, or lets it show in them again.
@@ -1654,6 +1692,29 @@ mod tests {
         assert!(build >= CAPTURE_EXCLUSION_BUILD, "{build}");
         use super::super::Desktop;
         assert!(WinDesktop.permissions().screenshots_supported);
+    }
+
+    /// A window of this process shown and not excluded is left out of a capture, then shows in
+    /// screenshots again: the capture puts back what it changed (#163 finding 3, CC8 review).
+    #[test]
+    #[ignore = "interactive Windows desktop: run in the user's own session"]
+    fn a_capture_puts_our_windows_back_as_it_found_them() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_OVERLAPPEDWINDOW, WS_VISIBLE};
+        per_monitor_aware();
+        let class = wide("STATIC");
+        let title = wide("Gentle Dot capture test");
+        // SAFETY: a plain window of this test process, destroyed below.
+        let hwnd = unsafe {
+            CreateWindowExW(0, class.as_ptr(), title.as_ptr(), WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 300, 200, null_mut(), null_mut(), null_mut(), null_mut())
+        };
+        assert!(!hwnd.is_null());
+        assert!(!is_excluded(hwnd));
+        let shot = capture();
+        let excluded_after = is_excluded(hwnd);
+        // SAFETY: the window created above.
+        unsafe { DestroyWindow(hwnd) };
+        shot.expect("a screenshot");
+        assert!(!excluded_after, "the capture put the window's affinity back");
     }
 
     #[test]

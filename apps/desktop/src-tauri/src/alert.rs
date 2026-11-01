@@ -203,8 +203,9 @@ mod windows {
     struct Watch<'a> {
         open: Option<&'a OpenDialog>,
         deadline: Option<std::time::Instant>,
-        /// The dialog could not be kept out of screenshots: its closing is counted as its opening was.
-        capturable: std::sync::atomic::AtomicBool,
+        /// The dialog could not be kept out of screenshots: no computer-control capture is returned
+        /// from its creation until it is destroyed.
+        capturable: std::sync::Mutex<Option<crate::computer::win::WindowChange>>,
     }
 
     /// Called only from the dialog's own callback, where `hwnd` is its live window.
@@ -236,15 +237,15 @@ mod windows {
                 // Like Gentle Dot's other windows, kept out of computer-control screenshots.
                 if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) == 0 {
                     eprintln!("gentle-dot: a dialog may show in computer-control screenshots");
-                    // A computer-control capture under way while it opens or closes is dropped,
-                    // and one taken while it is open sees it at its own check.
-                    watch.capturable.store(true, Ordering::SeqCst);
-                    crate::computer::win::note_own_window_change();
+                    // From now until it is destroyed (before it is displayed and after it is gone),
+                    // no computer-control capture is returned.
+                    let change = crate::computer::win::WindowChange::begin();
+                    *watch.capturable.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(change);
                 }
             }
         }
-        if notification == TDN_DESTROYED as u32 && watch.capturable.load(Ordering::SeqCst) {
-            crate::computer::win::note_own_window_change();
+        if notification == TDN_DESTROYED as u32 {
+            watch.capturable.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
         }
         0
     }
@@ -262,7 +263,7 @@ mod windows {
         if let Some(open) = open {
             open.0.store(false, Ordering::SeqCst);
         }
-        let watch = Watch { open, deadline, capturable: std::sync::atomic::AtomicBool::new(false) };
+        let watch = Watch { open, deadline, capturable: std::sync::Mutex::new(None) };
         let (title, message) = (wide(title), wide(message));
         let (allow, refuse) = (wide(choice.allow), wide(choice.refuse));
         let buttons = [

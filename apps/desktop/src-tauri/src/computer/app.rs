@@ -121,11 +121,11 @@ pub fn hide_for_call(window: &tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
-/// A window of Gentle Dot is about to be shown or hidden through tao (the panel, the Dot): a
-/// computer-control capture under way is dropped.
+/// A window of Gentle Dot is shown or hidden through tao (the panel, the Dot) while the returned
+/// change lives: a computer-control capture overlapping it is not returned.
 #[cfg(windows)]
-pub fn note_window_change() {
-    super::win::note_own_window_change();
+pub(crate) fn window_change() -> super::win::WindowChange {
+    super::win::WindowChange::begin()
 }
 
 #[cfg(windows)]

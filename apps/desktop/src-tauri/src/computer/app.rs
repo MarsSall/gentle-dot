@@ -168,8 +168,6 @@ pub fn start(app: &AppHandle, windows: Arc<dyn Windows>) -> Computer {
             let _ = item.0.set_checked(event.yolo);
         }
         let _ = session.send(Overlay::Session(event.active));
-        #[cfg(windows)]
-        keep_out_of_capture(&events, event.active);
         // Stop, panic, or the timeout: the call under way gives the Dot and the panel back now.
         if !event.active {
             session_ended();
@@ -461,28 +459,6 @@ fn run_glow(app: AppHandle, window: tauri::WebviewWindow, control: Arc<Control>,
         }
     });
     if let Err(error) = spawned { eprintln!("gentle-dot: the computer-control glow is unavailable: {error}"); }
-}
-
-/// Change only window display affinity on the main thread.
-#[cfg(windows)]
-fn keep_out_of_capture(app: &AppHandle, reported: bool) {
-    let handle = app.clone();
-    let scheduled = app.run_on_main_thread(move || {
-        // Reports can arrive out of order (Control reports after releasing its lock), so the
-        // state applied is the session's own when this runs: a late report of an active session
-        // never excludes the windows again after Stop.
-        let excluded = handle
-            .try_state::<Computer>()
-            .map_or(reported, |computer| computer.control.is_active(SystemClock.now_ms()));
-        super::win::set_session_exclusion(excluded);
-        for label in [crate::shell::DOT, crate::shell::PANEL] {
-            let Some(window) = handle.get_webview_window(label) else { continue };
-            let changed = window.hwnd().map_err(|e| e.to_string())
-                .and_then(|hwnd| super::win::set_capture_excluded(hwnd.0, excluded));
-            if let Err(error) = changed { eprintln!("gentle-dot: the {label} window may show in computer-control screenshots: {error}"); }
-        }
-    });
-    if let Err(error) = scheduled { eprintln!("gentle-dot: Gentle Dot's windows may show in computer-control screenshots: {error}"); }
 }
 
 /// Reports the timeout when it happens, not only at the next tool call.

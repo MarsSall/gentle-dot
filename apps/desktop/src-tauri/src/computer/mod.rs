@@ -23,7 +23,7 @@ pub mod server;
 pub mod session;
 pub mod windows;
 #[cfg(windows)]
-mod win;
+pub(crate) mod win;
 // The Windows desktop's pure parts, tested everywhere: UI Automation element mapping, which
 // processes are apps, and what Windows posts for each input event. The Windows desktop backend
 // widens each to `any(windows, test)` once it uses it.

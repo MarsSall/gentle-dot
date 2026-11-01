@@ -97,6 +97,20 @@ impl Choice {
     }
 }
 
+/// Shows an error or a warning with one OK button, on a thread of its own (Windows). Unlike the
+/// asking dialogs it is not kept out of screenshots, so the user's own show it; from its creation
+/// until it is destroyed no computer-control capture is returned.
+#[cfg(windows)]
+pub fn tell(title: &str, message: &str, error: bool) {
+    let (title, message) = (title.to_string(), message.to_string());
+    let shown = std::thread::Builder::new()
+        .name("message-box".into())
+        .spawn(move || windows::tell(&title, &message, error));
+    if let Err(problem) = shown {
+        eprintln!("gentle-dot: cannot show a message: {problem}");
+    }
+}
+
 /// Shows the alert and waits for the answer. Blocks, so it never runs on the main thread (there it
 /// refuses at once).
 pub fn ask(app: &AppHandle, title: &str, message: &str, choice: Choice) -> bool {
@@ -187,9 +201,9 @@ mod windows {
     use windows_sys::core::HRESULT;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::UI::Controls::{
-        TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
+        TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOG_BUTTON, TDCBF_OK_BUTTON, TDF_ALLOW_DIALOG_CANCELLATION,
         TDF_CALLBACK_TIMER, TDF_SIZE_TO_CONTENT, TDM_CLICK_BUTTON, TDN_CREATED, TDN_DESTROYED, TDN_TIMER,
-        TD_WARNING_ICON,
+        TD_ERROR_ICON, TD_WARNING_ICON,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         PostMessageW, SetForegroundWindow, SetWindowDisplayAffinity, SetWindowPos, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, WDA_EXCLUDEFROMCAPTURE,
@@ -248,6 +262,42 @@ mod windows {
             watch.capturable.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
         }
         0
+    }
+
+    /// While a message box lives (from `TDN_CREATED`, before it is displayed, to `TDN_DESTROYED`,
+    /// after it is gone), the change that keeps computer-control captures from being returned.
+    unsafe extern "system" fn on_message(_: HWND, notification: u32, _: WPARAM, _: LPARAM, data: isize) -> HRESULT {
+        // SAFETY: `data` is the slot borrowed by `tell`, alive for the whole dialog.
+        let change = unsafe { &*(data as *const std::sync::Mutex<Option<crate::computer::win::WindowChange>>) };
+        let mut change = change.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if notification == TDN_CREATED as u32 {
+            *change = Some(crate::computer::win::WindowChange::begin());
+        } else if notification == TDN_DESTROYED as u32 {
+            change.take();
+        }
+        0
+    }
+
+    /// An error or a warning with one OK button; returns once it is closed.
+    pub fn tell(title: &str, message: &str, error: bool) {
+        // Dropped at the latest when this returns, whatever notifications arrived.
+        let change: std::sync::Mutex<Option<crate::computer::win::WindowChange>> = std::sync::Mutex::new(None);
+        let (title, message) = (wide(title), wide(message));
+        // SAFETY: every pointer in the config outlives the modal call that reads it.
+        unsafe {
+            let mut config: TASKDIALOGCONFIG = zeroed();
+            config.cbSize = size_of::<TASKDIALOGCONFIG>() as u32;
+            config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_SIZE_TO_CONTENT;
+            config.dwCommonButtons = TDCBF_OK_BUTTON;
+            config.pszWindowTitle = title.as_ptr();
+            config.pszContent = message.as_ptr();
+            config.Anonymous1.pszMainIcon = if error { TD_ERROR_ICON } else { TD_WARNING_ICON };
+            config.pfCallback = Some(on_message);
+            config.lpCallbackData = &change as *const _ as isize;
+            if TaskDialogIndirect(&config, null_mut(), null_mut(), null_mut()) < 0 {
+                eprintln!("gentle-dot: cannot show a message: {}", std::io::Error::last_os_error());
+            }
+        }
     }
 
     pub fn ask(

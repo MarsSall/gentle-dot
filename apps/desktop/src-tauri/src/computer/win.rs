@@ -25,6 +25,7 @@ use super::coords::{fit_long_edge, Point, ScreenshotGeometry, MAX_LONG_EDGE};
 use super::encode::{bgra_to_jpeg, JPEG_QUALITY};
 use super::blocklist::{blocked_name, blocked_reason, AppIdentity, UNIDENTIFIED};
 use super::risk::{AxElement, Focus};
+use super::glow::Frame;
 use super::winaccess::{element, is_default, known_chain, unreadable, UIA_BUTTON, UIA_WINDOW};
 use super::winapps::{
     answers_to, app_pids, executable_target, fronts_same_app, hosted_page, request, shortcut_named, strip_ci, Request,
@@ -54,6 +55,7 @@ use windows_sys::Win32::System::Threading::{
     QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, MonitorFromPoint,
     ReleaseDC, SelectObject, SetBrushOrgEx, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
@@ -73,7 +75,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WindowFromPoint, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, GA_ROOT, GA_ROOTOWNER, GUITHREADINFO, GWL_EXSTYLE,
     GW_OWNER, ICONINFO, SMTO_ABORTIFHUNG, SM_CXCURSOR, SM_CXVIRTUALSCREEN, SM_CYCURSOR, SM_CYVIRTUALSCREEN,
     SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE, SW_SHOWNORMAL, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
-    WM_NULL, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WM_NULL, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, SetWindowLongPtrW, SetWindowPos, HWND_TOPMOST,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE,
 };
 
 /// Pause between the events of one action, so apps see distinct presses (as on macOS).
@@ -1098,7 +1101,7 @@ mod uia {
     };
 }
 
-/// A UI Automation client for one call, on a COM apartment it owns when it had to join one.
+/// A UI Automation client and its thread's COM apartment.
 struct Automation {
     client: uia::IUIAutomation,
     /// Declared after `client` so the client is released before COM is left.
@@ -1133,8 +1136,21 @@ impl Drop for Apartment {
     }
 }
 
+// The client never leaves its thread. It is released before the apartment is uninitialized at
+// thread exit; an existing apartment of a different model remains owned by its original caller.
+// A failed client creation or timeout configuration is cached as None and stays fail-closed.
+thread_local! {
+    static AUTOMATION: Option<std::rc::Rc<Automation>> = Automation::create().map(std::rc::Rc::new);
+}
+
 impl Automation {
-    fn new() -> Option<Automation> {
+    /// This thread's client: created on its first query and kept for the thread's life (the
+    /// helper serves each request on a thread of its own, so a request's queries share one).
+    fn new() -> Option<std::rc::Rc<Automation>> {
+        AUTOMATION.try_with(Clone::clone).ok().flatten()
+    }
+
+    fn create() -> Option<Automation> {
         let apartment = Apartment::join(Apartment::OBJECTS);
         // SAFETY: creating the system's UI Automation object.
         let client: uia::IUIAutomation =
@@ -1155,7 +1171,8 @@ impl Automation {
         unsafe { self.client.ControlViewWalker().ok()?.GetParentElement(of).ok() }
     }
 
-    /// Whether `of` ends its chain of ancestors: the desktop itself, or a top-level window.
+    /// Whether `of` ends its chain: the desktop or any Window ancestor. A nested Window still
+    /// holds the element, and the risk check reads the pressable element before its ancestors.
     fn ends_chain(&self, of: &uia::IUIAutomationElement) -> bool {
         // SAFETY: calls on live COM objects.
         let root = unsafe { self.client.GetRootElement() }
@@ -1336,6 +1353,104 @@ fn focused_pid() -> Option<i32> {
     (pid > 0).then_some(pid)
 }
 
+/// The frame of the display containing the point, in physical pixels.
+pub fn display_frame_at(at: Point) -> Option<Frame> {
+    monitor_at(at).map(|m| Frame { x: f64::from(m.x), y: f64::from(m.y), width: f64::from(m.width), height: f64::from(m.height) })
+}
+
+/// Physical pixels per CSS pixel for this display.
+pub fn display_scale(display: Frame) -> f64 {
+    let center = POINT { x: (display.x + display.width / 2.0) as i32, y: (display.y + display.height / 2.0) as i32 };
+    let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+    // SAFETY: valid monitor and out-pointers.
+    let read = unsafe { GetDpiForMonitor(MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST), MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) };
+    if read == 0 && dpi_x > 0 { f64::from(dpi_x) / 96.0 } else { 1.0 }
+}
+
+/// The focused element's frame, in physical pixels.
+pub fn focused_frame() -> Option<Frame> {
+    let automation = Automation::new()?;
+    // SAFETY: calls on live COM objects.
+    let rect = unsafe { automation.client.GetFocusedElement().ok()?.CurrentBoundingRectangle().ok()? };
+    let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+    (width > 0 && height > 0).then(|| Frame { x: f64::from(rect.left), y: f64::from(rect.top), width: f64::from(width), height: f64::from(height) })
+}
+
+/// Prevent activation and capture of the click-through glow.
+pub fn prepare_overlay(hwnd: *mut c_void) {
+    // SAFETY: calls on this process's window.
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize);
+    }
+    if let Err(error) = exclude_from_capture(hwnd) {
+        eprintln!("gentle-dot: the glow may show in computer-control screenshots: {error}");
+    }
+}
+
+/// Show above other windows without activation, or hide.
+pub fn show_overlay(hwnd: *mut c_void, visible: bool) {
+    // SAFETY: calls on this process's window.
+    unsafe {
+        if visible {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        } else { ShowWindow(hwnd, SW_HIDE); }
+    }
+}
+
+pub fn show_without_activating(hwnd: *mut c_void) {
+    // SAFETY: a call on this process's window.
+    unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+}
+
+pub fn hide_window(hwnd: *mut c_void) {
+    // SAFETY: a call on this process's window.
+    unsafe { ShowWindow(hwnd, SW_HIDE) };
+}
+
+pub fn show_window(hwnd: *mut c_void) {
+    // SAFETY: a call on this process's window.
+    unsafe { ShowWindow(hwnd, SW_SHOW) };
+}
+
+/// Move the glow over a display without activating it.
+pub fn cover(hwnd: *mut c_void, display: Frame) {
+    // SAFETY: a call on this process's window.
+    unsafe { SetWindowPos(hwnd, HWND_TOPMOST, display.x as i32, display.y as i32, display.width as i32, display.height as i32, SWP_NOACTIVATE); }
+}
+
+/// The first build that can leave a window out of captures (`WDA_EXCLUDEFROMCAPTURE`): Windows
+/// 10 version 2004.
+const CAPTURE_EXCLUSION_BUILD: u32 = 19041;
+
+/// This system's build number. The registry says it as it is; `GetVersionEx` answers what the
+/// app's manifest names.
+fn windows_build() -> Option<u32> {
+    let key = wide(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+    let value = wide("CurrentBuildNumber");
+    let mut buffer = vec![0u16; 64];
+    let mut bytes = (buffer.len() * 2) as u32;
+    // SAFETY: the buffer's size in bytes is passed and updated.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ, null_mut(),
+            buffer.as_mut_ptr() as *mut c_void, &mut bytes,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let units = &buffer[..(bytes as usize / 2).min(buffer.len())];
+    String::from_utf16_lossy(units).trim_end_matches('\0').trim().parse().ok()
+}
+
+/// Whether screenshots can leave Gentle Dot's windows out. A build that cannot be read counts as
+/// able: a capture whose exclusion fails is refused anyway (`exclude_own_windows`).
+fn supports_capture_exclusion(build: Option<u32>) -> bool {
+    build.map_or(true, |build| build >= CAPTURE_EXCLUSION_BUILD)
+}
+
 /// The Windows desktop the helper drives.
 pub struct WinDesktop;
 
@@ -1345,8 +1460,13 @@ impl super::Desktop for WinDesktop {
     }
 
     fn permissions(&self) -> super::Permissions {
-        // Windows asks for no permission to send input or take screenshots.
-        super::Permissions { accessibility: true, screen_recording: true, screenshots_supported: true }
+        // Windows asks for no permission to send input or take screenshots; leaving Gentle Dot's
+        // windows out of them needs a recent enough build.
+        super::Permissions {
+            accessibility: true,
+            screen_recording: true,
+            screenshots_supported: supports_capture_exclusion(windows_build()),
+        }
     }
 
     fn capture(&self) -> Result<Capture, String> {
@@ -1522,6 +1642,18 @@ mod tests {
         assert_eq!(desktop.keyboard_refusal(&ghost), keyboard_refusal(&ghost));
         let permissions = desktop.permissions();
         assert!(permissions.accessibility && permissions.screen_recording && permissions.screenshots_supported);
+    }
+
+    #[test]
+    fn screenshots_need_windows_10_2004() {
+        assert!(!supports_capture_exclusion(Some(19040)));
+        assert!(supports_capture_exclusion(Some(19041)));
+        assert!(supports_capture_exclusion(Some(26100)));
+        assert!(supports_capture_exclusion(None));
+        let build = windows_build().expect("the build number is readable");
+        assert!(build >= CAPTURE_EXCLUSION_BUILD, "{build}");
+        use super::super::Desktop;
+        assert!(WinDesktop.permissions().screenshots_supported);
     }
 
     #[test]

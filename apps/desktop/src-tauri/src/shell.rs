@@ -36,7 +36,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutEvent, ShortcutState};
 use tauri_plugin_opener::OpenerExt;
 
-const DOT: &str = "dot";
+pub(crate) const DOT: &str = "dot";
 pub(crate) const PANEL: &str = "panel";
 const TRAY: &str = "main";
 /// The Dot window, in points: a 66 pt black disc with the rose, plus a 3 pt
@@ -89,14 +89,18 @@ impl working::Windows for ShellWindows {
     }
 
     fn hide(&self, part: Part) -> Result<(), String> {
-        self.get(part).ok_or_else(|| format!("window {part:?} is missing"))?.hide().map_err(err)
+        let window = self.get(part).ok_or_else(|| format!("window {part:?} is missing"))?;
+        #[cfg(windows)]
+        return computer::hide_for_call(&window);
+        #[cfg(not(windows))]
+        window.hide().map_err(err)
     }
 
     fn show(&self, part: Part) {
         let Some(window) = self.get(part) else { return };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let shown = computer::show_without_focus(&window);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let shown = window.show().map_err(err);
         if let Err(error) = shown {
             eprintln!("gentle-dot: cannot show the {part:?} again: {error}");
@@ -230,7 +234,12 @@ async fn connection_info(app: AppHandle) -> CommandResult<ConnectionInfo> {
 
 #[tauri::command]
 fn toggle_panel(app: AppHandle) -> CommandResult {
-    if window(&app, PANEL)?.is_visible().map_err(err)? {
+    let panel = window(&app, PANEL)?;
+    #[cfg(windows)]
+    let shown = panel.is_visible().map_err(err)? && !panel.is_minimized().map_err(err)?;
+    #[cfg(not(windows))]
+    let shown = panel.is_visible().map_err(err)?;
+    if shown {
         hide_panel(app)
     } else {
         show_panel(&app)
@@ -246,7 +255,10 @@ fn hide_panel(app: AppHandle) -> CommandResult {
             *shell.panel_spot.lock().unwrap() = Some((rect.x, rect.y));
         }
     }
-    panel.hide().map_err(err)
+    panel.hide().map_err(err)?;
+    #[cfg(windows)]
+    computer::set_shown(&panel, false)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -266,6 +278,8 @@ fn set_rose_hidden(app: AppHandle, hidden: bool) -> CommandResult<bool> {
     } else {
         dot.show().map_err(err)?;
     }
+    #[cfg(windows)]
+    computer::set_shown(&dot, !hidden)?;
     if let Some(item) = app.try_state::<RoseMenuItem>() {
         item.0.set_text(rose_menu_label(hidden)).map_err(err)?;
     }
@@ -369,6 +383,12 @@ impl shortcut::Host for ShortcutHost<'_> {
 }
 
 /// The accelerator is only a label; one the menu cannot show is left off.
+fn unlabel_tray_open(app: &AppHandle) {
+    if let Some(item) = app.try_state::<OpenMenuItem>() {
+        let _ = item.0.set_accelerator(None::<&str>);
+    }
+}
+
 fn label_tray_open(app: &AppHandle, shortcut: &str) {
     if let Some(item) = app.try_state::<OpenMenuItem>() {
         if item.0.set_accelerator(Some(shortcut)).is_err() {
@@ -469,11 +489,26 @@ fn place_panel_next_to_dot(app: &AppHandle) -> CommandResult {
 }
 
 fn show_panel(app: &AppHandle) -> CommandResult {
+    #[cfg(windows)]
+    restore_panel(&window(app, PANEL)?)?;
     place_panel(app)?;
     let panel = window(app, PANEL)?;
     panel.show().map_err(err)?;
+    #[cfg(windows)]
+    computer::set_shown(&panel, true)?;
     panel.set_focus().map_err(err)?;
     app.emit("dot://panel-shown", ()).map_err(err)
+}
+
+/// A minimized panel must be restored before it is moved or shown.
+#[cfg(windows)]
+fn restore_panel(panel: &WebviewWindow) -> CommandResult {
+    if panel.is_minimized().map_err(err)? { panel.unminimize().map_err(err)?; }
+    let current = rect_of(panel)?;
+    if (current.width, current.height) != (PANEL_SIZE.0 as i32, PANEL_SIZE.1 as i32) {
+        panel.set_size(LogicalSize::new(PANEL_SIZE.0, PANEL_SIZE.1)).map_err(err)?;
+    }
+    Ok(())
 }
 
 /// Snaps the Dot to the nearest edge and persists the position.
@@ -537,6 +572,8 @@ fn build_windows(
     // the Dot stays resizable and equal minimum and maximum sizes pin it at DOT_SIZE.
     #[cfg(target_os = "linux")]
     let dot = dot.resizable(true).min_inner_size(DOT_SIZE.0, DOT_SIZE.1).max_inner_size(DOT_SIZE.0, DOT_SIZE.1);
+    #[cfg(windows)]
+    let dot = dot.minimizable(false);
     let dot = dot.build()?;
     // Linux has no window effects; the panel URL tells the UI to paint an opaque background.
     let panel = WebviewWindowBuilder::new(app, PANEL, WebviewUrl::App(platform::panel_url(Os::CURRENT).into()))
@@ -550,6 +587,8 @@ fn build_windows(
         // Lets the chat receive HTML5 drops of attachments (S31); Tauri's own handler would take them.
         .disable_drag_drop_handler()
         .visible(false);
+    #[cfg(windows)]
+    let panel = panel.minimizable(false);
     #[cfg(target_os = "macos")]
     let panel = panel
         .effects(EffectsBuilder::new().effect(Effect::HudWindow).state(EffectState::Active).radius(20.0).build());
@@ -613,7 +652,7 @@ fn build_tray(app: &AppHandle, config: &DesktopConfig, rose_hidden: bool) -> tau
     app.manage(OpenMenuItem(open.clone()));
     let menu = Menu::new(app)?;
     let conversations = conversations_on(std::env::var("GENTLE_DOT_CONVERSATIONS").ok().as_deref());
-    for id in tray_menu_ids(conversations, cfg!(target_os = "macos")) {
+    for id in tray_menu_ids(conversations, cfg!(any(target_os = "macos", windows))) {
         match id {
             "open" => menu.append(&open)?,
             "new" => menu.append(&MenuItem::with_id(app, "new", "New conversation", true, None::<&str>)?)?,
@@ -729,7 +768,7 @@ fn restart_daemon(app: AppHandle) {
 }
 
 /// ⌥⇧Esc ends computer control from anywhere, even while another app is in front.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn register_panic_shortcut(app: &AppHandle) {
     let handler = |app: &AppHandle, _: &_, event: tauri_plugin_global_shortcut::ShortcutEvent| {
         if event.state() == ShortcutState::Pressed {
@@ -864,15 +903,16 @@ pub fn run() {
             let (voice_input, voice_model) = voice::start(&handle);
             app.manage(voice_input);
             app.manage(voice_model);
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             register_panic_shortcut(&handle);
 
             build_windows(&handle, &config, places_windows, rose_hidden)?;
             build_tray(&handle, &config, rose_hidden)?;
             if places_windows {
                 let bound = register_shortcut(&handle, &config.shortcut);
-                if let Some(bound) = &bound {
-                    label_tray_open(&handle, bound);
+                match &bound {
+                    Some(bound) => label_tray_open(&handle, bound),
+                    None => unlabel_tray_open(&handle),
                 }
                 *app.state::<Shell>().shortcut.lock().unwrap() = bound;
                 let snap = app.state::<Shell>().snap.clone();

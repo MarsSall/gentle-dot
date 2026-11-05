@@ -14,7 +14,7 @@ https://github.com/user-attachments/assets/0c0f4d2d-7e0e-4c35-961a-8816d95a390c
 
 
 <p>
-<img src="https://img.shields.io/badge/macOS%20%C2%B7%20Linux%20%C2%B7%20Web-D7A0B8?style=for-the-badge&labelColor=1A1218" alt="Platform">
+<img src="https://img.shields.io/badge/macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20Web-D7A0B8?style=for-the-badge&labelColor=1A1218" alt="Platform">
 <img src="https://img.shields.io/badge/status-early%20preview-F095C8?style=for-the-badge&labelColor=1A1218" alt="Status: early preview">
 <a href="LICENSE"><img src="https://img.shields.io/badge/MIT-D7A0B8?style=for-the-badge&labelColor=1A1218" alt="License: MIT"></a>
 </p>
@@ -38,7 +38,7 @@ Assistants live in a browser tab you have to go find, forget you between chats, 
 <br/>
 
 > [!WARNING]
-> **Early preview.** Gentle Dot can see your screen and control your Mac when you allow it, and it runs an AI agent with a shell. Its safety checks are real, but some still live within the agent's reach (see [Security status](#security-status)). Use it on a machine and accounts you are comfortable letting an assistant act on.
+> **Early preview.** Gentle Dot can see your screen and control your computer when you allow it, and it runs an AI agent with a shell. Its safety checks are real, but some still live within the agent's reach (see [Security status](#security-status)). Use it on a machine and accounts you are comfortable letting an assistant act on.
 
 <br/>
 
@@ -50,7 +50,7 @@ Assistants live in a browser tab you have to go find, forget you between chats, 
 
 ### Always one key away
 
-A glowing rose sits on your desktop. Click it, press your shortcut (**`⌥ Space`** unless you pick another), or use the menu bar, and the chat opens over whatever you are doing. Hide the rose if you prefer, or open the chat full screen with **`⌘⇧F`**. The same chat runs in the browser, on your machine or on your own server.
+A glowing rose sits on your desktop. Click it, press your shortcut (**`⌥ Space`**, or **`Ctrl+Alt+Space`** on Windows, unless you pick another), or use the menu bar, and the chat opens over whatever you are doing. Hide the rose if you prefer, or open the chat full screen with **`⌘⇧F`** (**`Ctrl+Shift+F`** on Windows and Linux). The same chat runs in the browser, on your machine or on your own server.
 
 ---
 
@@ -60,15 +60,15 @@ There is one continuous chat, not a list of threads to manage. When it grows too
 
 ---
 
-### Uses your Mac (macOS)
+### Uses your computer (macOS and Windows)
 
-With your permission, Gentle Dot sees the screen and operates your apps: clicks, typing, shortcuts, and opening apps, batched into quick sequences. A pink glow shows where it acts. Every control session needs your approval in a native dialog, risky actions (send, pay, delete, submit) ask first, password managers and System Settings are off limits, and **`⌥⇧Esc`** stops everything instantly. Yolo mode skips the per-action questions for up to an hour, and only you can turn it on.
+With your permission, Gentle Dot sees the screen and operates your apps: clicks, typing, shortcuts, and opening apps, batched into quick sequences. A pink glow shows where it acts. Every control session needs your approval in a native dialog, risky actions (send, pay, delete, submit) ask first, password managers and the system settings are off limits, and **`⌥⇧Esc`** (**`Alt+Shift+Esc`** on Windows) stops everything instantly. Yolo mode skips the per-action questions for up to an hour, and only you can turn it on.
 
 ---
 
 ### Talk to it
 
-Press the mic and speak: the transcript lands in the input for you to review, or goes out as soon as you stop if you prefer. Replies to what you said are read aloud. Speech runs on your Mac by default; download the optional local model (NVIDIA Parakeet, 25 languages including Spanish) to keep your voice fully offline, or connect an OpenAI API key.
+Press the mic and speak: the transcript lands in the input for you to review, or goes out as soon as you stop if you prefer. Replies to what you said are read aloud. A Mac uses Apple's recognizer until you download the optional local model (NVIDIA Parakeet, 25 languages including Spanish), which keeps your voice fully offline; Windows and Linux use only that model. Or connect an OpenAI API key.
 
 ---
 
@@ -94,7 +94,7 @@ Attach files with the paperclip, drag and drop, or paste. Images go straight to 
 
 | Component | What it does |
 | :--- | :--- |
-| **Self-contained installers** | A macOS DMG and Linux `.deb` and Arch packages carry their own Node, engine, and Engram |
+| **Self-contained installers** | A macOS DMG, a Windows installer, and Linux `.deb` and Arch packages carry their own Node, engine, and Engram |
 | **Stable signing** | A self-signed identity keeps macOS permissions across updates |
 | **Isolated engine** | The assistant runs its own engine and home folder; it never touches your own agent setup |
 | **Web and server** | The same interface in the browser, and a Docker setup for your own VPS behind HTTPS, where the assistant runs as its own user, connector secrets are encrypted, and connector changes need your PIN |
@@ -178,6 +178,8 @@ What does not yet: the agent has a shell, and its shell commands (and its subage
 pnpm typecheck && pnpm lint && pnpm test   # unit and integration tests, with a fake agent
 pnpm e2e                                   # Playwright against the daemon
 ```
+
+The Windows workflow (`.github/workflows/windows.yml`) runs the same typecheck, lint, and test suite on Windows. Tests that need server mode, the stand-in app channel, or other POSIX-only behavior are skipped there, and the log names each reason.
 
 <div align="right"><a href="#top">Back to top</a></div>
 

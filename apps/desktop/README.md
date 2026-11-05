@@ -1,6 +1,6 @@
-# Gentle Dot desktop (macOS and Linux)
+# Gentle Dot desktop (macOS, Windows, and Linux)
 
-The Tauri 2 shell around the Gentle Dot UI: a floating Dot, an expandable panel, a menu bar item, and a global shortcut. The contract between Rust and the UI is §9 of [`docs/design.md`](../../docs/design.md). Linux is covered [below](#linux).
+The Tauri 2 shell around the Gentle Dot UI: a floating Dot, an expandable panel, a menu bar item, and a global shortcut. The contract between Rust and the UI is §9 of [`docs/design.md`](../../docs/design.md). Linux is covered [below](#linux); building the Windows installer is in [`docs/install.md`](../../docs/install.md#build-the-installer-from-source).
 
 ## Requirements
 
@@ -45,7 +45,7 @@ Runtime overrides:
 | `GENTLE_DOT_DATA_DIR` | Data directory (default `~/.gentle-dot`) |
 | `GENTLE_DOT_PORT` | Daemon port (default `4317`, otherwise `port` in `config.json`) |
 
-`shortcut` in `~/.gentle-dot/config.json` changes the global shortcut (default `Alt+Space`). The Dot position is saved in `~/.gentle-dot/desktop.json` as `dot_points`, in macOS points (the screen space every monitor shares, whatever its scale factor). The `dot` key written by older builds was in physical pixels and is ignored, so the Dot starts once more at the right edge of the main display.
+`shortcut` in `~/.gentle-dot/config.json` changes the global shortcut (default `Alt+Space`, `Ctrl+Alt+Space` on Windows). The Dot position is saved in `~/.gentle-dot/desktop.json` as `dot_points`, in macOS points (the screen space every monitor shares, whatever its scale factor). The `dot` key written by older builds was in physical pixels and is ignored, so the Dot starts once more at the right edge of the main display.
 
 ## Menu bar
 

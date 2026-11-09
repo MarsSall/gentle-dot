@@ -4,17 +4,30 @@
 // (it loads the guard with `-e`) or in any engine Gentle Dot did not start, and the daemon writes it
 // at every engine start and puts it back when it changes. The proxy and the native approvals stay
 // the boundary; the guard in children is defense in depth.
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import * as fs from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { APPROVAL_GUARD } from "../src/connectors.ts";
 import { type DotDaemon, startDaemon } from "../src/daemon.ts";
 import { type ConnectorPolicy, POLICY_ENV, PROPOSE_TOOL } from "../src/extensions/approval-guard.ts";
 import { FAKE_AGENT, tempDir, waitFor } from "./helpers.ts";
-import { canMakeDirectoryUnwritable, symlinkDirectory } from "./support/fixture-capabilities.ts";
+import { symlinkDirectory } from "./support/fixture-capabilities.ts";
 import { expectPosixLstatMode } from "./support/posix-modes.ts";
 
 const SHIM = "gentle-dot-child-guard.ts";
+
+vi.mock("node:fs", { spy: true });
+
+/** Makes the guard's write fail as an unwritable folder would, on every platform and even as root. */
+async function failGuardWrites() {
+	const original = (await vi.importActual<typeof fs>("node:fs")).writeFileSync;
+	return vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+		if (typeof file === "string" && file.includes(`${SHIM}.`))
+			throw new Error("test: the extensions folder is not writable");
+		return original(file, data, options);
+	});
+}
 
 const daemons: DotDaemon[] = [];
 const savedEnv = { ...process.env };
@@ -160,52 +173,33 @@ describe("subagents in the assistant's engine (S25.4)", () => {
 		expect(lines.some((line) => /subagents are off/i.test(line))).toBe(true);
 	});
 
-	it.skipIf(
-		!canMakeDirectoryUnwritable(
-			"child-guard: starts with subagents off when the extensions folder cannot be written",
-		),
-	)("starts with subagents off when the extensions folder cannot be written, on or off", async () => {
+	it("starts with subagents off when the extensions folder cannot be written, on or off", async () => {
 		for (const env of [{}, { GENTLE_DOT_SUBAGENTS: "off" }]) {
-			let folder = "";
+			const blocked = await failGuardWrites();
 			try {
-				const started = await start({
-					env,
-					before: (agentHome) => {
-						folder = join(agentHome, "extensions");
-						mkdirSync(folder, { recursive: true });
-						chmodSync(folder, 0o555);
-					},
-				});
+				const started = await start({ env });
 				expect(started.env().GENTLE_PI_AGENTS).toBe("0");
 				expect(started.lines.filter((line) => line.includes("cannot be written")).length).toBe(1);
 			} finally {
-				if (folder) chmodSync(folder, 0o755);
+				blocked.mockRestore();
 			}
 		}
 	});
 
-	it.skipIf(
-		!canMakeDirectoryUnwritable(
-			"child-guard: still removes a planted .pi/mcp.json when the child guard cannot be put back",
-		),
-	)(
-		"still removes a planted .pi/mcp.json when the child guard cannot be put back, and says so once",
-		async () => {
-			const { dataDir, agentHome, shim, lines } = await start();
-			const folder = join(agentHome, "extensions");
-			const planted = join(dataDir, "workspace", ".pi", "mcp.json");
-			try {
-				rmSync(shim);
-				chmodSync(folder, 0o555);
-				mkdirSync(join(dataDir, "workspace", ".pi"), { recursive: true });
-				writeFileSync(planted, '{"mcpServers":{}}\n');
-				await waitFor(() => !existsSync(planted), 5000);
-				await new Promise((resolve) => setTimeout(resolve, 2500));
-				expect(lines.filter((line) => line.includes("cannot be written")).length).toBe(1);
-				expect(lines.some((line) => line.includes("could not check"))).toBe(false);
-			} finally {
-				chmodSync(folder, 0o755);
-			}
-		},
-	);
+	it("still removes a planted .pi/mcp.json when the child guard cannot be put back, and says so once", async () => {
+		const { dataDir, shim, lines } = await start();
+		const planted = join(dataDir, "workspace", ".pi", "mcp.json");
+		const blocked = await failGuardWrites();
+		try {
+			rmSync(shim);
+			mkdirSync(join(dataDir, "workspace", ".pi"), { recursive: true });
+			writeFileSync(planted, '{"mcpServers":{}}\n');
+			await waitFor(() => !existsSync(planted), 5000);
+			await new Promise((resolve) => setTimeout(resolve, 2500));
+			expect(lines.filter((line) => line.includes("cannot be written")).length).toBe(1);
+			expect(lines.some((line) => line.includes("could not check"))).toBe(false);
+		} finally {
+			blocked.mockRestore();
+		}
+	});
 });
